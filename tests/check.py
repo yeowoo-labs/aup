@@ -10,6 +10,10 @@
    counts and event failures as the workbench Zig engine (via its Node CLI).
    Workbench JSON prints -0 as 0, so signed zeros compare numerically there;
    Pure's unit tests check signed zeros directly. Other values compare exactly.
+6. Text model: examples/notes.aup, run by pure-run, keeps its text, cursor and
+   mark exactly as a reference Python model under random typing (ASCII,
+   Korean, emoji, combining marks, NUL, newlines), moves and deletions; string
+   escapes and number text follow their stated rules.
 5. Editor parity: the document editor written in aup, run by pure-edit-module,
    answers random show/edit/apply operations exactly as pure-edit running the
    original editor.pure (stdout, stderr, exit code), on the same tree store
@@ -31,7 +35,7 @@ DIAGNOSTICS = [
     ('state a = b\n', '1:11', 'expected a numeric state initializer'),
     ('view v = dt\n', '1:10', 'dt is only available in handlers'),
     ('input k = key Space\ninput j = key Space\n', '2:15', "key Space is already used by input 'k'"),
-    ('input k = key Tab\n', '1:15', "unknown key 'Tab'"),
+    ('input k = key F13\n', '1:15', "unknown key 'F13'"),
     ('on missing.down {\n}\n', '1:4', "unknown input 'missing'"),
     ('state a = 0\non a.down {\n}\n', '2:4', "'a' is a state, not an input"),
     ('state a = 0\non frame {\n  b = 1\n}\n', '3:3', "unknown state 'b'"),
@@ -49,7 +53,7 @@ DIAGNOSTICS = [
     ('state s = 0\n' * 1 + ''.join(f'state s{i} = 0\n' for i in range(32)), '33:7', 'at most 32 states are allowed'),
     # v0b: messages, keyed documents and types
     ('state d: bytes by key\ninput m = message\non m {\n  reply d[key]\n}\n', '4:9', 'd[key] needs the handler of a message by key'),
-    ('input m = message by key { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'expected bytes, not a number'),
+    ('input m = message by key { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'reply takes bytes or text, not a number'),
     ('input m = message by key {\n  b: bytes\n  a: u32\n}\n', '3:3', 'a bytes field must be the last field'),
     ('input m = message by key\non m.down {\n}\n', '2:4', "'m' is a message; write on m { }"),
     ('input k = key Space\non k {\n}\n', '2:4', "'k' is a key input; write on k.down or on k.up"),
@@ -58,11 +62,30 @@ DIAGNOSTICS = [
     ('input m = message by key { a: u32 }\nview v = m.a\n', '2:10', "fields of 'm' are only available in its handler"),
     ('state x = 0\ninput m = message by key { a: bytes }\non m {\n  x = m.a\n}\n', '4:7', 'expected a number, not bytes'),
     ('input m = message by key { a: u32 }\non m {\n  reply m.z\n}\n', '3:9', "message 'm' has no field 'z'"),
-    ('state x = 0\non frame {\n  require x.bytes\n}\n', '3:13', '.bytes needs bytes, not a number'),
+    ('state x = 0\non frame {\n  require x.bytes\n}\n', '3:11', "a number has no 'bytes'"),
     ('state d: bytes by key\nstate e: bytes by key\n', '2:7', 'at most one keyed collection is allowed'),
     ('state d: bytes by key\ninput m = message by key { a: bytes }\non m {\n  d[key].replace(0 .. m.a, m.a)\n}\n', '4:23',
      'expected a number, not bytes'),
     ('input m = message by key { a: u32 }\non frame {\n  reply m.a\n}\n', '3:3', 'reply is only available in a message handler'),
+    # text and cursors
+    ('state at: cursor in missing\n', '1:7', "a cursor moves in a text state; 'missing' is not one"),
+    ('state a: text\nstate b: text\nstate at: cursor in a\ninput k = key KeyK\non k.down {\n  b.insert(at, "x")\n}\n',
+     '6:12', "a cursor of 'a' cannot point into 'b'"),
+    ('state a: text\nstate at: cursor in a\ninput k = key KeyK\non k.down {\n  at = 3\n}\n', '5:8',
+     'expected a cursor, not a number'),
+    ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number or text, not a cursor'),
+    ('state a: text\nstate at: cursor in a\nview v = "{at}"\n', '3:12', 'a string shows numbers and text, not a cursor'),
+    ('state x = 1\nstate t: text = "{x}"\n', '2:17', 'a text state starts from a plain string'),
+    ('view v = "a\\qb"\n', '1:12', 'unknown escape'),
+    ('view v = "\\u{D800}"\n', '1:11', 'Unicode scalar'),
+    ('state x = 1\nview v = "{x"\n', '2:11', "expected '}' to end the {expression}"),
+    ('state x = 1\nview v = x + 1 char\n', '2:12', 'only a cursor moves by a distance, not a number'),
+    ('view v = 1 char\n', '1:12', 'a distance moves a cursor'),
+    ('view v = "abc\n"\n', '1:10', 'a string ends on the line it starts'),
+    ('state a: text\ninput typed = text\nview v = typed\n', '3:10', "'typed' is only available in its handler"),
+    ('input typed = text\non typed.down {\n}\n', '2:4', "'typed' is a text input; write on typed { }"),
+    ('view v = text(3)\n', '1:10', 'text(...) converts bytes, not a number'),
+    ('view v = "é"\nview w = 1 é\n', '2:12', 'unexpected byte 0xc3 outside a string'),
 ]
 
 ACCEPTED = [
@@ -73,6 +96,12 @@ ACCEPTED = [
     'state d: bytes by key\nstate edits = 0\ninput m = message by key { at: u32; text: bytes }\n'
     'input peek = message by key\non m {\n  d[key].replace(at_or_end .. at_or_end, m.text)\n}\n'.replace('at_or_end', 'min(m.at, d[key].bytes)')
     + 'on m {\n  edits = edits + 1\n  require m.text.bytes > 0\n}\non peek { reply d[key] }\n',
+    # a keyed document loaded into a text state, edited with cursors and saved back as its UTF-8 bytes
+    'state documents: bytes by key\nstate note: text\nstate at: cursor in note\n'
+    'input open = message by key\ninput save = message by key\ninput typed = text\n'
+    'on open {\n  note = text(documents[key])\n  at = note.end\n}\n'
+    'on typed { note.insert(at, typed) }\n'
+    'on save {\n  documents[key].replace(0 .. documents[key].bytes, note)\n  reply "saved {note.chars} characters"\n}\n',
 ]
 
 
@@ -291,12 +320,106 @@ def editor_parity(aup, pure, work, seeds, operations=160):
     return compared, dict(sorted(outcomes.items()))
 
 
+class NotesModel:
+    """Reference semantics of examples/notes.aup: positions are Unicode
+    scalars; every cursor at or after an insertion point moves after it; a
+    removal gathers cursors inside it; line moves keep the column."""
+
+    def __init__(self):
+        self.note, self.at, self.mark = '', 0, 0
+
+    def line_start(self, i):
+        return self.note.rfind('\n', 0, i) + 1
+
+    def line_end(self, i):
+        end = self.note.find('\n', i)
+        return len(self.note) if end < 0 else end
+
+    def insert(self, text):
+        p = self.at
+        self.note = self.note[:p] + text + self.note[p:]
+        self.at, self.mark = [c + len(text) if c >= p else c for c in (self.at, self.mark)]
+
+    def remove(self, a, b):
+        self.note = self.note[:a] + self.note[b:]
+        self.at, self.mark = [c - (b - a) if c >= b else a if c > a else c for c in (self.at, self.mark)]
+
+    def key(self, name):
+        n, at = len(self.note), self.at
+        if name == 'left': self.at = max(0, at - 1)
+        elif name == 'right': self.at = min(n, at + 1)
+        elif name in ('up', 'down'):
+            start = self.line_start(at)
+            column = at - start
+            if name == 'up':
+                if start == 0: self.at = 0
+                else:
+                    previous = self.line_start(start - 1)
+                    self.at = previous + min(column, start - 1 - previous)
+            else:
+                end = self.line_end(at)
+                if end == n: self.at = n
+                else:
+                    self.at = end + 1 + min(column, self.line_end(end + 1) - end - 1)
+        elif name == 'back': self.remove(max(0, at - 1), at)
+        elif name == 'forward': self.remove(at, min(n, at + 1))
+        elif name == 'home': self.at = 0
+        elif name == 'finish': self.at = n
+        elif name == 'set_mark': self.mark = at
+
+    def expected(self):
+        byte = lambda i: len(self.note[:i].encode())
+        return ({'title': '메모', 'note': self.note, 'at': byte(self.at), 'mark': byte(self.mark)},
+                {'header': f'메모 · {len(self.note)}자',
+                 'current': self.note[self.line_start(self.at):self.line_end(self.at)],
+                 'position': f"line {self.note[:self.at].count(chr(10)) + 1}, char {self.at}",
+                 'size': len(self.note.encode()), 'lines': self.note.count('\n') + 1})
+
+
+def text_parity(aup, pure_run, work, seeds, steps=400):
+    module = work / 'notes.pmod'
+    compile_module(aup, ROOT / 'examples/notes.aup', module)
+    words = ['a', 'Pure', '안녕', '\n', '😀', 'e\u0301', '한글\n줄', 'xy z', '', '\u0000', '👩\u200d💻']
+    keys = ['left', 'right', 'up', 'down', 'back', 'forward', 'home', 'finish', 'set_mark']
+    compared = 0
+    for seed in seeds:
+        rng = random.Random(seed + 7000)
+        model, commands, expected = NotesModel(), [], []
+        for _ in range(steps):
+            if rng.random() < 0.45:
+                word = rng.choice(words)
+                commands.append('type typed ' + (word.encode().hex() or '-'))
+                model.insert(word)
+            else:
+                name = rng.choice(keys)
+                commands.append(f'down {name}')
+                model.key(name)
+            expected.append(model.expected())
+        lines = run(pure_run, module, stdin='\n'.join(commands) + '\n').stdout.splitlines()
+        assert len(lines) == len(commands), (seed, len(lines))
+        for line, command, (states, views) in zip(lines, commands, expected):
+            snapshot = json.loads(line)
+            assert snapshot['error'] is None, (seed, command, snapshot)
+            assert snapshot['states'] == states, (seed, command, snapshot['states'], states)
+            assert snapshot['views'] == views, (seed, command, snapshot['views'], views)
+            compared += 1
+    # Escapes, interpolation and number text.
+    source = work / 'strings.aup'
+    source.write_text('state t: text = "a\\tb\\u{AC00}\\{x\\}\\"q\\"\\\\"\n'
+                      'view v = "{t}|{1 / 4}|{1e21}|{0.1 + 0.2}|{-0}|{100}|{2.5e-7}|{-1234567.5}"\n')
+    compile_module(aup, source, work / 'strings.pmod')
+    shown = json.loads(run(pure_run, work / 'strings.pmod', stdin='show\n').stdout)
+    assert shown['views']['v'] == 'a\tb가{x}"q"\\|0.25|1e+21|0.30000000000000004|0|100|2.5e-7|-1234567.5', shown
+    return compared
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--aup', type=Path, required=True)
     parser.add_argument('--pure-run', type=Path, required=True)
     parser.add_argument('--pure', type=Path, default=ROOT.parent / 'pure' / 'prototypes' / 'connections')
     parser.add_argument('--editor-seeds', type=int, default=4)
+    parser.add_argument('--text-seeds', type=int, default=12)
     parser.add_argument('--workbench', type=Path, default=ROOT.parent / 'pure' / 'prototypes' / 'workbench')
     parser.add_argument('--seeds', type=int, default=12)
     parser.add_argument('--generated', type=int, default=600)
@@ -360,6 +483,7 @@ def main():
         report['parity_snapshots'] = sum(compared for compared, _ in results)
         report['parity_failed_events_matched'] = sum(failures for _, failures in results)
         report['parity_programs'] = len(pairs)
+        report['text_model_snapshots'] = text_parity(aup, pure_run, work, range(args.text_seeds))
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

@@ -1,0 +1,35 @@
+# A small text editor. The runtime owns the text: typing inserts at the
+# cursor, the cursor and the mark always sit between characters and follow
+# edits, and a failed event would leave everything as it was.
+state title: text = "메모"
+state note: text = ""
+state at: cursor in note
+state mark: cursor in note
+
+input typed = text
+input left = key ArrowLeft
+input right = key ArrowRight
+input up = key ArrowUp
+input down = key ArrowDown
+input back = key Backspace
+input forward = key Delete
+input home = key Home
+input finish = key End
+input set_mark = key KeyM
+
+on typed { note.insert(at, typed) }
+on left.down { at = at - 1 char }
+on right.down { at = at + 1 char }
+on up.down { at = at - 1 line }
+on down.down { at = at + 1 line }
+on back.down { note.remove(at - 1 char .. at) }
+on forward.down { note.remove(at .. at + 1 char) }
+on home.down { at = note.start }
+on finish.down { at = note.end }
+on set_mark.down { mark = at }
+
+view header = "{title} · {note.chars}자"
+view current = note.line(at)
+view position = "line {at.line}, char {at.chars}"
+view size = note.bytes
+view lines = note.lines
