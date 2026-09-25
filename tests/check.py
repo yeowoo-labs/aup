@@ -14,10 +14,11 @@
    mark exactly as a reference Python model under random typing (ASCII,
    Korean, emoji, combining marks, NUL, newlines), moves and deletions; string
    escapes and number text follow their stated rules.
-7. List model: examples/tasks.aup keeps its list, index, views and failed
-   events exactly as a reference Python model under random appends, moves,
-   toggles, copies, renames and removals; replacing it with a module whose
-   record changed keeps each item's fields by name.
+7. List model: examples/tasks.aup keeps its list, index, views (conditional
+   ones and a table with a row per task) and failed events exactly as a
+   reference Python model under random appends, moves, toggles, copies,
+   renames and removals; replacing it with a module whose record changed
+   keeps each item's fields by name.
 5. Editor parity: the document editor written in aup, run by pure-edit-module,
    answers random show/edit/apply operations exactly as pure-edit running the
    original editor.pure (stdout, stderr, exit code), on the same tree store
@@ -36,6 +37,7 @@ ROOT = HERE.parent
 
 RECORD = 'record T {\n  a = 0\n}\n'
 ON_K = 'input k = key KeyK\non k.down {\n'
+LIST = RECORD + 'state xs: list of T\nstate at: index of xs\n'
 
 DIAGNOSTICS = [
     ('state x = 1\nstate x = 2\n', '2:7', "already declared as a state"),
@@ -125,6 +127,25 @@ DIAGNOSTICS = [
     (RECORD + 'state n: text\nstate at: cursor in n\n' + ON_K + '  n.insert(at, T { a: 1 })\n}\n', '8:16',
      'a record value goes into a list'),
     ('state n: text\nstate at: cursor in n\n' + ON_K + '  n.remove(at)\n}\n', '5:3', 'a text removes a range'),
+    ('record T {\n  position = 0\n}\n', '2:3', "'position' is where an index is"),
+    (LIST + 'view v = at.b\n', '6:10', "record 'T' has no field 'b'"),
+    (LIST + ON_K + '  at.a = "x"\n}\n', '8:10', 'expected a number, not text'),
+    (LIST + 'state n = 0\n' + ON_K + '  n.a = 1\n}\n', '9:3', 'expected an index, not a number'),
+    # conditional expressions
+    ('view v = if 1 { 2 }\n', '1:20', 'an if expression needs else'),
+    ('view v = if 1 { 2 } else if 0 { 3 }\n', '1:36', 'an if expression needs else'),
+    ('view v = if 1 { 2 } else { "x" }\n', '1:28', 'the branches of if give a number and text'),
+    ('state a: text\nstate b: text\nstate x: cursor in a\nstate y: cursor in b\n' + ON_K + '  x = if 1 { x } else { y }\n}\n',
+     '7:25', 'the branches of if give cursors of different texts'),
+    ('view v = ' + '1 + (if 1 { ' * 9 + '1' + ' } else { 0 })' * 9 + '\n', '1:111', 'conditional expressions nest too deeply'),
+    # tables
+    ('view t = each x in missing {\n  a = 1\n}\n', '1:20', "unknown list 'missing'"),
+    (LIST + 'view t = each x in xs {\n}\n', '7:1', 'a table needs at least one column'),
+    (LIST + 'view t = each x in xs {\n  a = 1\n  a = 2\n}\n', '8:3', "duplicate column 'a'"),
+    (LIST + 'view t = each x in xs {\n  a = x.a\n}\nview v = x.a\n', '9:10', "unknown state 'x'"),
+    (LIST + 'view t = each at in xs {\n  a = 1\n}\n', '6:15', "'at' is already declared as a list index"),
+    (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number or text, not an index'),
+    ('view each = 1\n', '1:6', "'each' is reserved"),
 ]
 
 ACCEPTED = [
@@ -150,6 +171,18 @@ ACCEPTED = [
     'record Row {\n  label: text\n}\nstate rows: list of Row\nstate focus: index of rows\ninput next = key Tab\n'
     'on next.down {\n  if focus.position + 1 < rows.count {\n    focus = focus + 1\n  } else {\n    focus = rows.first\n  }\n}\n'
     'view summary = "{rows.count} rows, focus {focus.position}"\n',
+    # conditionals: else-if chains, on the next line, inside arithmetic, over cursors, seven deep
+    'state n: text = "ab"\nstate at: cursor in n\nstate x = 2\ninput k = key KeyK\n'
+    'on k.down {\n  x = 1 + if x > 1 { 10 } else if x > 0 { 20 }\n  else { 30 }\n'
+    '  at = if x > 5 { n.end } else { n.start }\n}\n'
+    'view size = if x > 1 {\n  "big"\n} else {\n  "small"\n}\n'
+    'view deep = ' + '1 + (if 1 { ' * 7 + '1' + ' } else { 0 })' * 7 + '\n',
+    # a table whose columns read their row, other states and the row's position
+    'record Cell {\n  label: text = "-"\n  weight = 1\n}\nstate cells: list of Cell\nstate at: index of cells\n'
+    'input add = key KeyA\non add.down {\n  cells.append(Cell { weight: cells.count })\n  at.label = "#{at.weight}"\n}\n'
+    'view grid = each cell in cells {\n  label = cell.label\n  heavy = cell.weight > 2\n'
+    '  here = if cell.position == at.position { ">" } else { " " }\n}\n'
+    'view other = each cell in cells { weight = cell.weight }\n',
 ]
 
 
@@ -460,9 +493,13 @@ class TasksModel:
 
     def expected(self):
         item = self.tasks[self.at] if self.tasks else None
+        board = [{'title': task['title'], 'mark': 'x' if task['done'] else ' ', 'here': int(i == self.at)}
+                 for i, task in enumerate(self.tasks)]
         return ({'tasks': [dict(task) for task in self.tasks], 'at': self.at, 'made': self.made},
-                {'count': len(self.tasks), 'position': self.at, 'current': item and item['title'],
-                 'status': f'{self.at + 1}/{len(self.tasks)}', 'finished': item and item['done']})
+                {'count': len(self.tasks), 'position': self.at,
+                 'current': item['title'] if item else '(empty)',
+                 'status': f'{self.at + 1}/{len(self.tasks)}' if item else 'empty',
+                 'finished': item and item['done'], 'board': board})
 
 
 def tasks_parity(aup, pure_run, work, seeds, steps=400):
@@ -505,6 +542,23 @@ def tasks_parity(aup, pure_run, work, seeds, steps=400):
     assert final['states'] == {'tasks': [{'urgent': 1, 'done': 0, 'title': 'milk'},
                                          {'urgent': 1, 'done': 1, 'title': 'b'}], 'at': 0}, final
     return compared, failed
+
+
+def conditionals(aup, pure_run, work):
+    """Only the chosen branch runs (10 / x is never computed at x = 0), else-if
+    chains pick the first true arm, and conditionals nest inside arithmetic."""
+    source = work / 'conditionals.aup'
+    source.write_text('state x = 0\ninput k = key KeyK\non k.down { x = x + 1 }\n'
+                      'view grade = if x > 2 { "high" } else if x > 0 { "some" } else { "none" }\n'
+                      'view safe = if x > 0 { 10 / x } else { 0 }\n'
+                      'view nested = 1 + (if x == 1 { 2 * (if x > 0 { 3 } else { 4 }) } else { 5 })\n')
+    compile_module(aup, source, work / 'conditionals.pmod')
+    lines = run(pure_run, work / 'conditionals.pmod', stdin='show\n' + 'down k\n' * 3).stdout.splitlines()
+    expected = [('none', 0, 6), ('some', 10, 7), ('some', 5, 6), ('high', 10 / 3, 6)]
+    for line, (grade, safe, nested) in zip(lines, expected):
+        views = json.loads(line)['views']
+        assert views == {'grade': grade, 'safe': safe, 'nested': nested}, (views, grade, safe, nested)
+    return len(expected)
 
 
 def text_parity(aup, pure_run, work, seeds, steps=400):
@@ -617,6 +671,7 @@ def main():
         report['text_model_snapshots'] = text_parity(aup, pure_run, work, range(args.text_seeds))
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
+        report['conditional_snapshots'] = conditionals(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

@@ -27,16 +27,23 @@ on typed {
 }
 on up.down { at = at - 1 }
 on down.down { at = at + 1 }
-on toggle.down { tasks[at].done = !tasks[at].done }
+on toggle.down { at.done = !at.done }
 on drop.down { tasks.remove(at) }
 on top.down { at = tasks.first }
 on bottom.down { at = tasks.last }
 # A copy goes before the current task, which stays current.
 on again.down { tasks.insert(at, Task { title: tasks[at].title, done: tasks[at].done }) }
-on shout.down { tasks[at].title = "{tasks[at].title}!" }
+on shout.down { tasks[at].title = "{at.title}!" }
 
 view count = tasks.count
 view position = at.position
-view current = tasks[at].title
-view status = "{at.position + 1}/{tasks.count}"
-view finished = tasks[at].done
+view current = if tasks.count > 0 { at.title } else { "(empty)" }
+view status = if tasks.count > 0 { "{at.position + 1}/{tasks.count}" } else { "empty" }
+view finished = at.done              # no value while the list is empty
+
+# One row per task. A surface computes only the rows it shows.
+view board = each task in tasks {
+  title = task.title
+  mark = if task.done { "x" } else { " " }
+  here = task.position == at.position
+}

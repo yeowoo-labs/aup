@@ -8,7 +8,7 @@
 #include <string.h>
 
 /* Limits and opcodes of Pure module format v5. */
-enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32,
+enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32, JOINS = 8,
        DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 64, CONSTANT_BYTES = 8192,
        RECORDS = 8, RECORD_FIELDS = 64, FIELDS_PER_RECORD = 16 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
@@ -16,7 +16,7 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        TEXT_CONST, TEXT_LOAD, TEXT_INPUT, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
-       ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM };
+       ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
@@ -44,6 +44,7 @@ typedef enum {
     E_ITEM,    /* name[args[0]].member: a field of a list item */
     E_RECORD,  /* name { fields }: E_FIELD nodes linked from args[0] */
     E_FIELD,   /* member: args[0] */
+    E_IF,      /* if args[0] { args[1] } else { args[2] } */
 } ExprKind;
 typedef struct Expr {
     ExprKind kind;
@@ -63,6 +64,7 @@ typedef struct Stmt {
     char name[NAME], member[NAME]; /* member: the item field an S_SET changes */
     Expr *value;          /* assigned value, condition, reply, requirement or insertion */
     Expr *first, *last;   /* a range, the insertion cursor or index, or the item index; last may be NULL */
+                          /* S_SET: name is the list, or empty when first is an index naming the item */
     struct Stmt *then, *otherwise, *next;
 } Stmt;
 
@@ -110,13 +112,18 @@ typedef struct {
     unsigned record_count, record_fields;
     Input inputs[INPUTS];
     unsigned input_count, field_count;
-    char view_names[VIEWS][NAME];
+    /* Views in order; a table (no value) is followed by its columns. */
+    char view_names[VIEWS][NAME], view_row[VIEWS][NAME], view_list[VIEWS][NAME];
     Expr *view_value[VIEWS];
+    int view_table[VIEWS];                            /* a column's table + 1, or 0 */
+    int view_line[VIEWS][2], view_column[VIEWS][2];   /* a table's row name and list name */
     unsigned views;
     struct { char input[NAME]; int edge, line, column; Stmt *body; } handlers[HANDLERS];
     unsigned handler_count;
     /* Code generation. */
     int message;          /* message or text input of the handler being generated, or -1 */
+    int row;              /* the table whose column is being generated, or -1 */
+    unsigned joins;       /* branches ahead that carry a value */
     struct { uint8_t op; uint32_t arg; double value; } code[CODE];
     unsigned code_count;
     uint32_t view_code[VIEWS][2], handler_code[HANDLERS][2];
@@ -129,7 +136,7 @@ typedef struct {
 
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
-                                       "reply", "require", "record"};
+                                       "reply", "require", "record", "each"};
 
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
     va_list args;
@@ -496,6 +503,34 @@ static Expr *string(Compiler *c, const Token *token) {
     return s;
 }
 
+/* { value } of a conditional expression. */
+static Expr *branch_value(Compiler *c) {
+    newlines(c);
+    expect(c, "{", "'{'");
+    Expr *value = expression(c, 0, true);
+    newlines(c);
+    expect(c, "}", "'}'");
+    return value;
+}
+
+/* if condition { value } else { value }, with else if chains. */
+static Expr *conditional(Compiler *c, const Token *token) {
+    if (++c->depth > DEPTH) fail_at(c, token->line, token->column, "expression nesting exceeds 64");
+    Expr *e = node(c, E_IF, token->line, token->column);
+    e->args[0] = expression(c, 0, false);
+    e->args[1] = branch_value(c);
+    if (c->token.kind == T_NL && lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "else")) take(c);
+    if (!word(c, "else")) fail_at(c, c->token.line, c->token.column, "an if expression needs else { value }");
+    take(c);
+    if (word(c, "if")) {
+        Token next = take(c);
+        e->args[2] = conditional(c, &next);
+    } else e->args[2] = branch_value(c);
+    e->count = 3;
+    --c->depth;
+    return e;
+}
+
 static Expr *expression(Compiler *c, int minimum, bool multiline) {
     if (++c->depth > DEPTH) fail_at(c, c->token.line, c->token.column, "expression nesting exceeds 64");
     if (multiline) newlines(c);
@@ -539,6 +574,8 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
                         calls[call].count == 1 ? "" : "s");
         } else if (!strcmp(token.text, "dt")) {
             left = node(c, E_DT, token.line, token.column);
+        } else if (!strcmp(token.text, "if")) {
+            left = conditional(c, &token);
         } else {
             if (reserved_name(token.text)) fail_at(c, token.line, token.column, "expected a number, state, or expression");
             left = node(c, E_NAME, token.line, token.column);
@@ -679,7 +716,18 @@ static Stmt *statement(Compiler *c, unsigned depth) {
     }
     if (is(c, ".")) {
         take(c);
-        Token method = expect_name(c, "insert, remove or append");
+        Token method = expect_name(c, "insert, remove, append or a field");
+        if (is(c, "=")) {
+            /* at.field = value: a field of the item an index names. */
+            take(c);
+            s->kind = S_SET;
+            s->first = node(c, E_NAME, token.line, token.column);
+            memcpy(s->first->name, s->name, NAME);
+            s->name[0] = 0;
+            memcpy(s->member, method.text, NAME);
+            s->value = expression(c, 0, false);
+            return s;
+        }
         expect(c, "(", "'('");
         if (!strcmp(method.text, "insert")) {
             s->kind = S_INSERT;
@@ -745,7 +793,7 @@ static int record_index(const Compiler *c, const char *name) {
 }
 
 static const char *declared_kind(const Compiler *c, const char *name) {
-    static const char *const states[] = {"state", "text state", "cursor", "list", "index"};
+    static const char *const states[] = {"state", "text state", "cursor", "list", "list index"};
     int state = state_index(c, name);
     if (state >= 0) return states[c->state_types[state]];
     if (record_index(c, name) >= 0) return "record";
@@ -753,7 +801,7 @@ static const char *declared_kind(const Compiler *c, const char *name) {
     int input = input_index(c, name);
     if (input >= 0) return c->inputs[input].kind == KIND_KEY ? "key input" :
                            c->inputs[input].kind == KIND_TEXT ? "text input" : "message";
-    for (unsigned i = 0; i < c->views; ++i) if (!strcmp(c->view_names[i], name)) return "view";
+    for (unsigned i = 0; i < c->views; ++i) if (!c->view_table[i] && !strcmp(c->view_names[i], name)) return "view";
     return NULL;
 }
 
@@ -830,6 +878,8 @@ static void record_declaration(Compiler *c) {
     while (!is(c, "}")) {
         Token field = expect_name(c, "a field name");
         if (reserved_name(field.text)) fail_at(c, field.line, field.column, "'%s' is reserved", field.text);
+        if (!strcmp(field.text, "position"))
+            fail_at(c, field.line, field.column, "'position' is where an index is; give the field another name");
         for (unsigned i = 0; i < r->fields; ++i)
             if (!strcmp(r->field_names[i], field.text)) fail_at(c, field.line, field.column, "duplicate field '%s'", field.text);
         if (r->fields == FIELDS_PER_RECORD) fail_at(c, field.line, field.column, "a record has at most 16 fields");
@@ -905,6 +955,39 @@ static void state_declaration(Compiler *c) {
     ++c->states;
 }
 
+/* view name = each row in list { column = value ... }: one row per item. */
+static void table_declaration(Compiler *c, unsigned table) {
+    take(c); /* each */
+    Token row = expect_name(c, "a name for each item");
+    if (reserved_name(row.text)) fail_at(c, row.line, row.column, "'%s' is reserved", row.text);
+    expect_word(c, "in");
+    Token list = expect_name(c, "a list state");
+    memcpy(c->view_row[table], row.text, NAME);
+    memcpy(c->view_list[table], list.text, NAME);
+    c->view_line[table][0] = row.line;
+    c->view_column[table][0] = row.column;
+    c->view_line[table][1] = list.line;
+    c->view_column[table][1] = list.column;
+    expect(c, "{", "'{' on the line of the table");
+    separators(c);
+    while (!is(c, "}")) {
+        Token column = expect_name(c, "a column name");
+        if (reserved_name(column.text)) fail_at(c, column.line, column.column, "'%s' is reserved", column.text);
+        for (unsigned i = table + 1; i < c->views; ++i)
+            if (!strcmp(c->view_names[i], column.text))
+                fail_at(c, column.line, column.column, "duplicate column '%s'", column.text);
+        if (c->views == VIEWS) fail_at(c, column.line, column.column, "at most 64 views are allowed");
+        expect(c, "=", "'='");
+        unsigned index = c->views++;
+        memcpy(c->view_names[index], column.text, NAME);
+        c->view_table[index] = (int)table + 1;
+        c->view_value[index] = expression(c, 0, false);
+        end(c);
+    }
+    if (c->views == table + 1) fail_at(c, c->token.line, c->token.column, "a table needs at least one column");
+    take(c);
+}
+
 static void declaration(Compiler *c) {
     Token kind = expect_name(c, "state, record, input, view, or on");
     if (!strcmp(kind.text, "state")) {
@@ -946,8 +1029,10 @@ static void declaration(Compiler *c) {
         declare(c, &name);
         if (c->views == VIEWS) fail_at(c, name.line, name.column, "at most 64 views are allowed");
         expect(c, "=", "'='");
-        memcpy(c->view_names[c->views], name.text, NAME);
-        c->view_value[c->views++] = expression(c, 0, false);
+        unsigned index = c->views++;
+        memcpy(c->view_names[index], name.text, NAME);
+        if (!word(c, "each")) c->view_value[index] = expression(c, 0, false);
+        else table_declaration(c, index);
     } else if (!strcmp(kind.text, "on")) {
         if (c->handler_count == HANDLERS) fail_at(c, kind.line, kind.column, "at most 64 handlers are allowed");
         Token event = expect_name(c, "frame or an input");
@@ -1096,6 +1181,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         return (Kind){TEXT, -1};
     }
     case E_NAME: {
+        if (c->row >= 0 && !strcmp(e->name, c->view_row[c->row])) {
+            int list = state_index(c, c->view_list[c->row]);
+            emit(c, e->line, e->column, ROW, (uint32_t)list, 0);
+            return (Kind){INDEX, list};
+        }
         int index = state_index(c, e->name);
         if (index >= 0) {
             int type = c->state_types[index];
@@ -1162,6 +1252,13 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             return (Kind){NUM, -1};
         }
         if (inner.type == INDEX && !strcmp(m, "position")) { emit(c, e->line, e->column, INDEX_NUM, 0, 0); return (Kind){NUM, -1}; }
+        if (inner.type == INDEX) {
+            /* at.title: a field of the item the index names. */
+            const Record *r = record_of(c, inner.owner);
+            unsigned field = record_field(c, r, m, e->line, e->column);
+            emit(c, e->line, e->column, ITEM_GET, (uint32_t)inner.owner | field << 16, 0);
+            return (Kind){r->field_text[field] ? TEXT : NUM, -1};
+        }
         fail_at(c, e->line, e->column, "%s has no '%s'", type_name(inner.type), m);
     }
     case E_LINE: {
@@ -1193,6 +1290,41 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         index_of(c, e->args[0], handler, height, list);
         emit(c, e->line, e->column, ITEM_GET, (uint32_t)list | field << 16, 0);
         return (Kind){r->field_text[field] ? TEXT : NUM, -1};
+    }
+    case E_IF: {
+        /* Arms of an else-if chain share one end; a value crosses it, so the
+         * branches ahead that carry one are counted against Pure's limit. */
+        unsigned ends[DEPTH], arms = 0, saved = c->joins;
+        Kind kind = {0, -1};
+        const Expr *arm = e;
+        for (;;) {
+            number(c, arm->args[0], handler, height);
+            unsigned jump = c->code_count;
+            emit(c, arm->line, arm->column, JZ, 0, 0);
+            if (height && ++c->joins > JOINS) fail_at(c, arm->line, arm->column, "conditional expressions nest too deeply");
+            Kind then = value(c, arm->args[1], handler, height);
+            if (arms && (then.type != kind.type || then.owner != kind.owner))
+                fail_at(c, arm->args[1]->line, arm->args[1]->column, then.type != kind.type ?
+                        "the branches of if give %s and %s" : "the branches of if point into different texts or lists",
+                        type_name(kind.type), type_name(then.type));
+            kind = then;
+            ends[arms++] = c->code_count;
+            emit(c, arm->line, arm->column, JMP, 0, 0);
+            if (arms == 1 && ++c->joins > JOINS) fail_at(c, arm->line, arm->column, "conditional expressions nest too deeply");
+            c->code[jump].arg = c->code_count;
+            if (height) --c->joins;
+            if (arm->args[2]->kind != E_IF) break;
+            arm = arm->args[2];
+        }
+        Kind otherwise = value(c, arm->args[2], handler, height);
+        if (otherwise.type != kind.type || otherwise.owner != kind.owner)
+            fail_at(c, arm->args[2]->line, arm->args[2]->column, otherwise.type != kind.type ?
+                    "the branches of if give %s and %s" : kind.type == CURSOR ?
+                    "the branches of if give cursors of different texts" : "the branches of if give indices of different lists",
+                    type_name(kind.type), type_name(otherwise.type));
+        for (unsigned i = 0; i < arms; ++i) c->code[ends[i]].arg = c->code_count;
+        c->joins = saved;
+        return kind;
     }
     case E_RECORD: case E_FIELD:
         fail_at(c, e->line, e->column, "a record value goes into a list, as in list.append(%s { ... })", e->name);
@@ -1306,10 +1438,15 @@ static void statements(Compiler *c, const Stmt *s) {
             break;
         }
         case S_SET: {
-            int list = list_state(c, s->name, s->line, s->column, s->first);
+            int list = *s->name ? list_state(c, s->name, s->line, s->column, s->first) : -1;
+            if (list < 0) {
+                Kind index = value(c, s->first, true, 0);
+                expect_kind(c, s->first, index, INDEX);
+                list = index.owner;
+            }
             const Record *r = record_of(c, list);
             unsigned field = record_field(c, r, s->member, s->line, s->column);
-            index_of(c, s->first, true, 0, list);
+            if (*s->name) index_of(c, s->first, true, 0, list);
             expect_kind(c, s->value, value(c, s->value, true, 1), r->field_text[field] ? TEXT : NUM);
             emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
@@ -1428,16 +1565,29 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         handler_input[i] = input;
         events[i] = 1u + 2u * (uint32_t)input + (c->handlers[i].edge > 0);
     }
-    /* Views, then handlers, each as one contiguous block. */
+    /* Views, then handlers, each as one contiguous block. A table names its
+     * list in place of code; its columns may read its row. */
     c->message = -1;
     for (unsigned i = 0; i < c->views; ++i) {
+        if (!c->view_value[i]) {
+            const char *row = c->view_row[i], *kind = declared_kind(c, row);
+            if (kind) fail_at(c, c->view_line[i][0], c->view_column[i][0], "'%s' is already declared as a %s", row, kind);
+            int list = list_state(c, c->view_list[i], c->view_line[i][1], c->view_column[i][1], NULL);
+            c->view_types[i] = 2;
+            c->view_code[i][0] = (uint32_t)list;
+            c->view_code[i][1] = 0;
+            continue;
+        }
+        c->row = c->view_table[i] - 1;
         c->view_code[i][0] = c->code_count;
         Kind kind = value(c, c->view_value[i], false, 0);
         if (kind.type != NUM && kind.type != TEXT)
-            fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a view is a number or text, not %s", type_name(kind.type));
+            fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a %s is a number or text, not %s",
+                    c->row >= 0 ? "column" : "view", type_name(kind.type));
         c->view_types[i] = kind.type == TEXT;
         c->view_code[i][1] = c->code_count - c->view_code[i][0];
     }
+    c->row = -1;
     for (unsigned i = 0; i < c->handler_count; ++i) {
         int input = handler_input[i];
         c->message = input >= 0 && c->inputs[input].kind != KIND_KEY ? input : -1;
@@ -1525,7 +1675,9 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         }
     for (unsigned i = 0; i < c->views; ++i) {
         p = put32(p, view_name[i]);
-        p = put32(p, (uint32_t)c->view_types[i]);
+        *p++ = (unsigned char)c->view_types[i];
+        *p++ = 0;
+        p = put16(p, (uint32_t)c->view_table[i]);
         p = put32(p, c->view_code[i][0]);
         p = put32(p, c->view_code[i][1]);
     }
@@ -1554,6 +1706,7 @@ bool aup_compile(const char *source, size_t length, unsigned char **module, size
     c->length = length;
     c->line = c->column = 1;
     c->error = error;
+    c->row = -1;
     unsigned char *result = NULL;
     if (!setjmp(c->fail)) {
         if (length > AUP_SOURCE_LIMIT) fail_at(c, 1, 1, "source exceeds 32768 bytes");
