@@ -1,6 +1,6 @@
 # aup v0 — 한 언어, 한 모듈 형식
 
-2026-09-25. 상태: v0a(scalar) 확정, v0b(바이트·영속 문서) 초안.
+2026-09-25. 상태: v0a(scalar)와 v0b의 바이트·영속 문서 부분 구현. text·커서는 [002](002-dsl-direction.md)에서 다음에 구현.
 
 착수 기준:
 
@@ -82,29 +82,36 @@ Pure는 로드할 때 범위·이름·분기·스택 높이를 모두 정적으�
 - `aup build FILE -o OUT.pmod`: 모듈을 만든다. 같은 소스는 바이트 단위로 같은 모듈을 만든다.
 - C17, 외부 의존성 없음. 컴파일러는 Pure를 링크하지 않는다. 시험에서는 Pure의 검증기로 결과를 확인한다.
 
-## v0b 초안: 바이트와 영속 문서
+## v0b: 바이트와 영속 문서 (구현)
 
 ```text
-layout Edit {
-  start: u32le
-  remove: u32le
+state documents: bytes by key          # 키마다 바이트 값 하나. 런타임이 버전을 붙여 영속화한다
+
+input show = message by key            # 키(와 선택적 기준 버전)를 가진 메시지
+input edit = message by key {
+  start: u32                           # 필드는 u32와 마지막 bytes 하나
+  remove: u32
   insert: bytes
-}
-
-state documents: bytes by key        # 키마다 하나의 바이트 값. 런타임이 버전을 붙여 영속화한다
-input edit = message Edit by key     # 키와 기준 버전을 가진 메시지
-input show = message by key
-
-on edit {
-  documents[key].splice(edit.start, edit.remove, edit.insert)
-  reply edit.insert
 }
 
 on show {
   reply documents[key]
 }
+
+on edit {
+  documents[key].replace(edit.start .. edit.start + edit.remove, edit.insert)
+  require documents[key].bytes <= 8    # 선택: 크기 정책은 require 한 줄
+  reply edit.insert
+}
 ```
 
-- 이벤트 트랜잭션이 곧 Pure draft다. 핸들러가 성공하면 draft를 커밋하고, 기준 버전이 다르면 충돌이다.
-- 바이트 값은 익스텐트 열이다. 연속 버퍼를 언어에서 드러내지 않는다.
-- `get/put` 핸들러, `store.read/splice` 호출, `request.revision`은 언어에서 사라진다. HTTP·CLI 호스트가 입력과 응답으로 바꾼다.
+- `on 메시지 { }`는 메시지가 도착할 때 한 번 실행된다. 필드는 `메시지.필드`, 키는 `key`로만 쓴다.
+- `이름[key]`는 그 메시지 키의 문서다. 읽으면 bytes, `.bytes`는 크기(없으면 0)다. 없는 문서를 읽으면 `not_found`.
+- `replace(a .. b, 값)`는 문서의 `[a, b)`를 바꾼다. 정수가 아니거나 범위 밖이면 이벤트가 `limit`으로 실패한다.
+- `require 조건`이 거짓이면 이벤트가 `limit`으로 실패한다. 크기 정책처럼 저장소의 특수 인자였던 것이 문장 하나가 된다.
+- 이벤트가 곧 Pure draft 트랜잭션이다. 기준 버전이 현재와 다르면 바로 `conflict`, 핸들러가 성공하면 커밋, 실패하면 아무것도 바뀌지 않는다.
+- `get/put`, `store.read/splice`, `request.revision`은 언어에서 사라졌다. CLI·HTTP 호스트가 입력과 응답으로 바꾼다.
+
+검증: Pure의 `pure-edit-module`로 실행한 `examples/editor.aup`·`bounded-editor.aup`가, 기존 `pure-edit`로 실행한
+`editor.pure`·`bounded-editor.pure`와 무작위 show·edit·apply 1,280회(성공·충돌·범위·없음·예산·잘못된 키 포함)에서
+stdout·stderr·종료 코드가 바이트 단위로 같고, 서로의 저장소를 같게 읽는다(`make check`).

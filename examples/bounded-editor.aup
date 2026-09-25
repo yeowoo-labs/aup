@@ -1,0 +1,20 @@
+# The same editor with an authored size policy: an edit whose result would
+# exceed 8 bytes fails as a whole, and nothing is stored.
+state documents: bytes by key
+
+input show = message by key
+input edit = message by key {
+  start: u32
+  remove: u32
+  insert: bytes
+}
+
+on show {
+  reply documents[key]
+}
+
+on edit {
+  documents[key].replace(edit.start .. edit.start + edit.remove, edit.insert)
+  require documents[key].bytes <= 8
+  reply edit.insert
+}

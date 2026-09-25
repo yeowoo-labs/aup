@@ -63,7 +63,7 @@ view current = note.line(at)           # 커서가 있는 줄. 복사하지 않�
 | 단계 | 들어가는 것 | 합격 기준 |
 |---|---|---|
 | v0a ✅ | 스칼라 상태, 키 입력, 핸들러, 보기 | 워크벤치 엔진과 비트 단위 일치 |
-| v0b | `bytes`, `text`(리터럴·보간·`cursor in`·`char`/`line`), 키별 영속 문서, `message`·`text` 입력, 응답 | 기존 편집기 CLI/TUI 검사와 결과 일치 |
+| v0b | `bytes`, 키별 영속 문서, `message` 입력, 응답, `require` ✅ / `text`(리터럴·보간·`cursor in`·`char`/`line`), `text` 입력 | 기존 편집기 CLI와 바이트 단위 일치 ✅ / TUI 동작 |
 | v0c | `i64 bool`, `record`, `list`/`map`, `index of`, 순수 `fn`, `use` 모듈 | 모든 연산에 실행량 상한 |
 | v0d | `use vega`로 첫 인터페이스 투영(목록·표·커서·톤) | 한 명세가 두 표면 이상에서 동작 |
 

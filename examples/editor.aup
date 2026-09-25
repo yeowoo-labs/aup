@@ -1,0 +1,20 @@
+# Revision-checked byte edits of keyed documents. The runtime owns the
+# documents: an edit is a transaction on the key's working version, which
+# commits only if the sender's revision is still current.
+state documents: bytes by key
+
+input show = message by key
+input edit = message by key {
+  start: u32
+  remove: u32
+  insert: bytes
+}
+
+on show {
+  reply documents[key]
+}
+
+on edit {
+  documents[key].replace(edit.start .. edit.start + edit.remove, edit.insert)
+  reply edit.insert
+}
