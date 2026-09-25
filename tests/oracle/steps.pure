@@ -1,0 +1,23 @@
+# The workbench has no else; the aup else-if chain is written as exclusive ifs.
+state level = 0
+state band = 0
+input up = ArrowUp
+input down = ArrowDown
+text shown(0, 0, band, "band")
+on up.down {
+  level = level + 1
+}
+on down.down {
+  level = level - 1
+}
+on frame {
+  if level > 2 {
+    band = 2
+  }
+  if level <= 2 && level > 0 {
+    band = 1
+  }
+  if level <= 0 {
+    band = 0
+  }
+}

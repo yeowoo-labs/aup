@@ -1,0 +1,22 @@
+# Each input fails on some presses; a failed event changes nothing.
+state q = 1
+state r = 0
+state s = 5
+input divide = key KeyD
+input grow = key KeyG
+input bound = key KeyB
+view shown = r
+
+on divide.down {
+  r = r + 1
+  q = 10 / (q - 1)
+}
+
+on grow.down {
+  s = s * 1e200
+}
+
+on bound.down {
+  r = r + 1
+  s = clamp(s, r, 3)
+}

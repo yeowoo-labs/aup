@@ -9,7 +9,18 @@ aup는 [Pure](/srv/git/pure.git) 런타임을 위한 **언어와 툴체인**이�
 | **aup** | 언어와 툴체인. 소스 → 진단 → Pure 모듈 |
 | [Vega](/srv/git/vega.git) | aup와 Pure 위의 인터페이스 구현자(TUI·CLI·GUI·NUI) |
 
-상태: v0 설계 중. [언어 v0](docs/design/001-language-v0.md).
+상태: v0a(scalar 상태·키 입력·원자적 이벤트·보기) 동작. v0b(바이트·영속 문서) 설계 중.
+[언어 v0](docs/design/001-language-v0.md).
+
+```sh
+make                                   # build/aup
+build/aup build examples/counter.aup -o counter.pmod
+printf 'down tap\nup tap\nshow\n' | ../pure/prototypes/connections/build/pure-run counter.pmod
+make check                             # Pure 검증, 결정성, 진단, 워크벤치 엔진과의 비트 단위 대조
+```
+
+`make check`는 옆의 Pure 체크아웃(`PURE=../pure/prototypes/connections`)의 검증기와 시험 호스트를 쓰고,
+워크벤치 대조에는 Node가 필요하다.
 
 ## 원칙
 

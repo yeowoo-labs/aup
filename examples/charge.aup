@@ -1,0 +1,36 @@
+# Hold Space to charge a jump; gravity and the floor are authored here.
+state holding = 0
+state charge = 0
+state y = 240
+state velocity = 0
+input jump = key Space
+view actor_y = y
+view meter_width = charge * 200
+view amount = charge
+
+on jump.down {
+  if y >= 240 {
+    holding = 1
+    charge = 0
+  }
+}
+
+on jump.up {
+  if holding {
+    velocity = -(160 + charge * 300)
+    holding = 0
+    charge = 0
+  }
+}
+
+on frame {
+  if holding {
+    charge = clamp(charge + dt, 0, 1)
+  }
+  velocity = velocity + 600 * dt
+  y = y + velocity * dt
+  if y >= 240 {
+    y = 240
+    velocity = 0
+  }
+}

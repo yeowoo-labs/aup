@@ -1,0 +1,9 @@
+# Space increments a count; views expose what a surface would show.
+state count = 0
+input tap = key Space
+view label = count
+view tile_width = 40 + min(count, 20) * 8
+
+on tap.down {
+  count = count + 1
+}

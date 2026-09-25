@@ -1,0 +1,24 @@
+# if / else and else if; the first matching branch runs.
+state level = 0
+state band = 0
+input up = key ArrowUp
+input down = key ArrowDown
+view shown = band
+
+on up.down {
+  level = level + 1
+}
+
+on down.down {
+  level = level - 1
+}
+
+on frame {
+  if level > 2 {
+    band = 2
+  } else if level > 0 {
+    band = 1
+  } else {
+    band = 0
+  }
+}
