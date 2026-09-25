@@ -7,8 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Limits and opcodes of Pure module format v4. */
-enum { STATES = 32, INPUTS = 32, VIEWS = 24, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32,
+/* Limits and opcodes of Pure module format v5. */
+enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32,
        DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 64, CONSTANT_BYTES = 8192,
        RECORDS = 8, RECORD_FIELDS = 64, FIELDS_PER_RECORD = 16 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
@@ -944,7 +944,7 @@ static void declaration(Compiler *c) {
     } else if (!strcmp(kind.text, "view")) {
         Token name = expect_name(c, "view name");
         declare(c, &name);
-        if (c->views == VIEWS) fail_at(c, name.line, name.column, "at most 24 views are allowed");
+        if (c->views == VIEWS) fail_at(c, name.line, name.column, "at most 64 views are allowed");
         expect(c, "=", "'='");
         memcpy(c->view_names[c->views], name.text, NAME);
         c->view_value[c->views++] = expression(c, 0, false);
@@ -1468,7 +1468,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     *size = 40 + 16u * c->states + 12u * c->collections + 16u * c->input_count + 8u * fields + 8u * c->constants +
             8u * c->record_count + 16u * c->record_fields + 16u * c->views + 12u * c->handler_count + 16u * c->code_count + used + c->constant_used;
     unsigned char *p = *module = allocate(c, *size);
-    memcpy(p, "PUREMOD4", 8);
+    memcpy(p, "PUREMOD5", 8);
     put16(p + 8, c->states);
     put16(p + 10, c->input_count);
     put16(p + 12, c->views);
