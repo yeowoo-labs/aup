@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* aup v0a: source text to a Pure module v1 (Pure docs/design/008). */
+/* aup: source text to a Pure module (Pure docs/design/008-module-format.md). */
 enum { AUP_SOURCE_LIMIT = 32768, AUP_MESSAGE = 160 };
 
 typedef struct {

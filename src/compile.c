@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Limits and opcodes of Pure module format v3. */
+/* Limits and opcodes of Pure module format v4. */
 enum { STATES = 32, INPUTS = 32, VIEWS = 24, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32,
        DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 64, CONSTANT_BYTES = 8192 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
@@ -1175,7 +1175,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     *size = 40 + 16u * c->states + 12u * c->collections + 16u * c->input_count + 8u * fields + 8u * c->constants +
             16u * c->views + 12u * c->handler_count + 16u * c->code_count + used + c->constant_used;
     unsigned char *p = *module = allocate(c, *size);
-    memcpy(p, "PUREMOD3", 8);
+    memcpy(p, "PUREMOD4", 8);
     put16(p + 8, c->states);
     put16(p + 10, c->input_count);
     put16(p + 12, c->views);

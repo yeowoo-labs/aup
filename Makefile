@@ -2,7 +2,7 @@ CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Werror
 BUILD ?= build
-# The Pure checkout that owns module format v1; tests load every module with it.
+# The Pure checkout that owns the module format; tests load every module with it.
 PURE ?= ../pure/prototypes/connections
 
 .PHONY: all check
