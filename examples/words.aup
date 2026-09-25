@@ -1,0 +1,5 @@
+# Words for counts and marks. A library: only fns, no state, so any app can
+# `use words` and call words.counted(...).
+fn plural(count, one, many) = if count == 1 { one } else { many }
+fn counted(count, one, many) = "{count} {plural(count, one, many)}"
+fn check(done) = if done { "x" } else { " " }

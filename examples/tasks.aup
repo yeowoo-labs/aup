@@ -1,6 +1,8 @@
 # A task list. The runtime owns the list: the index always names an item,
 # stays on it when items are inserted or removed before it, stops at the
 # ends, and a failed event leaves the list as it was.
+use words
+
 record Task {
   title: text
   done = 0
@@ -40,10 +42,11 @@ view position = at.position
 view current = if tasks.count > 0 { at.title } else { "(empty)" }
 view status = if tasks.count > 0 { "{at.position + 1}/{tasks.count}" } else { "empty" }
 view finished = at.done              # no value while the list is empty
+view summary = words.counted(tasks.count, "task", "tasks")
 
 # One row per task. A surface computes only the rows it shows.
 view board = each task in tasks {
   title = task.title
-  mark = if task.done { "x" } else { " " }
+  mark = words.check(task.done)
   here = task.position == at.position
 }

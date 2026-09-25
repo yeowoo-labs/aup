@@ -146,6 +146,17 @@ DIAGNOSTICS = [
     (LIST + 'view t = each at in xs {\n  a = 1\n}\n', '6:15', "'at' is already declared as a list index"),
     (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number or text, not an index'),
     ('view each = 1\n', '1:6', "'each' is reserved"),
+    # fns
+    ('fn f(x) = x\nview v = f(1, 2)\n', '2:10', 'f expects 1 argument'),
+    ('fn f(x) = f(x)\nview v = f(1)\n', '1:11', "fn 'f' calls itself (in fn 'f' called at 2:10)"),
+    ('fn f(x, x) = 1\n', '1:9', "duplicate parameter 'x'"),
+    ('view v = g(1)\n', '1:10', "unknown fn 'g'"),
+    ('fn f(x) = x + "a"\nview v = f(1)\n', '1:15', "expected a number, not text (in fn 'f' called at 2:10)"),
+    ('fn text(x) = x\n', '1:4', "'text' is a built-in conversion"),
+    ('state f = 0\nfn f = 1\n', '2:4', "'f' is already declared as a state"),
+    ('state n = 0\nview v = n(1)\n', '2:10', "'n' is a state, not a fn"),
+    ('use missing\n', '1:5', "cannot find library 'missing' (missing.aup)"),
+    ('view v = shapes.area(1, 2)\n', '1:17', "unknown library 'shapes'; write use shapes first"),
 ]
 
 ACCEPTED = [
@@ -183,6 +194,12 @@ ACCEPTED = [
     'view grid = each cell in cells {\n  label = cell.label\n  heavy = cell.weight > 2\n'
     '  here = if cell.position == at.position { ">" } else { " " }\n}\n'
     'view other = each cell in cells { weight = cell.weight }\n',
+    # fns: parameters of any kind, constants, calls inside fns, tables and conditionals
+    'record T {\n  a = 0\n  s: text\n}\nstate xs: list of T\nstate at: index of xs\nstate note: text\n'
+    'state c: cursor in note\nfn tag(i) = "{i.s}#{i.a}"\nfn limit = 3\nfn clip(x) = min(x, limit)\n'
+    'fn later(cursor, n) = cursor + n char\ninput k = key KeyK\n'
+    'on k.down {\n  xs.append(T { a: clip(xs.count), s: "q" })\n  c = later(c, 2)\n}\n'
+    'view board = each r in xs {\n  tag = tag(r)\n}\nview cur = if xs.count > 0 { tag(at) } else { "-" }\n',
 ]
 
 
@@ -499,7 +516,8 @@ class TasksModel:
                 {'count': len(self.tasks), 'position': self.at,
                  'current': item['title'] if item else '(empty)',
                  'status': f'{self.at + 1}/{len(self.tasks)}' if item else 'empty',
-                 'finished': item and item['done'], 'board': board})
+                 'finished': item and item['done'],
+                 'summary': f"{len(self.tasks)} {'task' if len(self.tasks) == 1 else 'tasks'}", 'board': board})
 
 
 def tasks_parity(aup, pure_run, work, seeds, steps=400):
@@ -542,6 +560,52 @@ def tasks_parity(aup, pure_run, work, seeds, steps=400):
     assert final['states'] == {'tasks': [{'urgent': 1, 'done': 0, 'title': 'milk'},
                                          {'urgent': 1, 'done': 1, 'title': 'b'}], 'at': 0}, final
     return compared, failed
+
+
+def libraries(aup, pure_run, work):
+    """fn calls compute each argument once, libraries are found beside the
+    source or on AUP_PATH, a library sees only its parameters, and errors in a
+    library name its file."""
+    lib, other = work / 'libs', work / 'libs' / 'far'
+    other.mkdir(parents=True, exist_ok=True)
+    (lib / 'shapes.aup').write_text('fn area(w, h) = w * h\nfn square(s) = area(s, s)\nfn unit = 1\n')
+    (lib / 'loopa.aup').write_text('use loopb\nfn a = 1\n')
+    (lib / 'loopb.aup').write_text('use loopa\nfn b = 2\n')
+    (lib / 'stateful.aup').write_text('fn f = 1\nstate x = 0\n')
+    (lib / 'peek.aup').write_text('fn f(a) = a + x\n')
+    (other / 'far.aup').write_text('fn twice(x) = x * 2\n')
+    env = {'AUP_PATH': f'{lib / "missing"}:{other}', 'PATH': '/usr/bin:/bin'}
+
+    def build(source):
+        path = lib / 'main.aup'
+        path.write_text(source)
+        return subprocess.run([str(aup), 'build', str(path), '-o', str(lib / 'main.pmod')], capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    good = [
+        ('use shapes\nuse far\nstate n = 3\nview a = shapes.square(n)\nview b = shapes.area(2, n + 1) + shapes.unit\n'
+         'view c = far.twice(n)\n', {'a': 9, 'b': 9, 'c': 6}),
+        ('fn sq(x) = x * x\nstate n = 3\nview v = sq(n + 1)\nview t = sq(sq(2))\n', {'v': 16, 't': 16}),
+        ('fn first(a, b) = a\nview v = first(1, 1 / 0)\n', {'v': None}),   # arguments are always computed
+    ]
+    for source, views in good:
+        result = build(source)
+        assert result.returncode == 0, (source, result.stderr)
+        first = (lib / 'main.pmod').read_bytes()
+        assert build(source).returncode == 0 and (lib / 'main.pmod').read_bytes() == first, source
+        shown = json.loads(run(pure_run, lib / 'main.pmod', stdin='show\n').stdout)
+        assert shown['views'] == views, (source, shown['views'])
+    bad = [
+        ('use loopa\n', 'loopb.aup:1:5', "library 'loopa' uses itself through its uses"),
+        ('use stateful\n', 'stateful.aup:2:1', 'a library declares only fn and use'),
+        ('use peek\nstate x = 1\nview v = peek.f(1)\n', 'peek.aup:1:15',
+         "'x' is not a parameter; a library fn reads only its parameters (in fn 'f' called at 3:15)"),
+        ('use shapes\nview v = shapes.volume(1)\n', 'main.aup:2:17', "library 'shapes' has no fn 'volume'"),
+    ]
+    for source, where, message in bad:
+        result = build(source)
+        assert result.returncode == 1 and f'{where}: {message}' in result.stderr, (source, result.stderr)
+    return len(good), len(bad)
 
 
 def conditionals(aup, pure_run, work):
@@ -672,6 +736,7 @@ def main():
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
+        report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

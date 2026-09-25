@@ -1,6 +1,6 @@
 # aup v0 — 한 언어, 한 모듈 형식
 
-2026-09-25. 상태: v0a(scalar)와 v0b(바이트·영속 문서·text·커서), v0c의 레코드·리스트·인덱스·조건식·표 보기 구현.
+2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use) 구현.
 text와 리스트 문법은 [002](002-dsl-direction.md).
 
 착수 기준:
@@ -48,7 +48,7 @@ on frame {                       # 1/60초 진행. 핸들러 안에서 dt를 쓸
 ```
 
 - 선언과 문장은 줄바꿈이나 `;`로 끝난다. 이름은 ASCII `[A-Za-z_][A-Za-z_0-9]*`, 31바이트 이하다.
-- 예약어: `state input view on if else key frame dt min max clamp message by bytes u32 reply require record each`.
+- 예약어: `state input view on if else key frame dt min max clamp message by bytes u32 reply require record each fn use`.
 - 키: `Space Enter ArrowLeft ArrowRight ArrowUp ArrowDown KeyA..KeyZ Digit0..Digit9`. 입력 이름과
   키는 각각 한 번만 쓴다. 상태·입력·보기의 이름공간은 서로 겹칠 수 없다.
 - 식: 숫자, 상태 이름, `dt`(핸들러 안에서만), 괄호, 단항 `- !`, 이항 `* /`, `+ -`,
@@ -79,7 +79,8 @@ Pure는 로드할 때 범위·이름·분기·스택 높이를 모두 정적으�
 
 ## 툴체인
 
-- `aup check FILE`: 진단만 한다. 오류는 `파일:줄:열: 메시지` 한 줄이다.
+- `aup check FILE`: 진단만 한다. 오류는 `파일:줄:열: 메시지` 한 줄이다(라이브러리 안이면 그 파일).
+- `use 이름`은 `이름.aup`을 FILE 옆, 그다음 `AUP_PATH`의 디렉터리 순서로 찾는다.
 - `aup build FILE -o OUT.pmod`: 모듈을 만든다. 같은 소스는 바이트 단위로 같은 모듈을 만든다.
 - C17, 외부 의존성 없음. 컴파일러는 Pure를 링크하지 않는다. 시험에서는 Pure의 검증기로 결과를 확인한다.
 

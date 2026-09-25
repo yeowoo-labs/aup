@@ -10,13 +10,14 @@
 /* Limits and opcodes of Pure module format v5. */
 enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32, JOINS = 8,
        DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 64, CONSTANT_BYTES = 8192,
-       RECORDS = 8, RECORD_FIELDS = 64, FIELDS_PER_RECORD = 16 };
+       RECORDS = 8, RECORD_FIELDS = 64, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, DOC, DOC_SIZE, LEN, REPLACE, REPLY, REQUIRE,
        TEXT_CONST, TEXT_LOAD, TEXT_INPUT, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
-       ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW };
+       ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
+       PICK, SLIDE };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
@@ -40,7 +41,7 @@ typedef enum {
     E_TEXT,    /* literal bytes */
     E_UNIT,    /* args[0] char|line */
     E_CONVERT, /* text(args[0]) or bytes(args[0]) */
-    E_LINE,    /* name.line(args[0]) */
+    E_FN,      /* name(args): a fn, qualified by the library in member (name.line(at) when member is a text) */
     E_ITEM,    /* name[args[0]].member: a field of a list item */
     E_RECORD,  /* name { fields }: E_FIELD nodes linked from args[0] */
     E_FIELD,   /* member: args[0] */
@@ -51,7 +52,7 @@ typedef struct Expr {
     int line, column, op;
     double number;
     char name[NAME], member[NAME];
-    struct Expr *args[3], *next;
+    struct Expr *args[PARAMS], *next;
     unsigned count;
     unsigned char *bytes;
     size_t size;
@@ -89,6 +90,21 @@ typedef struct {
     unsigned fields;
 } Record;
 
+/* A fn: one expression over its parameters, inlined where it is called. */
+typedef struct {
+    char name[NAME], params[PARAMS][NAME];
+    unsigned param_count;
+    int module, line, column;
+    Expr *body;
+    bool active; /* being inlined: a call back into it is recursion */
+} Fn;
+
+/* The fn being inlined: where its arguments are on the stack and their kinds. */
+typedef struct Scope {
+    int fn, base, line, column;
+    Kind kinds[PARAMS];
+} Scope;
+
 typedef struct {
     const char *source;
     size_t length, at;
@@ -123,6 +139,15 @@ typedef struct {
     /* Code generation. */
     int message;          /* message or text input of the handler being generated, or -1 */
     int row;              /* the table whose column is being generated, or -1 */
+    /* Libraries: module 0 is the main source; each module lists the libraries it uses. */
+    struct { char name[NAME], path[AUP_PATH]; bool uses[MODULES], parsing; } modules[MODULES];
+    unsigned module_count;
+    int module;           /* the module being parsed, or whose fn is being inlined */
+    AupLoad load;
+    void *load_context;
+    Fn fns[FNS];
+    unsigned fn_count;
+    Scope *scope;         /* the fn being inlined, or NULL */
     unsigned joins;       /* branches ahead that carry a value */
     struct { uint8_t op; uint32_t arg; double value; } code[CODE];
     unsigned code_count;
@@ -136,15 +161,20 @@ typedef struct {
 
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
-                                       "reply", "require", "record", "each"};
+                                       "reply", "require", "record", "each", "fn", "use"};
 
+/* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
     va_list args;
     va_start(args, format);
     c->error->line = line;
     c->error->column = column;
-    vsnprintf(c->error->message, sizeof(c->error->message), format, args);
+    snprintf(c->error->path, sizeof(c->error->path), "%s", c->modules[c->module].path);
+    int used = vsnprintf(c->error->message, sizeof(c->error->message), format, args);
     va_end(args);
+    if (c->scope && used >= 0 && (size_t)used < sizeof(c->error->message))
+        snprintf(c->error->message + used, sizeof(c->error->message) - (size_t)used, " (in fn '%s' called at %d:%d)",
+                 c->fns[c->scope->fn].name, c->scope->line, c->scope->column);
     longjmp(c->fail, 1);
 }
 
@@ -351,6 +381,22 @@ static void index_key(Compiler *c) {
     expect(c, "]", "']'");
 }
 
+/* (a, b, ...) after a fn name. */
+static Expr *arguments(Compiler *c, Expr *call) {
+    expect(c, "(", "'('");
+    newlines(c);
+    while (!is(c, ")")) {
+        if (call->count == PARAMS) fail_at(c, c->token.line, c->token.column, "a call takes at most 8 arguments");
+        call->args[call->count++] = expression(c, 0, true);
+        newlines(c);
+        if (!is(c, ",")) break;
+        take(c);
+        newlines(c);
+    }
+    expect(c, ")", "')'");
+    return call;
+}
+
 static Expr *postfix(Compiler *c, Expr *e) {
     const Token *next = is(c, "[") ? lookahead(c) : NULL;
     if (e->kind == E_NAME && next && next->kind == T_NAME && !strcmp(next->text, "key")) {
@@ -382,16 +428,13 @@ static Expr *postfix(Compiler *c, Expr *e) {
         take(c);
         Token member = expect_name(c, "a field or member name");
         if (is(c, "(")) {
-            if (e->kind != E_NAME || strcmp(member.text, "line"))
-                fail_at(c, member.line, member.column, "only a text state has a method here: name.line(cursor)");
-            take(c);
-            Expr *line = node(c, E_LINE, member.line, member.column);
-            memcpy(line->name, e->name, NAME);
-            line->args[0] = expression(c, 0, true);
-            line->count = 1;
-            newlines(c);
-            expect(c, ")", "')'");
-            e = line;
+            /* library.fn(...), or text.line(cursor) */
+            if (e->kind != E_NAME)
+                fail_at(c, member.line, member.column, "only a library fn or a text's line is called here");
+            Expr *call = node(c, E_FN, member.line, member.column);
+            memcpy(call->name, member.text, NAME);
+            memcpy(call->member, e->name, NAME);
+            e = arguments(c, call);
             continue;
         }
         Expr *access = node(c, E_MEMBER, e->line, e->column); /* errors point at the expression start */
@@ -578,8 +621,9 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
             left = conditional(c, &token);
         } else {
             if (reserved_name(token.text)) fail_at(c, token.line, token.column, "expected a number, state, or expression");
-            left = node(c, E_NAME, token.line, token.column);
+            left = node(c, is(c, "(") ? E_FN : E_NAME, token.line, token.column);
             memcpy(left->name, token.text, NAME);
+            if (left->kind == E_FN) left = arguments(c, left);
             left = postfix(c, left);
         }
     } else fail_at(c, token.line, token.column, "expected a number, state, or expression");
@@ -792,8 +836,24 @@ static int record_index(const Compiler *c, const char *name) {
     return -1;
 }
 
+static int fn_index(const Compiler *c, int module, const char *name) {
+    for (unsigned i = 0; i < c->fn_count; ++i)
+        if (c->fns[i].module == module && !strcmp(c->fns[i].name, name)) return (int)i;
+    return -1;
+}
+
+/* The library a module names by `use name`, or -1. */
+static int used_library(const Compiler *c, int module, const char *name) {
+    for (unsigned i = 1; i < c->module_count; ++i)
+        if (c->modules[module].uses[i] && !strcmp(c->modules[i].name, name)) return (int)i;
+    return -1;
+}
+
 static const char *declared_kind(const Compiler *c, const char *name) {
     static const char *const states[] = {"state", "text state", "cursor", "list", "list index"};
+    if (fn_index(c, c->module, name) >= 0) return "fn";
+    if (used_library(c, c->module, name) >= 0) return "library";
+    if (c->module) return NULL; /* a library has only fns and uses */
     int state = state_index(c, name);
     if (state >= 0) return states[c->state_types[state]];
     if (record_index(c, name) >= 0) return "record";
@@ -988,9 +1048,109 @@ static void table_declaration(Compiler *c, unsigned table) {
     take(c);
 }
 
+/* fn name(params) = value, or fn name = value. */
+static void fn_declaration(Compiler *c) {
+    Token name = expect_name(c, "fn name");
+    declare(c, &name);
+    if (!strcmp(name.text, "text") || !strcmp(name.text, "bytes"))
+        fail_at(c, name.line, name.column, "'%s' is a built-in conversion", name.text);
+    if (c->fn_count == FNS) fail_at(c, name.line, name.column, "at most 64 fns are allowed");
+    Fn *f = &c->fns[c->fn_count];
+    memset(f, 0, sizeof(*f));
+    memcpy(f->name, name.text, NAME);
+    f->module = c->module;
+    f->line = name.line;
+    f->column = name.column;
+    if (is(c, "(")) {
+        take(c);
+        newlines(c);
+        while (!is(c, ")")) {
+            Token param = expect_name(c, "a parameter name");
+            if (reserved_name(param.text)) fail_at(c, param.line, param.column, "'%s' is reserved", param.text);
+            for (unsigned i = 0; i < f->param_count; ++i)
+                if (!strcmp(f->params[i], param.text))
+                    fail_at(c, param.line, param.column, "duplicate parameter '%s'", param.text);
+            if (f->param_count == PARAMS) fail_at(c, param.line, param.column, "a fn takes at most 8 parameters");
+            memcpy(f->params[f->param_count++], param.text, NAME);
+            newlines(c);
+            if (!is(c, ",")) break;
+            take(c);
+            newlines(c);
+        }
+        expect(c, ")", "')'");
+    }
+    expect(c, "=", "'='");
+    f->body = expression(c, 0, false);
+    ++c->fn_count;
+}
+
+static void library_declaration(Compiler *c);
+
+/* use name: the fns of name.aup, called as name.fn(...). Each library is read once. */
+static void use_declaration(Compiler *c) {
+    Token name = expect_name(c, "a library name");
+    declare(c, &name);
+    int library = -1;
+    for (unsigned i = 1; i < c->module_count; ++i) if (!strcmp(c->modules[i].name, name.text)) library = (int)i;
+    if (library >= 0 && c->modules[library].parsing)
+        fail_at(c, name.line, name.column, "library '%s' uses itself through its uses", name.text);
+    if (library < 0) {
+        if (c->module_count == MODULES) fail_at(c, name.line, name.column, "at most 8 libraries are allowed");
+        const char *source = NULL;
+        size_t length = 0;
+        char path[AUP_PATH] = "";
+        if (!c->load || !c->load(c->load_context, name.text, &source, &length, path))
+            fail_at(c, name.line, name.column, "cannot find library '%s' (%s.aup)", name.text, name.text);
+        if (length > AUP_SOURCE_LIMIT) fail_at(c, name.line, name.column, "library '%s' exceeds 32768 bytes", name.text);
+        library = (int)c->module_count++;
+        memcpy(c->modules[library].name, name.text, NAME);
+        snprintf(c->modules[library].path, AUP_PATH, "%s", *path ? path : name.text);
+        /* Parse it with its own scanner, then resume here. */
+        const char *saved_source = c->source;
+        size_t saved_length = c->length, saved_at = c->at;
+        int saved_line = c->line, saved_column = c->column, saved_module = c->module;
+        Token saved_token = c->token, saved_ahead = c->ahead;
+        bool saved_has_ahead = c->has_ahead;
+        c->source = source;
+        c->length = length;
+        c->at = 0;
+        c->line = c->column = 1;
+        c->has_ahead = false;
+        c->module = library;
+        c->modules[library].parsing = true;
+        c->token = scan(c);
+        separators(c);
+        while (c->token.kind != T_EOF) library_declaration(c);
+        c->modules[library].parsing = false;
+        c->source = saved_source;
+        c->length = saved_length;
+        c->at = saved_at;
+        c->line = saved_line;
+        c->column = saved_column;
+        c->module = saved_module;
+        c->token = saved_token;
+        c->ahead = saved_ahead;
+        c->has_ahead = saved_has_ahead;
+    }
+    c->modules[c->module].uses[library] = true;
+}
+
+/* A library declares fns and uses only: it has no state and sees none. */
+static void library_declaration(Compiler *c) {
+    Token kind = expect_name(c, "fn or use");
+    if (!strcmp(kind.text, "fn")) fn_declaration(c);
+    else if (!strcmp(kind.text, "use")) use_declaration(c);
+    else fail_at(c, kind.line, kind.column, "a library declares only fn and use");
+    end(c);
+}
+
 static void declaration(Compiler *c) {
-    Token kind = expect_name(c, "state, record, input, view, or on");
-    if (!strcmp(kind.text, "state")) {
+    Token kind = expect_name(c, "state, record, input, view, fn, use, or on");
+    if (!strcmp(kind.text, "fn")) {
+        fn_declaration(c);
+    } else if (!strcmp(kind.text, "use")) {
+        use_declaration(c);
+    } else if (!strcmp(kind.text, "state")) {
         state_declaration(c);
     } else if (!strcmp(kind.text, "record")) {
         record_declaration(c);
@@ -1159,6 +1319,52 @@ static void index_of(Compiler *c, const Expr *e, bool handler, int height, int l
                 c->state_names[list]);
 }
 
+/* A fn inlined: its arguments go on the stack once, the body reads them with
+ * PICK, and SLIDE leaves only the result. e names the call (E_FN), or is the
+ * name of a fn without parameters. */
+static Kind inline_fn(Compiler *c, const Expr *e, int module, const char *name, bool handler, int height) {
+    int index = fn_index(c, module, name);
+    if (index < 0) {
+        if (module != c->module) fail_at(c, e->line, e->column, "library '%s' has no fn '%s'", c->modules[module].name, name);
+        const char *kind = declared_kind(c, name);
+        if (kind) fail_at(c, e->line, e->column, "'%s' is a %s, not a fn", name, kind);
+        fail_at(c, e->line, e->column, "unknown fn '%s'", name);
+    }
+    Fn *f = &c->fns[index];
+    unsigned count = e->kind == E_FN ? e->count : 0;
+    if (count != f->param_count)
+        fail_at(c, e->line, e->column, "%s expects %u argument%s", name, f->param_count, f->param_count == 1 ? "" : "s");
+    if (f->active) fail_at(c, e->line, e->column, "fn '%s' calls itself", name);
+    Scope scope = {.fn = index, .base = height, .line = e->line, .column = e->column};
+    for (unsigned i = 0; i < count; ++i) scope.kinds[i] = value(c, e->args[i], handler, height + (int)i);
+    Scope *outer = c->scope;
+    int caller = c->module;
+    c->scope = &scope;
+    c->module = f->module;
+    f->active = true;
+    Kind result = value(c, f->body, handler, height + (int)count);
+    f->active = false;
+    c->scope = outer;
+    c->module = caller;
+    if (count) emit(c, e->line, e->column, SLIDE, count, 0);
+    return result;
+}
+
+/* A parameter of the fn being inlined, or -1. */
+static int parameter(const Compiler *c, const char *name) {
+    if (!c->scope) return -1;
+    const Fn *f = &c->fns[c->scope->fn];
+    for (unsigned i = 0; i < f->param_count; ++i) if (!strcmp(f->params[i], name)) return (int)i;
+    return -1;
+}
+
+/* A name of the app (a state, input or collection): not visible in a library
+ * fn, and hidden by a parameter of the same name. */
+static void app_name(Compiler *c, const Expr *e, const char *name) {
+    if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", name);
+    if (parameter(c, name) >= 0) fail_at(c, e->line, e->column, "'%s' is a parameter here", name);
+}
+
 /* Emit an expression; height is the stack height before it. */
 static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
@@ -1181,7 +1387,14 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         return (Kind){TEXT, -1};
     }
     case E_NAME: {
-        if (c->row >= 0 && !strcmp(e->name, c->view_row[c->row])) {
+        int param = parameter(c, e->name);
+        if (param >= 0) {
+            emit(c, e->line, e->column, PICK, (uint32_t)(height - 1 - (c->scope->base + param)), 0);
+            return c->scope->kinds[param];
+        }
+        if (fn_index(c, c->module, e->name) >= 0) return inline_fn(c, e, c->module, e->name, handler, height);
+        if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
+        if (!c->scope && c->row >= 0 && !strcmp(e->name, c->view_row[c->row])) {
             int list = state_index(c, c->view_list[c->row]);
             emit(c, e->line, e->column, ROW, (uint32_t)list, 0);
             return (Kind){INDEX, list};
@@ -1209,7 +1422,9 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     }
     case E_MEMBER: {
         const Expr *base = e->args[0];
-        if (base->kind == E_NAME) {
+        int library = base->kind == E_NAME && parameter(c, base->name) < 0 ? used_library(c, c->module, base->name) : -1;
+        if (library >= 0) return inline_fn(c, e, library, e->member, handler, height); /* library.constant */
+        if (base->kind == E_NAME && parameter(c, base->name) < 0 && !c->module) {
             int input = input_index(c, base->name);
             if (input >= 0 && c->inputs[input].kind == KIND_MESSAGE) {
                 if (input != c->message)
@@ -1261,16 +1476,25 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         }
         fail_at(c, e->line, e->column, "%s has no '%s'", type_name(inner.type), m);
     }
-    case E_LINE: {
-        int text = text_state(c, e->name, e->line, e->column);
-        cursor_of(c, e->args[0], handler, height, text, e->name);
+    case E_FN: {
+        if (!*e->member) return inline_fn(c, e, c->module, e->name, handler, height);
+        int library = parameter(c, e->member) < 0 ? used_library(c, c->module, e->member) : -1;
+        if (library >= 0) return inline_fn(c, e, library, e->name, handler, height);
+        if (strcmp(e->name, "line")) fail_at(c, e->line, e->column, "unknown library '%s'; write use %s first", e->member, e->member);
+        /* note.line(at): the line a cursor is on. */
+        app_name(c, e, e->member);
+        int text = text_state(c, e->member, e->line, e->column);
+        if (e->count != 1) fail_at(c, e->line, e->column, "%s.line takes one cursor", e->member);
+        cursor_of(c, e->args[0], handler, height, text, e->member);
         emit(c, e->line, e->column, TEXT_LINE, (uint32_t)text, 0);
         return (Kind){TEXT, -1};
     }
     case E_DOC:
+        app_name(c, e, e->name);
         emit(c, e->line, e->column, DOC, collection(c, e->name, e->line, e->column), 0);
         return (Kind){BYTES, -1};
     case E_SIZE:
+        app_name(c, e, e->name);
         emit(c, e->line, e->column, DOC_SIZE, collection(c, e->name, e->line, e->column), 0);
         return (Kind){NUM, -1};
     case E_CONVERT: {
@@ -1283,6 +1507,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         return (Kind){e->op == TEXT_FROM ? TEXT : BYTES, -1};
     }
     case E_ITEM: {
+        app_name(c, e, e->name);
         int list = list_state(c, e->name, e->line, e->column, e->args[0]);
         const Record *r = record_of(c, list);
         if (!*e->member) fail_at(c, e->line, e->column, "read a field of the item, as in %s[index].%s", e->name, r->field_names[0]);
@@ -1695,18 +1920,21 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     if (c->constant_used) memcpy(p + used, c->constant_data, c->constant_used);
 }
 
-bool aup_compile(const char *source, size_t length, unsigned char **module, size_t *size,
-                 AupDiagnostic *error) {
+bool aup_compile(const char *source, size_t length, AupLoad load, void *context,
+                 unsigned char **module, size_t *size, AupDiagnostic *error) {
     *module = NULL;
     *size = 0;
-    *error = (AupDiagnostic){0};
+    *error = (AupDiagnostic){.line = 0};
     Compiler *c = calloc(1, sizeof(*c));
-    if (!c) { *error = (AupDiagnostic){1, 1, "out of memory"}; return false; }
+    if (!c) { *error = (AupDiagnostic){.line = 1, .column = 1, .message = "out of memory"}; return false; }
     c->source = source;
     c->length = length;
     c->line = c->column = 1;
     c->error = error;
     c->row = -1;
+    c->load = load;
+    c->load_context = context;
+    c->module_count = 1; /* the main source */
     unsigned char *result = NULL;
     if (!setjmp(c->fail)) {
         if (length > AUP_SOURCE_LIMIT) fail_at(c, 1, 1, "source exceeds 32768 bytes");
