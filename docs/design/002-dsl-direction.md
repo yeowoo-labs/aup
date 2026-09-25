@@ -65,7 +65,7 @@ view current = note.line(at)           # 커서가 있는 줄. 복사하지 않�
 | v0a ✅ | 스칼라 상태, 키 입력, 핸들러, 보기 | 워크벤치 엔진과 비트 단위 일치 |
 | v0b ✅ | `bytes`, 키별 영속 문서, `message` 입력, 응답, `require`, `text`(리터럴·보간·`cursor in`·`char`/`line`), `text` 입력 | 기존 편집기 CLI와 바이트 단위 일치, text 편집이 참조 모델과 일치 |
 | v0c | `record`, `list of`, `index of`, 조건식, 항목 투영(`each`), 순수 `fn`, `use` 라이브러리 ✅ / `i64 bool`, `map` | 모든 연산에 실행량 상한, 리스트가 참조 모델과 일치 ✅ |
-| v0d | `use vega`로 첫 인터페이스 투영(목록·표·커서·톤) | 한 명세가 두 표면 이상에서 동작 |
+| v0d ✅ | `use vega`로 첫 인터페이스 투영(목록·표·커서·톤), [Vega 001](/srv/git/vega.git) | 한 명세가 세 표면(TUI·CLI·NUI 문장)에서 동작, 표면은 보이는 칸만 계산 |
 
 ### 구현된 text (v0b)
 
