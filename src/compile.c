@@ -9,16 +9,18 @@
 
 /* Limits and opcodes of Pure module format v4. */
 enum { STATES = 32, INPUTS = 32, VIEWS = 24, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32,
-       DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 64, CONSTANT_BYTES = 8192 };
+       DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 64, CONSTANT_BYTES = 8192,
+       RECORDS = 8, RECORD_FIELDS = 64, FIELDS_PER_RECORD = 16 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, DOC, DOC_SIZE, LEN, REPLACE, REPLY, REQUIRE,
        TEXT_CONST, TEXT_LOAD, TEXT_INPUT, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
-       TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT };
+       TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
+       ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2 };
-enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, UNIT_CHAR = 0, UNIT_LINE = 1 };
-typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT } Type;
-typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state */
+enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
+typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
+typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
 
 typedef enum { T_EOF, T_NL, T_NUMBER, T_NAME, T_PUNCT, T_STRING } TokenKind;
 typedef struct {
@@ -39,6 +41,9 @@ typedef enum {
     E_UNIT,    /* args[0] char|line */
     E_CONVERT, /* text(args[0]) or bytes(args[0]) */
     E_LINE,    /* name.line(args[0]) */
+    E_ITEM,    /* name[args[0]].member: a field of a list item */
+    E_RECORD,  /* name { fields }: E_FIELD nodes linked from args[0] */
+    E_FIELD,   /* member: args[0] */
 } ExprKind;
 typedef struct Expr {
     ExprKind kind;
@@ -51,13 +56,13 @@ typedef struct Expr {
     size_t size;
 } Expr;
 
-typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE } StmtKind;
+typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_SET } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
-    char name[NAME];
+    char name[NAME], member[NAME]; /* member: the item field an S_SET changes */
     Expr *value;          /* assigned value, condition, reply, requirement or insertion */
-    Expr *first, *last;   /* a range, or the insertion cursor in first */
+    Expr *first, *last;   /* a range, the insertion cursor or index, or the item index; last may be NULL */
     struct Stmt *then, *otherwise, *next;
 } Stmt;
 
@@ -69,6 +74,18 @@ typedef struct {
     int field_types[FIELDS];
     unsigned fields;
 } Input;
+
+/* A record: fields in order, each a number or text with its default. */
+typedef struct {
+    char name[NAME];
+    int line, column;
+    char field_names[FIELDS_PER_RECORD][NAME];
+    bool field_text[FIELDS_PER_RECORD];
+    double field_number[FIELDS_PER_RECORD];
+    Expr *field_string[FIELDS_PER_RECORD]; /* a text default, or NULL for "" */
+    uint32_t field_constant[FIELDS_PER_RECORD];
+    unsigned fields;
+} Record;
 
 typedef struct {
     const char *source;
@@ -89,6 +106,8 @@ typedef struct {
     unsigned states;
     char collection_names[COLLECTIONS][NAME];
     unsigned collections;
+    Record records[RECORDS];
+    unsigned record_count, record_fields;
     Input inputs[INPUTS];
     unsigned input_count, field_count;
     char view_names[VIEWS][NAME];
@@ -110,7 +129,7 @@ typedef struct {
 
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
-                                       "reply", "require"};
+                                       "reply", "require", "record"};
 
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
     va_list args;
@@ -326,7 +345,8 @@ static void index_key(Compiler *c) {
 }
 
 static Expr *postfix(Compiler *c, Expr *e) {
-    if (e->kind == E_NAME && is(c, "[")) {
+    const Token *next = is(c, "[") ? lookahead(c) : NULL;
+    if (e->kind == E_NAME && next && next->kind == T_NAME && !strcmp(next->text, "key")) {
         index_key(c);
         e->kind = E_DOC;
         if (is(c, ".") && lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "bytes")) {
@@ -335,6 +355,21 @@ static Expr *postfix(Compiler *c, Expr *e) {
             e->kind = E_SIZE;
         }
         return e;
+    }
+    if (e->kind == E_NAME && next) {
+        /* tasks[at].title: a field of a list item. */
+        take(c);
+        Expr *item = node(c, E_ITEM, e->line, e->column);
+        memcpy(item->name, e->name, NAME);
+        item->args[0] = expression(c, 0, true);
+        item->count = 1;
+        newlines(c);
+        expect(c, "]", "']'");
+        if (is(c, ".")) {
+            take(c);
+            memcpy(item->member, expect_name(c, "a field name").text, NAME);
+        }
+        e = item;
     }
     while (is(c, ".")) {
         take(c);
@@ -538,6 +573,38 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     return left;
 }
 
+/* Record { field: value, ... }: fields end at a comma, semicolon or line end. */
+static Expr *record_value(Compiler *c) {
+    Token name = take(c);
+    take(c); /* { */
+    Expr *r = node(c, E_RECORD, name.line, name.column), **tail = &r->args[0];
+    memcpy(r->name, name.text, NAME);
+    separators(c);
+    while (!is(c, "}")) {
+        Token field = expect_name(c, "a field name");
+        expect(c, ":", "':'");
+        Expr *f = node(c, E_FIELD, field.line, field.column);
+        memcpy(f->member, field.text, NAME);
+        f->args[0] = expression(c, 0, false);
+        f->count = 1;
+        *tail = f;
+        tail = &f->next;
+        if (!is(c, ",") && !is(c, ";") && !is(c, "}") && c->token.kind != T_NL)
+            fail_at(c, c->token.line, c->token.column, "expected ',' or a new line between fields");
+        while (is(c, ",") || is(c, ";") || c->token.kind == T_NL) take(c);
+    }
+    take(c);
+    return r;
+}
+
+/* A value inserted into a text or a list: an expression or a record. */
+static Expr *inserted(Compiler *c) {
+    newlines(c);
+    if (c->token.kind == T_NAME && lookahead(c)->kind == T_PUNCT && !strcmp(lookahead(c)->text, "{"))
+        return record_value(c);
+    return expression(c, 0, true);
+}
+
 static Stmt *block(Compiler *c, unsigned depth);
 
 static void range(Compiler *c, Stmt *s) {
@@ -577,6 +644,25 @@ static Stmt *statement(Compiler *c, unsigned depth) {
     }
     if (reserved_name(token.text)) fail_at(c, token.line, token.column, "expected a statement or '}'");
     memcpy(s->name, token.text, NAME);
+    if (is(c, "[") && !(lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "key"))) {
+        /* tasks[at].field = value */
+        take(c);
+        s->kind = S_SET;
+        s->first = expression(c, 0, true);
+        newlines(c);
+        expect(c, "]", "']'");
+        if (is(c, ".") && lookahead(c)->kind == T_NAME) {
+            take(c);
+            Token field = take(c);
+            if (is(c, "("))
+                fail_at(c, s->first->line, s->first->column, "a collection is indexed by the message key, as in name[key]");
+            memcpy(s->member, field.text, NAME);
+        } else fail_at(c, c->token.line, c->token.column, "expected '.' and the field to change, as in %s[at].field = value",
+                       s->name);
+        expect(c, "=", "'='");
+        s->value = expression(c, 0, false);
+        return s;
+    }
     if (is(c, "[")) {
         index_key(c);
         expect(c, ".", "'.replace'");
@@ -593,19 +679,31 @@ static Stmt *statement(Compiler *c, unsigned depth) {
     }
     if (is(c, ".")) {
         take(c);
-        Token method = expect_name(c, "insert or remove");
+        Token method = expect_name(c, "insert, remove or append");
         expect(c, "(", "'('");
         if (!strcmp(method.text, "insert")) {
             s->kind = S_INSERT;
             s->first = expression(c, 0, true);
             newlines(c);
             expect(c, ",", "','");
-            s->value = expression(c, 0, true);
+            s->value = inserted(c);
             newlines(c);
         } else if (!strcmp(method.text, "remove")) {
+            /* A text removes a range; a list removes the item at an index. */
             s->kind = S_REMOVE;
-            range(c, s);
-        } else fail_at(c, method.line, method.column, "a text supports insert(cursor, text) and remove(first .. last)");
+            s->first = expression(c, 0, true);
+            newlines(c);
+            if (is(c, "..")) {
+                take(c);
+                s->last = expression(c, 0, true);
+                newlines(c);
+            }
+        } else if (!strcmp(method.text, "append")) {
+            s->kind = S_APPEND;
+            s->value = inserted(c);
+            newlines(c);
+        } else fail_at(c, method.line, method.column,
+                       "a text supports insert and remove; a list supports append, insert and remove");
         expect(c, ")", "')'");
         return s;
     }
@@ -641,10 +739,16 @@ static int state_index(const Compiler *c, const char *name) {
     return -1;
 }
 
+static int record_index(const Compiler *c, const char *name) {
+    for (unsigned i = 0; i < c->record_count; ++i) if (!strcmp(c->records[i].name, name)) return (int)i;
+    return -1;
+}
+
 static const char *declared_kind(const Compiler *c, const char *name) {
-    static const char *const states[] = {"state", "text state", "cursor"};
+    static const char *const states[] = {"state", "text state", "cursor", "list", "index"};
     int state = state_index(c, name);
     if (state >= 0) return states[c->state_types[state]];
+    if (record_index(c, name) >= 0) return "record";
     for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) return "collection";
     int input = input_index(c, name);
     if (input >= 0) return c->inputs[input].kind == KIND_KEY ? "key input" :
@@ -693,6 +797,67 @@ static void message_fields(Compiler *c, Input *in) {
     take(c);
 }
 
+/* A signed number literal: a numeric state or field default. */
+static double signed_number(Compiler *c, const char *what) {
+    double sign = 1;
+    if (is(c, "-") || is(c, "+")) sign = take(c).text[0] == '-' ? -1 : 1;
+    if (c->token.kind != T_NUMBER) fail_at(c, c->token.line, c->token.column, "expected a numeric %s", what);
+    return sign * take(c).number;
+}
+
+/* A plain string with no {expressions}: a text state or field default. */
+static Expr *plain_string(Compiler *c, const char *what) {
+    if (c->token.kind != T_STRING) fail_at(c, c->token.line, c->token.column, "%s starts from a string", what);
+    Token literal = take(c);
+    Expr *value = string(c, &literal);
+    if (value->args[0]->kind != E_TEXT || value->args[0]->next)
+        fail_at(c, literal.line, literal.column, "%s starts from a plain string without {expressions}", what);
+    return value->args[0];
+}
+
+/* record Name { field = number; field: text = "..." } */
+static void record_declaration(Compiler *c) {
+    Token name = expect_name(c, "record name");
+    declare(c, &name);
+    if (c->record_count == RECORDS) fail_at(c, name.line, name.column, "at most 8 records are allowed");
+    Record *r = &c->records[c->record_count];
+    memset(r, 0, sizeof(*r));
+    memcpy(r->name, name.text, NAME);
+    r->line = name.line;
+    r->column = name.column;
+    expect(c, "{", "'{' on the line of the record name");
+    separators(c);
+    while (!is(c, "}")) {
+        Token field = expect_name(c, "a field name");
+        if (reserved_name(field.text)) fail_at(c, field.line, field.column, "'%s' is reserved", field.text);
+        for (unsigned i = 0; i < r->fields; ++i)
+            if (!strcmp(r->field_names[i], field.text)) fail_at(c, field.line, field.column, "duplicate field '%s'", field.text);
+        if (r->fields == FIELDS_PER_RECORD) fail_at(c, field.line, field.column, "a record has at most 16 fields");
+        if (c->record_fields == RECORD_FIELDS) fail_at(c, field.line, field.column, "at most 64 record fields are allowed");
+        unsigned index = r->fields++;
+        memcpy(r->field_names[index], field.text, NAME);
+        ++c->record_fields;
+        if (is(c, ":")) {
+            take(c);
+            Token type = expect_name(c, "text");
+            if (strcmp(type.text, "text"))
+                fail_at(c, type.line, type.column, "a field is a number (field = 0) or text (field: text)");
+            r->field_text[index] = true;
+            if (is(c, "=")) {
+                take(c);
+                r->field_string[index] = plain_string(c, "a text field");
+            }
+        } else {
+            expect(c, "=", "'=' and a number, or ': text'");
+            r->field_number[index] = signed_number(c, "field default");
+        }
+        end(c);
+    }
+    take(c);
+    if (!r->fields) fail_at(c, name.line, name.column, "a record needs at least one field");
+    ++c->record_count;
+}
+
 static void state_declaration(Compiler *c) {
     Token name = expect_name(c, "state name");
     declare(c, &name);
@@ -712,40 +877,40 @@ static void state_declaration(Compiler *c) {
     c->state_column[index] = name.column;
     if (is(c, ":")) {
         take(c);
-        Token type = expect_name(c, "text or cursor");
+        Token type = expect_name(c, "text, cursor, list or index");
         if (!strcmp(type.text, "text")) {
             c->state_types[index] = STATE_TEXT;
             if (is(c, "=")) {
                 take(c);
-                if (c->token.kind != T_STRING) fail_at(c, c->token.line, c->token.column, "a text state starts from a string");
-                Token literal = take(c);
-                Expr *value = string(c, &literal);
-                if (value->args[0]->kind != E_TEXT || value->args[0]->next)
-                    fail_at(c, literal.line, literal.column, "a text state starts from a plain string without {expressions}");
-                c->state_text[index] = value->args[0];
+                c->state_text[index] = plain_string(c, "a text state");
             }
         } else if (!strcmp(type.text, "cursor")) {
             c->state_types[index] = STATE_CURSOR;
             expect_word(c, "in");
             Token target = expect_name(c, "a text state");
             memcpy(c->state_target[index], target.text, NAME);
-        } else fail_at(c, type.line, type.column, "state types are numbers, text, cursor in a text, and bytes by key");
+        } else if (!strcmp(type.text, "list") || !strcmp(type.text, "index")) {
+            c->state_types[index] = type.text[0] == 'l' ? STATE_LIST : STATE_INDEX;
+            expect_word(c, "of");
+            Token target = expect_name(c, type.text[0] == 'l' ? "a record" : "a list state");
+            memcpy(c->state_target[index], target.text, NAME);
+        } else fail_at(c, type.line, type.column,
+                       "state types are numbers, text, cursor in a text, list of a record, index of a list, and bytes by key");
         ++c->states;
         return;
     }
     expect(c, "=", "'='");
-    double sign = 1;
-    if (is(c, "-") || is(c, "+")) sign = take(c).text[0] == '-' ? -1 : 1;
-    if (c->token.kind != T_NUMBER) fail_at(c, c->token.line, c->token.column, "expected a numeric state initializer");
     c->state_types[index] = STATE_NUM;
-    c->initial[index] = sign * take(c).number;
+    c->initial[index] = signed_number(c, "state initializer");
     ++c->states;
 }
 
 static void declaration(Compiler *c) {
-    Token kind = expect_name(c, "state, input, view, or on");
+    Token kind = expect_name(c, "state, record, input, view, or on");
     if (!strcmp(kind.text, "state")) {
         state_declaration(c);
+    } else if (!strcmp(kind.text, "record")) {
+        record_declaration(c);
     } else if (!strcmp(kind.text, "input")) {
         Token name = expect_name(c, "input name");
         declare(c, &name);
@@ -816,7 +981,7 @@ static void emit(Compiler *c, int line, int column, uint8_t op, uint32_t arg, do
 }
 
 static const char *type_name(Type type) {
-    static const char *const names[] = {"", "a number", "bytes", "text", "a cursor", "a distance"};
+    static const char *const names[] = {"", "a number", "bytes", "text", "a cursor", "a distance", "an index"};
     return names[type];
 }
 
@@ -859,6 +1024,27 @@ static int text_state(Compiler *c, const char *name, int line, int column) {
 
 static int cursor_owner(const Compiler *c, int cursor) { return state_index(c, c->state_target[cursor]); }
 
+/* The list state name[...] indexes; where points at the index for a collection. */
+static int list_state(Compiler *c, const char *name, int line, int column, const Expr *where) {
+    int index = state_index(c, name);
+    if (index >= 0 && c->state_types[index] == STATE_LIST) return index;
+    for (unsigned i = 0; i < c->collections; ++i)
+        if (!strcmp(c->collection_names[i], name) && where)
+            fail_at(c, where->line, where->column, "a collection is indexed by the message key, as in name[key]");
+    const char *kind = declared_kind(c, name);
+    if (kind) fail_at(c, line, column, "'%s' is a %s, not a list", name, kind);
+    fail_at(c, line, column, "unknown list '%s'", name);
+}
+
+static const Record *record_of(const Compiler *c, int list) {
+    return &c->records[record_index(c, c->state_target[list])];
+}
+
+static unsigned record_field(Compiler *c, const Record *r, const char *field, int line, int column) {
+    for (unsigned i = 0; i < r->fields; ++i) if (!strcmp(r->field_names[i], field)) return i;
+    fail_at(c, line, column, "record '%s' has no field '%s'", r->name, field);
+}
+
 static Kind value(Compiler *c, const Expr *e, bool handler, int height);
 
 static void expect_kind(Compiler *c, const Expr *e, Kind actual, Type type) {
@@ -877,6 +1063,15 @@ static void cursor_of(Compiler *c, const Expr *e, bool handler, int height, int 
     expect_kind(c, e, kind, CURSOR);
     if (kind.owner != text)
         fail_at(c, e->line, e->column, "a cursor of '%s' cannot point into '%s'", c->state_names[kind.owner], name);
+}
+
+/* An index of the named list state. */
+static void index_of(Compiler *c, const Expr *e, bool handler, int height, int list) {
+    Kind kind = value(c, e, handler, height);
+    expect_kind(c, e, kind, INDEX);
+    if (kind.owner != list)
+        fail_at(c, e->line, e->column, "an index of '%s' cannot point into '%s'", c->state_names[kind.owner],
+                c->state_names[list]);
 }
 
 /* Emit an expression; height is the stack height before it. */
@@ -904,9 +1099,13 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         int index = state_index(c, e->name);
         if (index >= 0) {
             int type = c->state_types[index];
-            emit(c, e->line, e->column, type == STATE_NUM ? LOAD : type == STATE_TEXT ? TEXT_LOAD : CUR_LOAD, (uint32_t)index, 0);
-            return type == STATE_NUM ? (Kind){NUM, -1} : type == STATE_TEXT ? (Kind){TEXT, -1} :
-                   (Kind){CURSOR, cursor_owner(c, index)};
+            if (type == STATE_LIST)
+                fail_at(c, e->line, e->column, "'%s' is a list; read %s.count or a field, as in %s[index].field",
+                        e->name, e->name, e->name);
+            static const uint8_t loads[] = {LOAD, TEXT_LOAD, CUR_LOAD, 0, INDEX_LOAD};
+            static const Type types[] = {NUM, TEXT, CURSOR, 0, INDEX};
+            emit(c, e->line, e->column, loads[type], (uint32_t)index, 0);
+            return (Kind){types[type], type == STATE_CURSOR || type == STATE_INDEX ? cursor_owner(c, index) : -1};
         }
         int input = input_index(c, e->name);
         if (input >= 0 && c->inputs[input].kind == KIND_TEXT) {
@@ -941,6 +1140,15 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 emit(c, e->line, e->column, e->member[0] == 's' ? CUR_START : CUR_END, (uint32_t)state, 0);
                 return (Kind){CURSOR, state};
             }
+            if (state >= 0 && c->state_types[state] == STATE_LIST) {
+                const char *m = e->member;
+                if (!strcmp(m, "count")) { emit(c, e->line, e->column, LIST_COUNT, (uint32_t)state, 0); return (Kind){NUM, -1}; }
+                if (!strcmp(m, "first") || !strcmp(m, "last")) {
+                    emit(c, e->line, e->column, m[0] == 'f' ? INDEX_FIRST : INDEX_LAST, (uint32_t)state, 0);
+                    return (Kind){INDEX, state};
+                }
+                fail_at(c, e->line, e->column, "a list has count, first and last, not '%s'", m);
+            }
         }
         Kind inner = value(c, base, handler, height);
         const char *m = e->member;
@@ -953,6 +1161,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             emit(c, e->line, e->column, CUR_COUNT, m[0] == 'c' ? UNIT_CHAR : UNIT_LINE, 0);
             return (Kind){NUM, -1};
         }
+        if (inner.type == INDEX && !strcmp(m, "position")) { emit(c, e->line, e->column, INDEX_NUM, 0, 0); return (Kind){NUM, -1}; }
         fail_at(c, e->line, e->column, "%s has no '%s'", type_name(inner.type), m);
     }
     case E_LINE: {
@@ -976,17 +1185,33 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
         return (Kind){e->op == TEXT_FROM ? TEXT : BYTES, -1};
     }
+    case E_ITEM: {
+        int list = list_state(c, e->name, e->line, e->column, e->args[0]);
+        const Record *r = record_of(c, list);
+        if (!*e->member) fail_at(c, e->line, e->column, "read a field of the item, as in %s[index].%s", e->name, r->field_names[0]);
+        unsigned field = record_field(c, r, e->member, e->line, e->column);
+        index_of(c, e->args[0], handler, height, list);
+        emit(c, e->line, e->column, ITEM_GET, (uint32_t)list | field << 16, 0);
+        return (Kind){r->field_text[field] ? TEXT : NUM, -1};
+    }
+    case E_RECORD: case E_FIELD:
+        fail_at(c, e->line, e->column, "a record value goes into a list, as in list.append(%s { ... })", e->name);
     case E_UNIT:
         fail_at(c, e->line, e->column, "a distance moves a cursor, as in at + 1 char");
     case E_BINARY:
-        if (e->args[1]->kind == E_UNIT && (e->op == ADD || e->op == SUB)) {
-            Kind cursor = value(c, e->args[0], handler, height);
-            if (cursor.type != CURSOR)
-                fail_at(c, e->line, e->column, "only a cursor moves by a distance, not %s", type_name(cursor.type));
-            number(c, e->args[1]->args[0], handler, height + 1);
+        if (e->op == ADD || e->op == SUB) {
+            /* at + 1 char moves a cursor, at + 1 an index; both stop at the ends. */
+            bool distance = e->args[1]->kind == E_UNIT;
+            Kind left = value(c, e->args[0], handler, height);
+            if (distance && left.type != CURSOR)
+                fail_at(c, e->line, e->column, "only a cursor moves by a distance, not %s", type_name(left.type));
+            if (!distance && left.type != INDEX) expect_kind(c, e->args[0], left, NUM);
+            number(c, distance ? e->args[1]->args[0] : e->args[1], handler, height + 1);
+            if (left.type == NUM) { emit(c, e->line, e->column, (uint8_t)e->op, 0, 0); return left; }
             if (e->op == SUB) emit(c, e->line, e->column, NEG, 0, 0);
-            emit(c, e->line, e->column, CUR_MOVE, (uint32_t)e->args[1]->op, 0);
-            return cursor;
+            if (distance) emit(c, e->line, e->column, CUR_MOVE, (uint32_t)e->args[1]->op, 0);
+            else emit(c, e->line, e->column, INDEX_MOVE, 0, 0);
+            return left;
         }
         /* fall through */
     default:
@@ -1003,6 +1228,28 @@ static void bytes_value(Compiler *c, const Expr *e, int height, const char *what
     else if (kind.type != BYTES) fail_at(c, e->line, e->column, "%s takes bytes or text, not %s", what, type_name(kind.type));
 }
 
+/* A record's fields in order, onto the stack from height; missing fields take their default. */
+static void record_fields(Compiler *c, const Expr *e, int list, int height) {
+    const Record *r = record_of(c, list);
+    if (e->kind != E_RECORD)
+        fail_at(c, e->line, e->column, "'%s' holds %s records, as in %s.append(%s { %s: ... })", c->state_names[list],
+                r->name, c->state_names[list], r->name, r->field_names[0]);
+    if (strcmp(e->name, r->name)) fail_at(c, e->line, e->column, "'%s' holds %s, not %s", c->state_names[list], r->name, e->name);
+    const Expr *given[FIELDS_PER_RECORD] = {0};
+    for (const Expr *f = e->args[0]; f; f = f->next) {
+        unsigned field = record_field(c, r, f->member, f->line, f->column);
+        if (given[field]) fail_at(c, f->line, f->column, "field '%s' is given twice", f->member);
+        given[field] = f;
+    }
+    for (unsigned k = 0; k < r->fields; ++k) {
+        int at = height + (int)k;
+        if (given[k]) expect_kind(c, given[k]->args[0], value(c, given[k]->args[0], true, at), r->field_text[k] ? TEXT : NUM);
+        else if (at + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
+        else if (r->field_text[k]) emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
+        else emit(c, e->line, e->column, CONST, 0, r->field_number[k]);
+    }
+}
+
 static void statements(Compiler *c, const Stmt *s) {
     for (; s; s = s->next) {
         switch (s->kind) {
@@ -1016,6 +1263,11 @@ static void statements(Compiler *c, const Stmt *s) {
             if (c->state_types[index] == STATE_NUM) {
                 number(c, s->value, true, 0);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
+            } else if (c->state_types[index] == STATE_LIST) {
+                fail_at(c, s->line, s->column, "a list changes by append, insert, remove and %s[index].field = value", s->name);
+            } else if (c->state_types[index] == STATE_INDEX) {
+                index_of(c, s->value, true, 0, cursor_owner(c, index));
+                emit(c, s->line, s->column, INDEX_STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_TEXT) {
                 expect_kind(c, s->value, value(c, s->value, true, 0), TEXT);
                 emit(c, s->line, s->column, TEXT_SET, (uint32_t)index, 0);
@@ -1026,18 +1278,40 @@ static void statements(Compiler *c, const Stmt *s) {
             }
             break;
         }
-        case S_INSERT: {
+        case S_INSERT: case S_REMOVE: {
+            int list = state_index(c, s->name);
+            if (list >= 0 && c->state_types[list] == STATE_LIST) {
+                if (s->last) fail_at(c, s->last->line, s->last->column, "a list removes one item, as in %s.remove(index)", s->name);
+                index_of(c, s->first, true, 0, list);
+                if (s->kind == S_INSERT) record_fields(c, s->value, list, 1);
+                emit(c, s->line, s->column, s->kind == S_INSERT ? LIST_INSERT : LIST_REMOVE, (uint32_t)list, 0);
+                break;
+            }
             int text = text_state(c, s->name, s->line, s->column);
             cursor_of(c, s->first, true, 0, text, s->name);
-            expect_kind(c, s->value, value(c, s->value, true, 1), TEXT);
-            emit(c, s->line, s->column, TEXT_INSERT, (uint32_t)text, 0);
-            break;
-        }
-        case S_REMOVE: {
-            int text = text_state(c, s->name, s->line, s->column);
-            cursor_of(c, s->first, true, 0, text, s->name);
+            if (s->kind == S_INSERT) {
+                expect_kind(c, s->value, value(c, s->value, true, 1), TEXT);
+                emit(c, s->line, s->column, TEXT_INSERT, (uint32_t)text, 0);
+                break;
+            }
+            if (!s->last) fail_at(c, s->line, s->column, "a text removes a range, as in %s.remove(first .. last)", s->name);
             cursor_of(c, s->last, true, 1, text, s->name);
             emit(c, s->line, s->column, TEXT_REMOVE, (uint32_t)text, 0);
+            break;
+        }
+        case S_APPEND: {
+            int list = list_state(c, s->name, s->line, s->column, NULL);
+            record_fields(c, s->value, list, 0);
+            emit(c, s->line, s->column, LIST_APPEND, (uint32_t)list, 0);
+            break;
+        }
+        case S_SET: {
+            int list = list_state(c, s->name, s->line, s->column, s->first);
+            const Record *r = record_of(c, list);
+            unsigned field = record_field(c, r, s->member, s->line, s->column);
+            index_of(c, s->first, true, 0, list);
+            expect_kind(c, s->value, value(c, s->value, true, 1), r->field_text[field] ? TEXT : NUM);
+            emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
         }
         case S_REPLACE: {
@@ -1113,12 +1387,25 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         if (c->state_types[i] == STATE_TEXT) {
             Expr empty = {.kind = E_TEXT, .line = c->state_line[i], .column = c->state_column[i]};
             state_ref[i] = constant(c, c->state_text[i] ? c->state_text[i] : &empty);
-        } else if (c->state_types[i] == STATE_CURSOR) {
+        } else if (c->state_types[i] == STATE_CURSOR || c->state_types[i] == STATE_INDEX) {
+            bool cursor = c->state_types[i] == STATE_CURSOR;
             int target = state_index(c, c->state_target[i]);
-            if (target < 0 || c->state_types[target] != STATE_TEXT)
-                fail_at(c, c->state_line[i], c->state_column[i], "a cursor moves in a text state; '%s' is not one",
-                        c->state_target[i]);
+            if (target < 0 || c->state_types[target] != (cursor ? STATE_TEXT : STATE_LIST))
+                fail_at(c, c->state_line[i], c->state_column[i], cursor ? "a cursor moves in a text state; '%s' is not one" :
+                        "an index points into a list state; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)target;
+        } else if (c->state_types[i] == STATE_LIST) {
+            int record = record_index(c, c->state_target[i]);
+            if (record < 0)
+                fail_at(c, c->state_line[i], c->state_column[i], "a list holds a record; '%s' is not one", c->state_target[i]);
+            state_ref[i] = (uint32_t)record;
+        }
+    }
+    for (unsigned i = 0; i < c->record_count; ++i) {
+        Record *r = &c->records[i];
+        for (unsigned k = 0; k < r->fields; ++k) {
+            Expr empty = {.kind = E_TEXT, .line = r->line, .column = r->column};
+            if (r->field_text[k]) r->field_constant[k] = constant(c, r->field_string[k] ? r->field_string[k] : &empty);
         }
     }
     for (unsigned i = 0; i < c->handler_count; ++i) {
@@ -1158,10 +1445,11 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         statements(c, c->handlers[i].body);
         c->handler_code[i][1] = c->code_count - c->handler_code[i][0];
     }
-    static unsigned char strings[(STATES + COLLECTIONS + 2 * INPUTS + FIELDS + VIEWS) * NAME];
+    static unsigned char strings[(STATES + COLLECTIONS + 2 * INPUTS + FIELDS + VIEWS + RECORDS + RECORD_FIELDS) * NAME];
     size_t used = 0;
     uint32_t state_name[STATES] = {0}, collection_name[COLLECTIONS] = {0}, input_name[INPUTS] = {0}, input_key[INPUTS] = {0};
-    uint32_t field_name[FIELDS] = {0}, view_name[VIEWS] = {0};
+    uint32_t field_name[FIELDS] = {0}, view_name[VIEWS] = {0}, record_name[RECORDS] = {0};
+    uint32_t record_field_name[RECORDS][FIELDS_PER_RECORD] = {{0}};
     unsigned fields = 0;
     for (unsigned i = 0; i < c->states; ++i) state_name[i] = intern(strings, &used, c->state_names[i]);
     for (unsigned i = 0; i < c->collections; ++i) collection_name[i] = intern(strings, &used, c->collection_names[i]);
@@ -1172,8 +1460,13 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             field_name[fields++] = intern(strings, &used, c->inputs[i].field_names[f]);
     }
     for (unsigned i = 0; i < c->views; ++i) view_name[i] = intern(strings, &used, c->view_names[i]);
+    for (unsigned i = 0; i < c->record_count; ++i) {
+        record_name[i] = intern(strings, &used, c->records[i].name);
+        for (unsigned k = 0; k < c->records[i].fields; ++k)
+            record_field_name[i][k] = intern(strings, &used, c->records[i].field_names[k]);
+    }
     *size = 40 + 16u * c->states + 12u * c->collections + 16u * c->input_count + 8u * fields + 8u * c->constants +
-            16u * c->views + 12u * c->handler_count + 16u * c->code_count + used + c->constant_used;
+            8u * c->record_count + 16u * c->record_fields + 16u * c->views + 12u * c->handler_count + 16u * c->code_count + used + c->constant_used;
     unsigned char *p = *module = allocate(c, *size);
     memcpy(p, "PUREMOD4", 8);
     put16(p + 8, c->states);
@@ -1185,7 +1478,9 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     put16(p + 24, fields);
     put16(p + 26, c->collections);
     put16(p + 28, c->constants);
+    put16(p + 30, c->record_count);
     put32(p + 32, (uint32_t)c->constant_used);
+    put16(p + 36, c->record_fields);
     p += 40;
     for (unsigned i = 0; i < c->states; ++i) {
         p = put32(p, state_name[i]);
@@ -1213,6 +1508,21 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             p = put32(p, (uint32_t)c->inputs[i].field_types[f]);
         }
     for (unsigned i = 0; i < c->constants; ++i) { p = put32(p, c->constant_offset[i]); p = put32(p, c->constant_length[i]); }
+    first = 0;
+    for (unsigned i = 0; i < c->record_count; ++i) {
+        p = put32(p, record_name[i]);
+        p = put16(p, first);
+        p = put16(p, c->records[i].fields);
+        first += c->records[i].fields;
+    }
+    for (unsigned i = 0; i < c->record_count; ++i)
+        for (unsigned k = 0; k < c->records[i].fields; ++k) {
+            const Record *r = &c->records[i];
+            p = put32(p, record_field_name[i][k]);
+            p = put32(p, r->field_text[k]);
+            if (r->field_text[k]) { p = put32(p, r->field_constant[k]); p = put32(p, 0); }
+            else p = put_double(p, r->field_number[k]);
+        }
     for (unsigned i = 0; i < c->views; ++i) {
         p = put32(p, view_name[i]);
         p = put32(p, (uint32_t)c->view_types[i]);

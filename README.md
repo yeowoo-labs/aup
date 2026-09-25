@@ -9,8 +9,8 @@ aup는 [Pure](/srv/git/pure.git) 런타임을 위한 **언어와 툴체인**이�
 | **aup** | 언어와 툴체인. 소스 → 진단 → Pure 모듈 |
 | [Vega](/srv/git/vega.git) | aup와 Pure 위의 인터페이스 구현자(TUI·CLI·GUI·NUI) |
 
-상태: v0a(scalar 상태·키 입력·원자적 이벤트·보기)와 v0b(바이트·영속 문서·메시지·응답·text·커서) 동작.
-다음은 v0c(레코드·리스트·`index of`·순수 함수·모듈).
+상태: v0a(scalar 상태·키 입력·원자적 이벤트·보기), v0b(바이트·영속 문서·메시지·응답·text·커서),
+v0c의 레코드·리스트·`index of` 동작. 다음은 항목 투영과 조건식, 순수 함수, 모듈.
 [언어 v0](docs/design/001-language-v0.md).
 
 ```sh
@@ -19,9 +19,11 @@ build/aup build examples/counter.aup -o counter.pmod
 printf 'down tap\nup tap\nshow\n' | ../pure/prototypes/connections/build/pure-run counter.pmod
 build/aup build examples/notes.aup -o notes.pmod
 printf 'type typed %s\ndown left\nshow\n' "$(printf '안녕' | xxd -p)" | ../pure/prototypes/connections/build/pure-run notes.pmod
+build/aup build examples/tasks.aup -o tasks.pmod
+printf 'type typed %s\ndown again\ndown toggle\nshow\n' "$(printf '우유' | xxd -p)" | ../pure/prototypes/connections/build/pure-run tasks.pmod
 build/aup build examples/editor.aup -o editor.pmod
 ../pure/prototypes/connections/build/pure-edit-module --module editor.pmod --store /tmp/docs show note
-make check                             # Pure 검증, 결정성, 진단, 워크벤치·기존 편집기·text 참조 모델과의 대조
+make check                             # Pure 검증, 결정성, 진단, 워크벤치·기존 편집기·text·리스트 참조 모델과의 대조
 ```
 
 `make check`는 옆의 Pure 체크아웃(`PURE=../pure/prototypes/connections`)의 검증기와 시험 호스트를 쓰고,

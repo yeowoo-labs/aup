@@ -14,6 +14,10 @@
    mark exactly as a reference Python model under random typing (ASCII,
    Korean, emoji, combining marks, NUL, newlines), moves and deletions; string
    escapes and number text follow their stated rules.
+7. List model: examples/tasks.aup keeps its list, index, views and failed
+   events exactly as a reference Python model under random appends, moves,
+   toggles, copies, renames and removals; replacing it with a module whose
+   record changed keeps each item's fields by name.
 5. Editor parity: the document editor written in aup, run by pure-edit-module,
    answers random show/edit/apply operations exactly as pure-edit running the
    original editor.pure (stdout, stderr, exit code), on the same tree store
@@ -29,6 +33,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+
+RECORD = 'record T {\n  a = 0\n}\n'
+ON_K = 'input k = key KeyK\non k.down {\n'
 
 DIAGNOSTICS = [
     ('state x = 1\nstate x = 2\n', '2:7', "already declared as a state"),
@@ -86,6 +93,38 @@ DIAGNOSTICS = [
     ('input typed = text\non typed.down {\n}\n', '2:4', "'typed' is a text input; write on typed { }"),
     ('view v = text(3)\n', '1:10', 'text(...) converts bytes, not a number'),
     ('view v = "é"\nview w = 1 é\n', '2:12', 'unexpected byte 0xc3 outside a string'),
+    # records, lists and indices
+    ('record T {\n  a = 0\n  a = 1\n}\n', '3:3', "duplicate field 'a'"),
+    ('record T {\n}\n', '1:8', 'a record needs at least one field'),
+    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0) or text (field: text)'),
+    ('record T {\n  a = 0\n}\nstate T = 0\n', '4:7', "'T' is already declared as a record"),
+    ('state xs: list of Missing\n', '1:7', "a list holds a record; 'Missing' is not one"),
+    ('state x = 0\nstate at: index of x\n', '2:7', "an index points into a list state; 'x' is not one"),
+    (RECORD + 'state xs: list T\n', '4:16', "expected 'of'"),
+    (RECORD + 'state xs: list of T\nstate ys: list of T\nstate at: index of xs\nview v = ys[at].a\n', '7:13',
+     "an index of 'xs' cannot point into 'ys'"),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at].b\n', '6:10', "record 'T' has no field 'b'"),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at]\n', '6:10', 'read a field of the item'),
+    (RECORD + 'state xs: list of T\nview v = xs\n', '5:10', "'xs' is a list; read xs.count"),
+    (RECORD + 'state xs: list of T\nview v = xs.size\n', '5:10', "a list has count, first and last, not 'size'"),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number or text, not an index'),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  at = 3\n}\n', '8:8', 'expected an index, not a number'),
+    (RECORD + 'state xs: list of T\n' + ON_K + '  xs = 1\n}\n', '7:3', 'a list changes by append, insert, remove'),
+    (RECORD + 'record U {\n  a = 0\n}\nstate xs: list of T\n' + ON_K + '  xs.append(U { a: 1 })\n}\n', '10:13',
+     "'xs' holds T, not U"),
+    (RECORD + 'state xs: list of T\n' + ON_K + '  xs.append(1)\n}\n', '7:13', "'xs' holds T records"),
+    (RECORD + 'state xs: list of T\n' + ON_K + '  xs.append(T { a: "x" })\n}\n', '7:20', 'expected a number, not text'),
+    (RECORD + 'state xs: list of T\n' + ON_K + '  xs.append(T { b: 1 })\n}\n', '7:17', "record 'T' has no field 'b'"),
+    (RECORD + 'state xs: list of T\n' + ON_K + '  xs.append(T { a: 1, a: 2 })\n}\n', '7:23', "field 'a' is given twice"),
+    (RECORD + 'state xs: list of T\n' + ON_K + '  xs.append(T { a: 1 a: 2 })\n}\n', '7:22',
+     "expected ',' or a new line between fields"),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  xs.remove(at .. at)\n}\n', '8:19',
+     'a list removes one item'),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  xs[at].a = "x"\n}\n', '8:14',
+     'expected a number, not text'),
+    (RECORD + 'state n: text\nstate at: cursor in n\n' + ON_K + '  n.insert(at, T { a: 1 })\n}\n', '8:16',
+     'a record value goes into a list'),
+    ('state n: text\nstate at: cursor in n\n' + ON_K + '  n.remove(at)\n}\n', '5:3', 'a text removes a range'),
 ]
 
 ACCEPTED = [
@@ -102,6 +141,15 @@ ACCEPTED = [
     'on open {\n  note = text(documents[key])\n  at = note.end\n}\n'
     'on typed { note.insert(at, typed) }\n'
     'on save {\n  documents[key].replace(0 .. documents[key].bytes, note)\n  reply "saved {note.chars} characters"\n}\n',
+    # a record literal over several lines, text defaults, inserting at the first item
+    'record Item {\n  name: text = "untitled"\n  price = 0; count = -1\n}\n'
+    'state items: list of Item\nstate at: index of items\ninput add = key KeyA\n'
+    'on add.down {\n  items.insert(items.first, Item {\n    price: 2.5,\n    count: items.count + 1,\n  })\n'
+    '  at = items.first\n  items[at].name = "{items[at].name} #{items.count}"\n}\nview total = items.count\n',
+    # index arithmetic and positions in conditions and views
+    'record Row {\n  label: text\n}\nstate rows: list of Row\nstate focus: index of rows\ninput next = key Tab\n'
+    'on next.down {\n  if focus.position + 1 < rows.count {\n    focus = focus + 1\n  } else {\n    focus = rows.first\n  }\n}\n'
+    'view summary = "{rows.count} rows, focus {focus.position}"\n',
 ]
 
 
@@ -376,6 +424,89 @@ class NotesModel:
                  'size': len(self.note.encode()), 'lines': self.note.count('\n') + 1})
 
 
+class TasksModel:
+    """Reference semantics of examples/tasks.aup: the index names an item (0 in
+    an empty list), stays on its item across inserts and removes before it,
+    names the next item when its item is removed, and stops at the ends. An
+    event that reads a missing item fails and changes nothing."""
+
+    def __init__(self):
+        self.tasks, self.at, self.made = [], 0, 0
+
+    def last(self):
+        return max(len(self.tasks) - 1, 0)
+
+    def typed(self, word):
+        self.tasks.append({'title': word, 'done': 0})
+        self.at, self.made = self.last(), self.made + 1
+        return 'none'
+
+    def key(self, name):
+        if name in ('toggle', 'drop', 'again', 'shout') and not self.tasks:
+            return 'not_found'
+        if name == 'up': self.at = max(self.at - 1, 0)
+        elif name == 'down': self.at = min(self.at + 1, self.last())
+        elif name == 'toggle': self.tasks[self.at]['done'] = int(self.tasks[self.at]['done'] == 0)
+        elif name == 'drop':
+            del self.tasks[self.at]
+            self.at = min(self.at, self.last())
+        elif name == 'top': self.at = 0
+        elif name == 'bottom': self.at = self.last()
+        elif name == 'again':
+            self.tasks.insert(self.at, dict(self.tasks[self.at]))
+            self.at += 1
+        elif name == 'shout': self.tasks[self.at]['title'] += '!'
+        return 'none'
+
+    def expected(self):
+        item = self.tasks[self.at] if self.tasks else None
+        return ({'tasks': [dict(task) for task in self.tasks], 'at': self.at, 'made': self.made},
+                {'count': len(self.tasks), 'position': self.at, 'current': item and item['title'],
+                 'status': f'{self.at + 1}/{len(self.tasks)}', 'finished': item and item['done']})
+
+
+def tasks_parity(aup, pure_run, work, seeds, steps=400):
+    module = work / 'tasks.pmod'
+    compile_module(aup, ROOT / 'examples/tasks.aup', module)
+    words = ['milk', '빵', '', 'a"b\\', '😀\n', '\u0000', '👩\u200d💻']
+    keys = ['up', 'down', 'toggle', 'drop', 'drop', 'top', 'bottom', 'again', 'shout']
+    compared = failed = 0
+    for seed in seeds:
+        rng = random.Random(seed + 9000)
+        model, commands, expected = TasksModel(), [], []
+        for _ in range(steps):
+            # Appends and copies balance drops, so the list keeps coming back to empty.
+            if rng.random() < 0.1:
+                word = rng.choice(words)
+                commands.append('type typed ' + (word.encode().hex() or '-'))
+                fault = model.typed(word)
+            else:
+                name = rng.choice(keys)
+                commands.append(f'down {name}')
+                fault = model.key(name)
+            expected.append((fault, *model.expected()))
+        lines = run(pure_run, module, stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()
+        assert len(lines) == len(commands), (seed, len(lines))
+        for line, command, (fault, states, views) in zip(lines, commands, expected):
+            snapshot = json.loads(line)
+            where = (seed, command)
+            assert snapshot['fault'] == fault and (snapshot['error'] is None) == (fault == 'none'), (where, snapshot)
+            assert snapshot['states'] == states, (where, snapshot['states'], states)
+            assert snapshot['views'] == views, (where, snapshot['views'], views)
+            compared += 1
+            failed += fault != 'none'
+    # A replacement whose record gained and reordered fields keeps every item.
+    (work / 'tasks2.aup').write_text('record Task {\n  urgent = 1\n  done = 0\n  title: text = "-"\n}\n'
+                                     'state tasks: list of Task\nstate at: index of tasks\n')
+    compile_module(aup, work / 'tasks2.aup', work / 'tasks2.pmod')
+    lines = run(pure_run, module, stdin='type typed 6d696c6b\ntype typed 62\ndown toggle\ndown up\n'
+                                        f'replace {work / "tasks2.pmod"}\n').stdout.splitlines()
+    final = json.loads(lines[-1])
+    assert final['states'] == {'tasks': [{'urgent': 1, 'done': 0, 'title': 'milk'},
+                                         {'urgent': 1, 'done': 1, 'title': 'b'}], 'at': 0}, final
+    return compared, failed
+
+
 def text_parity(aup, pure_run, work, seeds, steps=400):
     module = work / 'notes.pmod'
     compile_module(aup, ROOT / 'examples/notes.aup', module)
@@ -484,6 +615,8 @@ def main():
         report['parity_failed_events_matched'] = sum(failures for _, failures in results)
         report['parity_programs'] = len(pairs)
         report['text_model_snapshots'] = text_parity(aup, pure_run, work, range(args.text_seeds))
+        report['list_model_snapshots'], report['list_model_failed_events'] = \
+            tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

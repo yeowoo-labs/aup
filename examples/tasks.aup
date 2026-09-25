@@ -1,0 +1,42 @@
+# A task list. The runtime owns the list: the index always names an item,
+# stays on it when items are inserted or removed before it, stops at the
+# ends, and a failed event leaves the list as it was.
+record Task {
+  title: text
+  done = 0
+}
+
+state tasks: list of Task
+state at: index of tasks
+state made = 0
+
+input typed = text
+input up = key ArrowUp
+input down = key ArrowDown
+input toggle = key Space
+input drop = key Delete
+input top = key Home
+input bottom = key End
+input again = key KeyD
+input shout = key KeyS
+
+on typed {
+  tasks.append(Task { title: typed })
+  at = tasks.last
+  made = made + 1
+}
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on toggle.down { tasks[at].done = !tasks[at].done }
+on drop.down { tasks.remove(at) }
+on top.down { at = tasks.first }
+on bottom.down { at = tasks.last }
+# A copy goes before the current task, which stays current.
+on again.down { tasks.insert(at, Task { title: tasks[at].title, done: tasks[at].done }) }
+on shout.down { tasks[at].title = "{tasks[at].title}!" }
+
+view count = tasks.count
+view position = at.position
+view current = tasks[at].title
+view status = "{at.position + 1}/{tasks.count}"
+view finished = tasks[at].done
