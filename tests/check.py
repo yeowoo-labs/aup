@@ -14,6 +14,8 @@
    mark exactly as a reference Python model under random typing (ASCII,
    Korean, emoji, combining marks, NUL, newlines), moves and deletions; string
    escapes and number text follow their stated rules.
+8. Stored state: the list app and the text editor run on a tree store,
+   restarting at random points, and still match their reference models.
 7. List model: examples/tasks.aup keeps its list, index, views (conditional
    ones and a table with a row per task) and failed events exactly as a
    reference Python model under random appends, moves, toggles, copies,
@@ -608,6 +610,63 @@ def libraries(aup, pure_run, work):
     return len(good), len(bad)
 
 
+def stored_runs(aup, pure_run, work, seeds, steps=240):
+    """Declared state is stored state: the list app and the text editor run on
+    a store, restarting (a new pure-run process) at random points, and keep
+    matching their reference models across the restarts."""
+    import shutil
+    compared = restarts = 0
+    for source in ('examples/tasks.aup', 'examples/notes.aup'):
+        module = work / (Path(source).stem + '-stored.pmod')
+        compile_module(aup, ROOT / source, module)
+        for seed in seeds:
+            rng = random.Random(seed + 11000)
+            store = work / f'store-{Path(source).stem}-{seed}'
+            if store.exists():
+                shutil.rmtree(store)
+            commands, expected = [], []
+            if 'tasks' in source:
+                model, words = TasksModel(), ['milk', '빵', '', 'a"b', '😀\n']
+                keys = ['up', 'down', 'toggle', 'drop', 'top', 'bottom', 'again', 'shout']
+                for _ in range(steps):
+                    if rng.random() < 0.3:
+                        word = rng.choice(words)
+                        commands.append('type typed ' + (word.encode().hex() or '-'))
+                        fault = model.typed(word)
+                    else:
+                        name = rng.choice(keys)
+                        commands.append(f'down {name}')
+                        fault = model.key(name)
+                    expected.append((fault, *model.expected()))
+            else:
+                model, words = NotesModel(), ['a', '안녕', '\n', '😀', 'e\u0301']
+                keys = ['left', 'right', 'up', 'down', 'back', 'forward', 'home', 'finish', 'set_mark']
+                for _ in range(steps):
+                    if rng.random() < 0.45:
+                        word = rng.choice(words)
+                        commands.append('type typed ' + word.encode().hex())
+                        model.insert(word)
+                    else:
+                        name = rng.choice(keys)
+                        commands.append(f'down {name}')
+                        model.key(name)
+                    expected.append(('none', *model.expected()))
+            cuts = sorted(rng.sample(range(1, steps), 8))
+            lines = []
+            for start, end in zip([0] + cuts, cuts + [steps]):
+                chunk = '\n'.join(commands[start:end]) + '\n'
+                lines += run(pure_run, module, '--store', store, stdin=chunk, check=False).stdout.splitlines()
+                restarts += 1
+            assert len(lines) == steps, (source, seed, len(lines))
+            for line, command, (fault, states, views) in zip(lines, commands, expected):
+                snapshot = json.loads(line)
+                where = (source, seed, command)
+                assert snapshot['fault'] == fault, (where, snapshot)
+                assert snapshot['states'] == states and snapshot['views'] == views, (where, snapshot, states, views)
+                compared += 1
+    return compared, restarts
+
+
 def conditionals(aup, pure_run, work):
     """Only the chosen branch runs (10 / x is never computed at x = 0), else-if
     chains pick the first true arm, and conditionals nest inside arithmetic."""
@@ -736,6 +795,7 @@ def main():
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
+        report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))

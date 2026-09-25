@@ -21,9 +21,10 @@ build/aup build examples/notes.aup -o notes.pmod
 printf 'type typed %s\ndown left\nshow\n' "$(printf '안녕' | xxd -p)" | ../pure/prototypes/connections/build/pure-run notes.pmod
 build/aup build examples/tasks.aup -o tasks.pmod
 printf 'type typed %s\ndown again\ndown toggle\nshow\n' "$(printf '우유' | xxd -p)" | ../pure/prototypes/connections/build/pure-run tasks.pmod
+../pure/prototypes/connections/build/pure-run tasks.pmod --store /tmp/tasks < /dev/null   # 상태는 저장소에 남는다
 build/aup build examples/editor.aup -o editor.pmod
 ../pure/prototypes/connections/build/pure-edit-module --module editor.pmod --store /tmp/docs show note
-make check                             # Pure 검증, 결정성, 진단, 워크벤치·기존 편집기·text·리스트 참조 모델과의 대조
+make check                             # Pure 검증, 결정성, 진단, 워크벤치·기존 편집기·text·리스트 참조 모델과의 대조, 재시작을 끼운 영속 대조
 ```
 
 `make check`는 옆의 Pure 체크아웃(`PURE=../pure/prototypes/connections`)의 검증기와 시험 호스트를 쓰고,
