@@ -1,6 +1,6 @@
 # aup v0 — 한 언어, 한 모듈 형식
 
-2026-09-25. 상태: v0a(scalar)와 v0b의 바이트·영속 문서 부분 구현. text·커서는 [002](002-dsl-direction.md)에서 다음에 구현.
+2026-09-25. 상태: v0a(scalar)와 v0b(바이트·영속 문서·text·커서) 구현. text 문법은 [002](002-dsl-direction.md).
 
 착수 기준:
 

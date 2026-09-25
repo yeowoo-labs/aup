@@ -63,8 +63,24 @@ view current = note.line(at)           # 커서가 있는 줄. 복사하지 않�
 | 단계 | 들어가는 것 | 합격 기준 |
 |---|---|---|
 | v0a ✅ | 스칼라 상태, 키 입력, 핸들러, 보기 | 워크벤치 엔진과 비트 단위 일치 |
-| v0b | `bytes`, 키별 영속 문서, `message` 입력, 응답, `require` ✅ / `text`(리터럴·보간·`cursor in`·`char`/`line`), `text` 입력 | 기존 편집기 CLI와 바이트 단위 일치 ✅ / TUI 동작 |
+| v0b ✅ | `bytes`, 키별 영속 문서, `message` 입력, 응답, `require`, `text`(리터럴·보간·`cursor in`·`char`/`line`), `text` 입력 | 기존 편집기 CLI와 바이트 단위 일치, text 편집이 참조 모델과 일치 |
 | v0c | `i64 bool`, `record`, `list`/`map`, `index of`, 순수 `fn`, `use` 모듈 | 모든 연산에 실행량 상한 |
 | v0d | `use vega`로 첫 인터페이스 투영(목록·표·커서·톤) | 한 명세가 두 표면 이상에서 동작 |
+
+### 구현된 text (v0b)
+
+`examples/notes.aup`가 작은 편집기 전체다. 위 문법 중 다음을 구현했다.
+
+- `text` 상태·문자열 초기값, 문자열의 이스케이프와 `{보간}`(수와 text), `input 이름 = text`
+- `cursor in 이름`, `char`/`line` 거리, `.start`/`.end`, `insert`/`remove`, `.line(커서)`
+- text의 `.chars`/`.lines`/`.bytes`, 커서의 `.chars`(처음부터 센 글자 수)와 `.line`(줄 번호)
+- `text(bytes)`/`bytes(text)`. 응답과 문서 `replace`는 text를 UTF-8 바이트로 받는다.
+
+`char`는 Unicode scalar다. 여러 줄 문자열, `{price:.2}` 같은 형식 지정, grapheme과 `word`는 아직 없다.
+삽입 위치에 있던 커서는 모두 삽입한 글자 뒤로 간다(입력 커서와 표시가 같은 규칙). 보간 안에는 문자열을 쓸 수 없다.
+
+검증: 무작위 입력(ASCII·한글·이모지·결합 문자·NUL·줄바꿈)과 이동·지우기 4,800단계에서 본문, 커서, 표시,
+보기가 Python 참조 모델과 같다. 이스케이프와 숫자 표시(`1e+21`, `0.30000000000000004`, `2.5e-7`, `-0`은 `0`)를
+확인한다. 컴파일러와 Pure 실행기를 각각 sanitizer로 빌드해 같은 검사를 통과했다.
 
 구현은 C로 손수 쓴 재귀 하강 파서를 유지한다. 문법은 EBNF로 문서화하고, 이후 `aup fmt`와 언어 서버를 붙인다.
