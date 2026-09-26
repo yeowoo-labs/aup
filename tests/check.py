@@ -943,6 +943,94 @@ def server_lent_budget(aup, pure, work):
     return budget
 
 
+NOTE_SOURCE = """state note: text
+input write = message {
+  text: text
+}
+on write { note = write.text }
+view page = note
+view size = note.bytes
+"""
+
+
+def server_lent_views(aup, pure, work, threads=1):
+    """A view that shows a text state as it is lends the state's stored
+    extents. Answers pipelined on one connection and left waiting hold the
+    store mapping they were read from while the note is replaced: each comes
+    out whole in one version. When a reader goes without reading, the
+    mappings its answers held are unmapped and nothing stays charged. With
+    several threads the owner lends and a connection thread gives back."""
+    import socket
+    import time
+    module, source = work / 'note.pmod', work / 'note.aup'
+    source.write_text(NOTE_SOURCE)
+    compile_module(aup, source, module)
+    store = work / f'lent-views-{threads}'
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store, '--threads', threads])
+
+    def write(text):
+        body = json.dumps({'text': text}).encode()
+        import http.client
+        connection = http.client.HTTPConnection('127.0.0.1', host.port, timeout=30)
+        connection.request('POST', '/inputs/write', body, {'Content-Type': 'application/json'})
+        assert connection.getresponse().status == 200
+        connection.close()
+
+    def mappings():
+        # A compaction replaces the file: a mapping of the old one shows as "(deleted)".
+        path = str((store / 'pure.tree').resolve())
+        return sum(1 for line in open(f'/proc/{host.process.pid}/maps') if path in line)
+
+    def settle(to):
+        for _ in range(100):  # an answer's ticket is released on its thread
+            if mappings() <= to: return mappings()
+            time.sleep(0.02)
+        return mappings()
+
+    def pipeline(count):
+        # Far more than the kernel's buffers take (a few MiB): an answer waits, lent.
+        sock = socket.create_connection(('127.0.0.1', host.port), timeout=30)
+        sock.sendall(b'GET /views/page HTTP/1.1\r\nHost: x\r\n\r\n' * count)
+        time.sleep(0.3)
+        return sock
+
+    size = 1 << 20
+    try:
+        write('x' * size)
+        assert http(host.port, 'GET', '/views/size')[3] == str(size).encode()
+        alone = mappings()
+        # Whole versions, however the note changes while answers wait.
+        sock = pipeline(32)
+        for round_ in range(5):
+            write(chr(ord('A') + round_) * size)
+        held = mappings()
+        data = b''
+        while data.count(b'HTTP/1.1 200') < 32 or len(data) < 32 * size:
+            chunk = sock.recv(1 << 20)
+            assert chunk, len(data)
+            data += chunk
+        sock.close()
+        answers = [part.split(b'\r\n\r\n', 1) for part in data.split(b'HTTP/1.1 200 OK\r\n')[1:]]
+        bodies = [body[:size] for _, body in answers]
+        assert all(b'text/plain' in head for head, _ in answers) and bodies[0] == b'x' * size, [b[:1] for b in bodies]
+        assert all(len(set(body)) == 1 and len(body) == size for body in bodies), [len(b) for b in bodies]
+        after_reading = settle(alone)
+        # A reader that goes without reading gives back what its answers held.
+        sock = pipeline(32)
+        for round_ in range(3):
+            write(chr(ord('a') + round_) * size)
+        held_again = mappings()
+        sock.close()
+        after_leaving = settle(alone)
+        assert held > alone and held_again > alone and after_reading <= alone and after_leaving <= alone, \
+            (alone, held, after_reading, held_again, after_leaving)
+        assert http(host.port, 'GET', '/views/page')[3] == b'c' * size
+    finally:
+        stats = host.stop()
+    assert stats[0]['active'] == 0 and stats[0]['retained_payload_bytes'] == 0, stats
+    return {'alone': alone, 'while_lent': max(held, held_again), 'after': after_leaving}
+
+
 def server_bursts(aup, pure, work, clients=8, edits=30, shards=1):
     """Concurrent edits share commits, and every acknowledged edit survives a
     kill -9 of the server."""
@@ -1831,6 +1919,7 @@ def main():
         report['server_pipelined_answers'] = server_pipelining(aup, args.pure.resolve(), work)
         report['server_lent_read_bytes'] = server_lent_reads(aup, args.pure.resolve(), work)
         report['server_lent_budget_bytes'] = server_lent_budget(aup, args.pure.resolve(), work)
+        report['server_lent_views'] = [server_lent_views(aup, args.pure.resolve(), work, threads) for threads in (1, 3)]
         report['server_bursts'] = server_bursts(aup, args.pure.resolve(), work)
         report['server_bursts_three_threads'] = server_bursts(aup, args.pure.resolve(), work, shards=3)
         report['server_app_requests'], report['server_app_acknowledged_before_kill'] = \
