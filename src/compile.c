@@ -17,9 +17,9 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
-       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS };
+       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD };
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
-enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4 };
+enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
 typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
@@ -34,7 +34,7 @@ typedef struct {
 } Token;
 
 typedef enum {
-    E_NUMBER, E_NAME, E_DT, E_UNARY, E_BINARY, E_CALL,
+    E_NUMBER, E_NAME, E_DT, E_NOW, E_UNARY, E_BINARY, E_CALL,
     E_MEMBER,  /* args[0].member */
     E_DOC,     /* name[key] */
     E_SIZE,    /* name[key].bytes */
@@ -74,6 +74,7 @@ typedef struct Stmt {
 typedef struct {
     char name[NAME], key[NAME];
     int kind;
+    uint32_t period; /* a timer's, in milliseconds */
     bool keyed;
     char field_names[FIELDS][NAME];
     int field_types[FIELDS];
@@ -175,7 +176,8 @@ typedef struct {
 
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
-                                       "reply", "require", "record", "each", "fn", "use"};
+                                       "reply", "require", "record", "each", "fn", "use", "now", "every",
+                                       "floor"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -291,7 +293,7 @@ static Token scan(Compiler *c) {
             token.kind = T_PUNCT;
             return token;
         }
-    if (strchr("=+-*/!<>(){}[],.;:", ch)) {
+    if (strchr("=+-*/%!<>(){}[],.;:", ch)) {
         token.text[0] = ch;
         advance(c);
         token.kind = T_PUNCT;
@@ -373,7 +375,7 @@ static bool utf8_valid(const unsigned char *bytes, size_t size) {
 
 static const struct { const char *text; int precedence, op; } binary[] = {
     {"||", 1, OR}, {"&&", 2, AND}, {"==", 3, EQ}, {"!=", 3, NE}, {"<", 4, LT}, {"<=", 4, LE},
-    {">", 4, GT}, {">=", 4, GE}, {"+", 5, ADD}, {"-", 5, SUB}, {"*", 6, MUL}, {"/", 6, DIV},
+    {">", 4, GT}, {">=", 4, GE}, {"+", 5, ADD}, {"-", 5, SUB}, {"*", 6, MUL}, {"/", 6, DIV}, {"%", 6, MOD},
 };
 
 static Expr *node(Compiler *c, ExprKind kind, int line, int column) {
@@ -638,9 +640,10 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
         expect(c, ")", "')'");
     } else if (token.kind == T_NAME) {
         static const struct { const char *name; unsigned count; int op; } calls[] =
-            {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM}};
+            {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM},
+             {"floor", 1, FLOOR}};
         int call = -1, how = -1;
-        for (int i = 0; i < 5; ++i) if (!strcmp(token.text, calls[i].name)) call = i;
+        for (int i = 0; i < (int)(sizeof(calls) / sizeof(*calls)); ++i) if (!strcmp(token.text, calls[i].name)) call = i;
         static const char *const folds[] = {"count", "sum", "max", "min", "first"};
         for (int i = 0; i < 5; ++i) if (!strcmp(token.text, folds[i])) how = i;
         Expr *first = NULL;
@@ -679,7 +682,7 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
         }
         if (call >= 0 && (first || is(c, "("))) {
             if (!first) take(c);
-            left = node(c, call >= 3 ? E_CONVERT : E_CALL, token.line, token.column);
+            left = node(c, calls[call].op == TEXT_FROM || calls[call].op == BYTES_FROM ? E_CONVERT : E_CALL, token.line, token.column);
             left->op = calls[call].op;
             newlines(c);
             if (first) {
@@ -699,8 +702,8 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
             if (left->count != calls[call].count)
                 fail_at(c, token.line, token.column, "%s expects %u argument%s", token.text, calls[call].count,
                         calls[call].count == 1 ? "" : "s");
-        } else if (!strcmp(token.text, "dt")) {
-            left = node(c, E_DT, token.line, token.column);
+        } else if (!strcmp(token.text, "dt") || !strcmp(token.text, "now")) {
+            left = node(c, token.text[0] == 'd' ? E_DT : E_NOW, token.line, token.column);
         } else if (!strcmp(token.text, "if")) {
             left = conditional(c, &token);
         } else {
@@ -725,7 +728,7 @@ parsed:
         if (multiline) newlines(c);
         int found = -1;
         if (c->token.kind == T_PUNCT)
-            for (int i = 0; i < 12; ++i) if (!strcmp(c->token.text, binary[i].text)) found = i;
+            for (int i = 0; i < (int)(sizeof(binary) / sizeof(*binary)); ++i) if (!strcmp(c->token.text, binary[i].text)) found = i;
         if (found < 0 || binary[found].precedence < minimum) break;
         Token op = take(c);
         Expr *e = node(c, E_BINARY, op.line, op.column);
@@ -1275,8 +1278,27 @@ static void declaration(Compiler *c) {
             take(c);
             in->kind = KIND_TEXT;
             ++c->input_count;
+        } else if (word(c, "every")) {
+            /* input tick = every 1 second: ticks while a host runs the app. */
+            take(c);
+            if (c->token.kind != T_NUMBER) fail_at(c, c->token.line, c->token.column, "expected a period, as in every 1 second");
+            Token amount = take(c);
+            Token unit = expect_name(c, "ms, second, minute or hour");
+            static const struct { const char *name; double scale; } units[] = {
+                {"ms", 1}, {"second", 1000}, {"seconds", 1000}, {"minute", 60000}, {"minutes", 60000},
+                {"hour", 3600000}, {"hours", 3600000}};
+            double scale = 0;
+            for (size_t u = 0; u < sizeof(units) / sizeof(*units); ++u)
+                if (!strcmp(unit.text, units[u].name)) scale = units[u].scale;
+            if (!scale) fail_at(c, unit.line, unit.column, "a timer's unit is ms, second, minute or hour");
+            double period = amount.number * scale;
+            if (period != floor(period) || period < 1 || period > 86400000)
+                fail_at(c, amount.line, amount.column, "a timer ticks every 1 ms to 24 hours, in whole milliseconds");
+            in->kind = KIND_TIMER;
+            in->period = (uint32_t)period;
+            ++c->input_count;
         } else {
-            if (!word(c, "key")) fail_at(c, c->token.line, c->token.column, "expected 'key', 'text' or 'message'");
+            if (!word(c, "key")) fail_at(c, c->token.line, c->token.column, "expected 'key', 'text', 'message' or 'every'");
             take(c);
             Token key = expect_name(c, "key name");
             if (!key_name(key.text)) fail_at(c, key.line, key.column, "unknown key '%s'", key.text);
@@ -1498,11 +1520,15 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
     switch (e->kind) {
     case E_NUMBER: emit(c, e->line, e->column, CONST, 0, e->number); return (Kind){NUM, -1};
-    case E_DT:
-        if (c->folding) fail_at(c, e->line, e->column, "dt is not available in count, sum, max or min");
-        if (!handler) fail_at(c, e->line, e->column, "dt is only available in handlers");
-        emit(c, e->line, e->column, DT, 0, 0);
+    case E_DT: case E_NOW: {
+        const char *name = e->kind == E_DT ? "dt" : "now";
+        if (c->folding) fail_at(c, e->line, e->column, "%s is not available in count, sum, max or min", name);
+        if (!handler)
+            fail_at(c, e->line, e->column, e->kind == E_DT ? "dt is only available in handlers" :
+                    "now is only available in handlers; a view shows a state that a timer or an event sets");
+        emit(c, e->line, e->column, e->kind == E_DT ? DT : NOW, 0, 0);
         return (Kind){NUM, -1};
+    }
     case E_TEXT: emit(c, e->line, e->column, TEXT_CONST, constant(c, e), 0); return (Kind){TEXT, -1};
     case E_STRING: {
         int pieces = 0;
@@ -2005,7 +2031,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (kind) fail_at(c, line, column, "'%s' is a %s, not an input", name, kind);
             fail_at(c, line, column, "unknown input '%s'", name);
         }
-        const char *what = c->inputs[input].kind == KIND_MESSAGE ? "message" : "text input";
+        const char *what = c->inputs[input].kind == KIND_MESSAGE ? "message" :
+                           c->inputs[input].kind == KIND_TIMER ? "timer" : "text input";
         if (c->inputs[input].kind != KIND_KEY && c->handlers[i].edge >= 0)
             fail_at(c, line, column, "'%s' is a %s; write on %s { }", name, what, name);
         if (c->inputs[input].kind == KIND_KEY && c->handlers[i].edge < 0)
@@ -2108,7 +2135,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         *p++ = (unsigned char)in->kind;
         *p++ = in->keyed;
         p = put16(p, 0);
-        p = put32(p, input_key[i]);
+        p = put32(p, in->kind == KIND_TIMER ? in->period : input_key[i]);
         p = put16(p, in->kind == KIND_MESSAGE ? first : 0);
         p = put16(p, in->fields);
         first += in->fields;

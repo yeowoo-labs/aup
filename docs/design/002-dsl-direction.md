@@ -245,6 +245,30 @@ view summary = words.counted(tasks.count, "task", "tasks")
 검증: 라이브러리를 쓴 할 일 목록이 참조 모델과 일치하고, 인자를 한 번만 계산하며(값 전달), 라이브러리 경로·순환·
 상태 선언·앱 상태 읽기 오류가 해당 파일 위치로 보고된다. 같은 소스와 라이브러리는 같은 모듈을 만든다. 진단 10건을 더했다.
 
+### 시간
+
+```text
+state started = 0
+state last = 0
+input tick = every 1 second                 # ms, second, minute, hour (1 ms–24시간)
+on tick {
+  if started == 0 { started = now }         # now: 이 이벤트의 시각, 1970년부터 ms(UTC)
+  last = now
+}
+view elapsed = floor((last - started) / 1000)
+view clock = "{floor(last / 3600000) % 24}:{floor(last / 60000) % 60}:{floor(last / 1000) % 60}"
+```
+
+- **시간은 입력이다.** `now`는 핸들러에서만 읽는 이벤트의 시각이다. 호스트가 이벤트마다 정하고 스크립트는 아무 시각이나
+  재현한다(`pure-run`의 `time MS`). 보기에서는 쓸 수 없다. 보기는 상태의 순수 함수라, 시계를 보이려면 타이머가 상태에 적는다.
+- **타이머는 입력이다.** `input tick = every 1 second`는 호스트가 앱을 돌리는 동안 주기마다 틱을 넣는다. 틱은 키 이벤트처럼
+  저장되는 이벤트다. 놓친 틱을 몰아서 넣지는 않는다.
+- **시각을 나누는 셈.** `floor(x)`와 `x % y`(곱셈과 같은 우선순위)를 더했다. `%`의 결과는 나누는 수의 부호를 따른다(파이썬과
+  같다). `-7 % 3`은 2다. 0으로 나누면 이벤트가 `divide`로 실패한다.
+
+검증: 무작위 시각(정수·소수 ms, 앞뒤로)과 두 타이머의 틱, 키 3,600단계에서 상태와 보기가 파이썬 모델(`math.floor`, `%`)과 같다.
+진단 9건을 더했다.
+
 ### 다시 빌드: aup watch
 
 ```sh

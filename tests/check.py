@@ -202,6 +202,16 @@ DIAGNOSTICS = [
     # Texts compare with texts, by their bytes.
     ('view v = "a" < 1\n', '1:16', 'expected text, not a number'),
     ('view v = 1 < "a"\n', '1:14', 'expected a number, not text'),
+    # Time: now in handlers, timers, floor and a floored modulo.
+    ('view v = now\n', '1:10', 'now is only available in handlers; a view shows a state that a timer or an event sets'),
+    ('input t = every 0 ms\n', '1:17', 'a timer ticks every 1 ms to 24 hours, in whole milliseconds'),
+    ('input t = every 1.5 ms\n', '1:17', 'a timer ticks every 1 ms to 24 hours, in whole milliseconds'),
+    ('input t = every 25 hours\n', '1:17', 'a timer ticks every 1 ms to 24 hours, in whole milliseconds'),
+    ('input t = every 2 days\n', '1:19', "a timer's unit is ms, second, minute or hour"),
+    ('input t = every second\n', '1:17', 'expected a period, as in every 1 second'),
+    ('input t = every 1 second\non t.down {\n}\n', '2:4', "'t' is a timer; write on t { }"),
+    ('view v = floor(1, 2)\n', '1:10', 'floor expects 1 argument'),
+    ('state now = 1\n', '1:7', "'now' is reserved"),
 ]
 
 ACCEPTED = [
@@ -253,6 +263,9 @@ ACCEPTED = [
     # Message fields of every type, variable ones anywhere and several of them.
     'state n = 0\nstate t: text\ninput m = message {\n  a: text\n  b: number\n  c: bytes\n  d: u32\n  e: text\n}\n'
     'on m {\n  n = m.b + m.d + m.c.bytes\n  t = "{m.a}{m.e}"\n}\n',
+    # A timer, now, floor and %.
+    'state last = 0\ninput tick = every 500 ms\ninput slow = every 2 hours\non tick { last = floor(now / 1000) % 60 }\n'
+    'on slow { last = -7 % 3 }\nview v = last % 7\n',
 ]
 
 
@@ -1483,6 +1496,66 @@ def folds(aup, pure_run, work, seeds, steps=300):
     return compared
 
 
+TIME_SOURCE = """state started = 0
+state last = 0
+state ticks = 0
+state spread = 0
+input tick = every 250 ms
+input slow = every 1 hour
+input mix = key KeyM
+on tick {
+  if started == 0 { started = now }
+  last = now
+  ticks = ticks + 1
+}
+on slow { spread = (now - started) % 7 }
+on mix.down { spread = floor(spread * 3.5 - 2) % -4 }
+view elapsed = floor((last - started) / 1000)
+view clock = "{floor(last / 3600000) % 24}:{floor(last / 60000) % 60}:{floor(last / 1000) % 60}"
+view day = floor(last / 86400000)
+"""
+
+
+def timing(aup, pure_run, work, seeds, steps=300):
+    """now, timers, floor and % against a Python model under random times
+    (whole and fractional milliseconds, forwards and back), ticks of two
+    timers and a key: % takes the divisor's sign as Python's does."""
+    import math
+    source = work / 'time.aup'
+    source.write_text(TIME_SOURCE)
+    compile_module(aup, source, work / 'time.pmod')
+    compared = 0
+    for seed in seeds:
+        rng, now, started, last, ticks, spread = random.Random(seed + 5100), 0.0, 0.0, 0.0, 0, 0.0
+        commands, expected = [], []
+        for _ in range(steps):
+            roll = rng.random()
+            if roll < 0.3:
+                now = rng.choice([now + rng.choice([250, 1000, 61000, 3600000]), rng.uniform(0, 2e12),
+                                  float(rng.randrange(0, 10 ** 12)), now - 5000 if now > 5000 else now])
+                commands.append(f'time {now!r}')
+            elif roll < 0.6:
+                commands.append('tick tick')
+                if started == 0: started = now
+                last, ticks = now, ticks + 1
+            elif roll < 0.8:
+                commands.append('tick slow')
+                spread = (now - started) % 7
+            else:
+                commands.append('down mix')
+                spread = math.floor(spread * 3.5 - 2) % -4
+            views = {'elapsed': math.floor((last - started) / 1000),
+                     'clock': f'{math.floor(last / 3600000) % 24}:{math.floor(last / 60000) % 60}:{math.floor(last / 1000) % 60}',
+                     'day': math.floor(last / 86400000)}
+            expected.append(({'started': started, 'last': last, 'ticks': ticks, 'spread': spread}, views))
+        lines = run(pure_run, work / 'time.pmod', stdin='\n'.join(commands) + '\n').stdout.splitlines()
+        shown = [json.loads(line) for line in lines]
+        for number, (got, (states, views)) in enumerate(zip(shown, expected)):
+            assert got['states'] == states and got['views'] == views, (seed, number, commands[number], got, states, views)
+        compared += len(shown)
+    return compared
+
+
 def watching(aup, pure_run, work):
     """aup watch: whatever the last build read, read differently, builds
     again; errors keep the last module; the module is only ever replaced whole."""
@@ -1691,6 +1764,7 @@ def main():
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
+        report['time_snapshots'] = timing(aup, pure_run, work, range(args.seeds))
         report['watched_builds'] = watching(aup, pure_run, work)
         report['fold_snapshots'] = folds(aup, pure_run, work, range(args.seeds if hasattr(args, 'seeds') else 8))
         report['keyed_snapshots'], report['keyed_failed_events'] = keyed(aup, pure_run, work, range(args.seeds))
