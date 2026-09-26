@@ -14,8 +14,12 @@
    mark exactly as a reference Python model under random typing (ASCII,
    Korean, emoji, combining marks, NUL, newlines), moves and deletions; string
    escapes and number text follow their stated rules.
+9. Server: the HTTP document server running editor.aup answers random
+   requests exactly as the server running editor.pure; concurrent edits share
+   commits, and every acknowledged edit survives kill -9.
 8. Stored state: the list app and the text editor run on a tree store,
-   restarting at random points, and still match their reference models.
+   restarting at random points (every other run saving in bursts), and still
+   match their reference models.
 7. List model: examples/tasks.aup keeps its list, index, views (conditional
    ones and a table with a row per task) and failed events exactly as a
    reference Python model under random appends, moves, toggles, copies,
@@ -653,9 +657,10 @@ def stored_runs(aup, pure_run, work, seeds, steps=240):
                     expected.append(('none', *model.expected()))
             cuts = sorted(rng.sample(range(1, steps), 8))
             lines = []
-            for start, end in zip([0] + cuts, cuts + [steps]):
+            for number, (start, end) in enumerate(zip([0] + cuts, cuts + [steps])):
                 chunk = '\n'.join(commands[start:end]) + '\n'
-                lines += run(pure_run, module, '--store', store, stdin=chunk, check=False).stdout.splitlines()
+                batch = ['--batch', str(rng.randint(2, 9))] if number % 2 else []  # deferred saving, in bursts
+                lines += run(pure_run, module, '--store', store, *batch, stdin=chunk, check=False).stdout.splitlines()
                 restarts += 1
             assert len(lines) == steps, (source, seed, len(lines))
             for line, command, (fault, states, views) in zip(lines, commands, expected):
@@ -665,6 +670,149 @@ def stored_runs(aup, pure_run, work, seeds, steps=240):
                 assert snapshot['states'] == states and snapshot['views'] == views, (where, snapshot, states, views)
                 compared += 1
     return compared, restarts
+
+
+class HttpHost:
+    """A Pure HTTP host on a fresh port; stops with its statistics."""
+
+    def __init__(self, args):
+        import select
+        self.process = subprocess.Popen([str(a) for a in args] + ['--port', '0'], stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+        ready, _, _ = select.select([self.process.stdout], [], [], 10)
+        assert ready, 'HTTP host did not start'
+        line = self.process.stdout.readline()
+        assert line, self.process.communicate(timeout=5)
+        self.port = json.loads(line)['port']
+
+    def request(self, method, key, body=b'', expected=None):
+        import http.client
+        headers = {'Content-Length': str(len(body))}
+        if expected is not None:
+            headers['If-None-Match' if expected == 0 else 'If-Match'] = '*' if expected == 0 else f'"{expected}"'
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=30)
+        try:
+            connection.request(method, f'/objects/{key}', body, headers)
+            response = connection.getresponse()
+            return response.status, response.getheader('ETag'), response.getheader('X-Pure-Error'), response.read()
+        finally:
+            connection.close()
+
+    def stop(self):
+        self.process.terminate()
+        _, error = self.process.communicate(timeout=30)
+        assert self.process.returncode == 0, error[-1000:]
+        return [json.loads(line) for line in error.decode().splitlines() if line.startswith('{')]
+
+
+def server_parity(aup, pure, work, seeds, operations=150):
+    """The document server running editor.aup answers every request exactly
+    as the server running editor.pure: status, revision, error and body."""
+    import struct
+    module = work / 'editor-server.pmod'
+    compile_module(aup, ROOT / 'examples/editor.aup', module)
+    compared = 0
+    for seed in seeds:
+        rng = random.Random(seed + 13000)
+        old = HttpHost([pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure',
+                        '--store', work / f'http-old-{seed}'])
+        new = HttpHost([pure / 'build/pure-connections-module', '--module', module, '--store', work / f'http-new-{seed}'])
+        try:
+            revision, size = {}, {}
+            for _ in range(operations):
+                key = rng.choice(['a', 'b', 'long-key_1'])
+                current, length = revision.get(key, 0), size.get(key, 0)
+                if rng.random() < 0.35:
+                    request = ('GET', key, b'', None)
+                else:
+                    pick = rng.random()
+                    base = current if pick < 0.75 else max(current - 1, 0) if pick < 0.9 else current + 3
+                    if rng.random() < 0.05:
+                        body = bytes(rng.randrange(256) for _ in range(rng.randint(0, 7)))  # too short
+                    else:
+                        insert = bytes(rng.randrange(256) for _ in range(rng.choice([0, 1, 7, 300, 5000])))
+                        body = struct.pack('<II', rng.randint(0, length + 2), rng.choice([0, 1, 3, length])) + insert
+                    request = ('PUT', key, body, base)
+                theirs, ours = old.request(*request), new.request(*request)
+                assert ours == theirs, (seed, request[:2], request[3], ours[:3], theirs[:3])
+                if theirs[0] == 200 and theirs[1]:
+                    revision[key] = int(theirs[1].strip('"'))
+                    if request[0] == 'GET':
+                        size[key] = len(theirs[3])
+                    else:
+                        size[key] = len(old.request('GET', key)[3])
+                        assert new.request('GET', key) == old.request('GET', key)
+                compared += 1
+        finally:
+            old.stop()
+            new.stop()
+    return compared
+
+
+def server_bursts(aup, pure, work, clients=8, edits=30):
+    """Concurrent edits share commits, and every acknowledged edit survives a
+    kill -9 of the server."""
+    import http.client
+    import signal
+    import struct
+    import threading
+    import time
+    module = work / 'editor-bursts.pmod'
+    compile_module(aup, ROOT / 'examples/editor.aup', module)
+
+    def load(host, rounds, acknowledged):
+        def client(number):
+            key, base = f'c{number}', acknowledged[number][1]
+            for _ in range(rounds):
+                try:
+                    status, tag, _, _ = host.request('PUT', key, struct.pack('<II', 0, 0) + b'x', base)
+                except (OSError, http.client.HTTPException):  # the server died mid-answer: not acknowledged
+                    return
+                if status != 200:
+                    return
+                base = int(tag.strip('"'))
+                acknowledged[number] = (acknowledged[number][0] + 1, base)
+        threads = [threading.Thread(target=client, args=(n,)) for n in range(clients)]
+        start = time.perf_counter()
+        for thread in threads:
+            thread.start()
+        return threads, start
+
+    timings = {}
+    for name, args in [('program', [pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure']),
+                       ('module', [pure / 'build/pure-connections-module', '--module', module])]:
+        host = HttpHost(args + ['--store', work / f'bursts-{name}'])
+        acknowledged = [(0, 0)] * clients
+        threads, start = load(host, edits, acknowledged)
+        for thread in threads:
+            thread.join()
+        timings[name] = time.perf_counter() - start
+        assert all(count == edits for count, _ in acknowledged), acknowledged
+        stats = host.stop()
+        if name == 'module':
+            bursts = stats[0]['bursts']
+            assert stats[0]['burst_events'] == clients * edits and (clients == 1 or bursts < clients * edits), stats
+    # Kill the module server while clients edit; what it acknowledged is stored.
+    store = work / 'bursts-module'
+    host = HttpHost([pure / 'build/pure-connections-module', '--module', module, '--store', store])
+    acknowledged = [(edits, edits)] * clients
+    threads, _ = load(host, 1000, acknowledged)
+    time.sleep(0.5)
+    host.process.send_signal(signal.SIGKILL)
+    host.process.wait()
+    for thread in threads:
+        thread.join()
+    host = HttpHost([pure / 'build/pure-connections-module', '--module', module, '--store', store])
+    try:
+        for number, (count, base) in enumerate(acknowledged):
+            status, tag, _, body = host.request('GET', f'c{number}')
+            stored = int(tag.strip('"'))
+            assert status == 200 and stored in (base, base + 1) and len(body) == stored, (number, count, base, tag)
+    finally:
+        host.stop()
+    return {'writes': clients * edits, 'bursts': bursts, 'program_seconds': round(timings['program'], 3),
+            'module_seconds': round(timings['module'], 3),
+            'acknowledged_before_kill': sum(count for count, _ in acknowledged) - clients * edits}
 
 
 def conditionals(aup, pure_run, work):
@@ -799,6 +947,8 @@ def main():
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
+        report['server_parity_requests'] = server_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
+        report['server_bursts'] = server_bursts(aup, args.pure.resolve(), work)
     print(json.dumps(report))
 
 
