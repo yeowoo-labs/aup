@@ -28,6 +28,11 @@
    reference Python model under random appends, moves, toggles, copies,
    renames and removals; replacing it with a module whose record changed
    keeps each item's fields by name.
+10. Watch: aup watch builds again when the source or a library it read is
+   written, or a library appears where one was looked for; it keeps the last
+   module while the source has an error (a library's error too), saving the
+   same bytes builds nothing, a file caught halfway through being written is
+   not built, and a module is only ever replaced whole.
 5. Editor parity: the document editor written in aup, run by pure-edit-module,
    answers random show/edit/apply operations exactly as pure-edit running the
    original editor.pure (stdout, stderr, exit code), on the same tree store
@@ -1050,6 +1055,86 @@ def folds(aup, pure_run, work, seeds, steps=300):
     return compared
 
 
+def watching(aup, pure_run, work):
+    """aup watch: whatever the last build read, read differently, builds
+    again; errors keep the last module; the module is only ever replaced whole."""
+    import os
+    import time
+    directory, far = work / 'watch', work / 'watch-far'
+    directory.mkdir()
+    far.mkdir()
+    source, out = directory / 'app.aup', directory / 'app.pmod'
+    library, beside = far / 'shared.aup', directory / 'shared.aup'
+    library.write_text('fn twice(n) = n * 2\n')
+    program = 'use shared\nstate count = {}\ninput tap = key Space\nview doubled = shared.twice(count)\n' \
+              'on tap.down {{\n  count = count + 1\n}}\n'
+    source.write_text(program.format(1))
+    watcher = subprocess.Popen([str(aup), 'watch', str(source), '-o', str(out)], stderr=subprocess.PIPE, text=True,
+                               env=dict(os.environ, AUP_PATH=str(far)))
+    lines = []
+
+    def heard(expected):
+        """The next stderr line, which must contain expected."""
+        line = watcher.stderr.readline()
+        lines.append(line)
+        assert expected in line, (expected, lines)
+
+    def shown():
+        return json.loads(run(pure_run, out, stdin='show\n').stdout)['views']['doubled']
+
+    def write(path, text):
+        path.write_text(text)
+
+    try:
+        heard(f'built {out}')
+        assert shown() == 2
+        write(source, program.format(21))
+        heard(f'built {out}')
+        assert shown() == 42
+        write(source, program.format(21).replace('twice(count)', 'twice(missing)'))
+        heard(f'{source}:4:')
+        assert shown() == 42  # the last module stays
+        write(source, program.format(5))
+        heard(f'built {out}')
+        assert shown() == 10
+        write(library, 'fn twice(n) = n * 2 + 100\n')
+        heard(f'built {out}')
+        assert shown() == 110
+        write(library, 'fn twice(n) = n * oops\n')
+        heard(f'{library}:1:')
+        assert shown() == 110
+        write(library, 'fn twice(n) = n + n\n')  # the fix in the library alone builds again
+        heard(f'built {out}')
+        assert shown() == 10
+        write(beside, 'fn twice(n) = n * 3\n')  # found first from now on
+        heard(f'built {out}')
+        assert shown() == 15
+        write(library, 'fn twice(n) = 0\n')  # no longer read: nothing to build
+        write(source, program.format(5))  # the same bytes again: nothing to build
+        write(source, program.format(6))
+        heard(f'built {out}')
+        assert shown() == 18
+        # Written in two parts at random moments; the first part alone (and the
+        # empty file before it) compiles too, into a module without the view.
+        rng = random.Random(10)
+        for count in range(7, 17):
+            time.sleep(rng.uniform(0, 0.05))
+            text = program.format(count)
+            cut = text.index('view')
+            with open(source, 'w') as file:
+                file.write(text[:cut])
+                file.flush()
+                time.sleep(0.02)
+                file.write(text[cut:])
+            heard(f'built {out}')
+            assert shown() == 3 * count
+    finally:
+        watcher.terminate()
+        assert watcher.wait(timeout=5) == 0
+    assert sorted(path.name for path in directory.iterdir()) == ['app.aup', 'app.pmod', 'shared.aup'], 'no temporary left'
+    return len(lines)
+
+
 def conditionals(aup, pure_run, work):
     """Only the chosen branch runs (10 / x is never computed at x = 0), else-if
     chains pick the first true arm, and conditionals nest inside arithmetic."""
@@ -1178,6 +1263,7 @@ def main():
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
+        report['watched_builds'] = watching(aup, pure_run, work)
         report['fold_snapshots'] = folds(aup, pure_run, work, range(args.seeds if hasattr(args, 'seeds') else 8))
         report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)

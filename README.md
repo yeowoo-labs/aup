@@ -16,6 +16,7 @@ v0c(레코드·리스트·`index of`·조건식·표 보기·`fn`·`use` 라이�
 ```sh
 make                                   # build/aup
 build/aup build examples/counter.aup -o counter.pmod
+build/aup watch examples/counter.aup -o counter.pmod   # 저장할 때마다 다시 빌드(vega ... --watch가 받아 바꾼다)
 printf 'down tap\nup tap\nshow\n' | ../pure/prototypes/connections/build/pure-run counter.pmod
 build/aup build examples/notes.aup -o notes.pmod
 printf 'type typed %s\ndown left\nshow\n' "$(printf '안녕' | xxd -p)" | ../pure/prototypes/connections/build/pure-run notes.pmod
