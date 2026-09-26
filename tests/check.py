@@ -989,6 +989,178 @@ def server_bursts(aup, pure, work, clients=8, edits=30, shards=1):
             'acknowledged_before_kill': sum(count for count, _ in acknowledged) - clients * edits}
 
 
+SERVED_SOURCE = """record Entry {
+  name: text
+  points = 0
+}
+state board: list of Entry by name
+state at: index of board
+input score = message {
+  points: u32
+  name: bytes
+}
+input join = text
+input drop = key Delete
+on score {
+  if !board.has(text(score.name)) { board.add(Entry { name: text(score.name) }) }
+  board[text(score.name)].points = board[text(score.name)].points + score.points
+  at = board[text(score.name)]
+  reply score.name
+}
+on join {
+  board.add(Entry { name: join })
+  at = board[join]
+}
+on drop.down { board.remove(at) }
+view total = sum(e.points for e in board)
+view current = at.name
+view leaders = each e in board {
+  name = e.name
+  points = e.points
+}
+"""
+
+
+def http(port, method, path, body=b''):
+    """One request on its own connection: status, X-Pure-Error, content type, body."""
+    import http.client
+    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
+    try:
+        connection.request(method, path, body, {'Content-Length': str(len(body))} if method != 'GET' else {})
+        response = connection.getresponse()
+        return response.status, response.getheader('X-Pure-Error'), response.getheader('Content-Type'), response.read()
+    finally:
+        connection.close()
+
+
+def server_app(aup, pure, work, seeds, operations=200):
+    """An app served by its views and inputs, no routes written: random
+    POSTs (a message with query fields and a body, a text, a key) and GETs
+    (a number, a text, a table's pages) answer exactly as a Python model
+    says, failures with their fault; what was acknowledged is there after
+    the server stops, and after it is killed while clients post."""
+    import signal
+    import threading
+    import time
+    module = work / 'served.pmod'
+    source = work / 'served.aup'
+    source.write_text(SERVED_SOURCE)
+    compile_module(aup, source, module)
+    names = ['ann', 'bob', 'zed', '가', 'a"b', 'back\\slash', 'tab\t', '', 'bob2']
+    compared = 0
+    for seed in seeds:
+        rng, board, at = random.Random(seed + 9100), {}, 0
+        store = work / f'served-{seed}'
+        host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+        order = lambda: sorted(board, key=lambda name: name.encode())
+
+        def place(name):
+            nonlocal at
+            keys = order()
+            if name not in board:
+                position = sum(1 for k in keys if k.encode() < name.encode())
+                board[name] = 0
+                if len(board) > 1 and at >= position: at += 1
+
+        try:
+            for _ in range(operations):
+                roll, keys = rng.random(), order()
+                if roll < 0.35:
+                    name, points = rng.choice(names), rng.randint(0, 9)
+                    if rng.random() < 0.05:
+                        request = ('POST', '/inputs/score', b'x')  # no points
+                        want = (400, 'missing_field', b'')
+                    elif rng.random() < 0.05:
+                        request = ('POST', f'/inputs/score?points={points}', b'\xff')
+                        want = (422, 'encoding', b'')
+                    else:
+                        request = ('POST', f'/inputs/score?points={points}', name.encode())
+                        place(name)
+                        board[name] += points
+                        at = order().index(name)
+                        want = (200, 'none', name.encode())
+                elif roll < 0.5:
+                    name = rng.choice(names)
+                    request = ('POST', '/inputs/join', name.encode())
+                    if name in board: want = (409, 'exists', b'')
+                    else:
+                        place(name)
+                        at = order().index(name)
+                        want = (200, 'none', b'')
+                elif roll < 0.58:
+                    request = ('POST', '/inputs/drop', b'')
+                    if not board: want = (404, 'not_found', b'')
+                    else:
+                        del board[keys[at]]
+                        at = min(at, max(len(board) - 1, 0))
+                        want = (200, 'none', b'')
+                elif roll < 0.68:
+                    request = ('GET', '/views/total', b'')
+                    want = (200, 'none', str(sum(board.values())).encode())
+                elif roll < 0.78:
+                    request = ('GET', '/views/current', b'')
+                    want = (200, 'none', keys[at].encode()) if board else (404, 'no_value', b'')
+                elif roll < 0.96:
+                    first, count = rng.randint(0, 4), rng.choice([1, 2, 5, 100])
+                    request = ('GET', f'/views/leaders?from={first}&count={count}', b'')
+                    shown = min(first, len(keys))
+                    rows = [{'name': k, 'points': board[k]} for k in keys[shown:shown + count]]
+                    want = (200, 'none', {'rows': len(keys), 'from': shown, 'items': rows})
+                else:
+                    request, want = rng.choice([(('GET', '/views/nope', b''), (404, 'no_view', b'')),
+                                                (('POST', '/inputs/nope', b''), (404, 'no_input', b'')),
+                                                (('POST', '/inputs/join?x=1', b'q'), (400, 'query', b'')),
+                                                (('GET', '/views/total?from=1', b''), (400, 'query', b''))])
+                status, error, kind, body = http(host.port, *request)
+                if isinstance(want[2], dict):
+                    assert kind == 'application/json', kind
+                    body = json.loads(body)
+                assert (status, error, body) == want, (seed, request, (status, error, body), want)
+                compared += 1
+        finally:
+            stats = host.stop()
+        assert stats[0]['bursts'] <= stats[0]['requests']
+        # A graceful stop kept every acknowledged event.
+        host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+        try:
+            got = json.loads(http(host.port, 'GET', '/views/leaders')[3])
+            assert got['items'] == [{'name': k, 'points': board[k]} for k in order()], (seed, got)
+        finally:
+            host.stop()
+
+    # Clients post while the server is killed: each acknowledged point is stored.
+    store = work / 'served-kill'
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+    acknowledged = [0] * 6
+
+    def client(number):
+        for _ in range(10000):
+            try:
+                status, _, _, _ = http(host.port, 'POST', '/inputs/score?points=1', f'c{number}'.encode())
+            except OSError:
+                return
+            if status != 200:
+                return
+            acknowledged[number] += 1
+
+    threads = [threading.Thread(target=client, args=(n,)) for n in range(len(acknowledged))]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.8)
+    host.process.send_signal(signal.SIGKILL)
+    host.process.wait()
+    for thread in threads:
+        thread.join()
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+    try:
+        stored = {row['name']: row['points'] for row in json.loads(http(host.port, 'GET', '/views/leaders')[3])['items']}
+        for number, count in enumerate(acknowledged):
+            assert count > 0 and stored.get(f'c{number}', 0) in (count, count + 1), (number, count, stored)
+    finally:
+        host.stop()
+    return compared, sum(acknowledged)
+
+
 FOLDS_SOURCE = """record Task {
   title: text
   done = 0
@@ -1423,6 +1595,8 @@ def main():
         report['server_lent_budget_bytes'] = server_lent_budget(aup, args.pure.resolve(), work)
         report['server_bursts'] = server_bursts(aup, args.pure.resolve(), work)
         report['server_bursts_three_threads'] = server_bursts(aup, args.pure.resolve(), work, shards=3)
+        report['server_app_requests'], report['server_app_acknowledged_before_kill'] = \
+            server_app(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))
 
 
