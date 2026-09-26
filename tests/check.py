@@ -79,7 +79,7 @@ DIAGNOSTICS = [
     # v0b: messages, keyed documents and types
     ('state d: bytes by key\ninput m = message\non m {\n  reply d[key]\n}\n', '4:9', 'd[key] needs the handler of a message by key'),
     ('input m = message by key { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'reply takes bytes or text, not a number'),
-    ('input m = message by key {\n  b: bytes\n  a: u32\n}\n', '3:3', 'a bytes field must be the last field'),
+    ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, number, bytes and text'),
     ('input m = message by key\non m.down {\n}\n', '2:4', "'m' is a message; write on m { }"),
     ('input k = key Space\non k {\n}\n', '2:4', "'k' is a key input; write on k.down or on k.up"),
     ('state d: bytes by key\ninput m = message by key { a: bytes }\non m {\n  d[1].replace(0 .. 0, m.a)\n}\n', '4:5',
@@ -250,6 +250,9 @@ ACCEPTED = [
     # A keyed list: added, found, changed, asked and removed by key; texts ordered by bytes.
     KEYED_LIST + ON_K + '  xs.add(T { s: "q" })\n  at = xs["q"]\n  xs["q"].a = xs["q"].a + 1\n  xs.remove("q")\n}\n'
     'view v = if xs.has("q") { 1 } else { 0 }\nview w = "a" < "b" && "b" >= "b" && "a" != "ab"\n',
+    # Message fields of every type, variable ones anywhere and several of them.
+    'state n = 0\nstate t: text\ninput m = message {\n  a: text\n  b: number\n  c: bytes\n  d: u32\n  e: text\n}\n'
+    'on m {\n  n = m.b + m.d + m.c.bytes\n  t = "{m.a}{m.e}"\n}\n',
 ]
 
 
@@ -1033,6 +1036,110 @@ def http(port, method, path, body=b''):
         connection.close()
 
 
+JSON_SOURCE = """record Note {
+  title: text
+  body: text
+  points = 0
+}
+state notes: list of Note by title
+state counted = 0
+input add = message {
+  title: text
+  points: number
+  body: text
+}
+input count = message {
+  n: u32
+}
+on add {
+  notes.add(Note { title: add.title, body: add.body, points: add.points })
+  reply add.title
+}
+on count { counted = counted + count.n }
+view counted_view = counted
+view all = each n in notes {
+  title = n.title
+  body = n.body
+  points = n.points
+}
+"""
+
+
+def server_json(aup, pure, work, rounds=300):
+    """Messages of text and number fields posted as JSON objects: strings
+    come out as Python's json module reads them (escapes, control bytes,
+    Korean, surrogate pairs), numbers as it reads them; a missing, unknown,
+    doubled or mistyped field, broken JSON and a lone surrogate answer 400."""
+    module, source = work / 'json.pmod', work / 'json.aup'
+    source.write_text(JSON_SOURCE)
+    compile_module(aup, source, module)
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / 'json-store'])
+    rng = random.Random(77)
+    pieces = ['a', 'Z', ' ', '"', '\\', '/', '\n', '\t', '\x01', '\x1f', 'é', '가', '😀', '\u2028', 'x' * 20]
+    notes = {}
+
+    def post(path, body, json_body=True):
+        import http.client
+        connection = http.client.HTTPConnection('127.0.0.1', host.port, timeout=30)
+        try:
+            headers = {'Content-Length': str(len(body))}
+            if json_body: headers['Content-Type'] = 'application/json'
+            connection.request('POST', path, body, headers)
+            response = connection.getresponse()
+            return response.status, response.getheader('X-Pure-Error'), response.read()
+        finally:
+            connection.close()
+
+    try:
+        for _ in range(rounds):
+            title = ''.join(rng.choice(pieces) for _ in range(rng.randint(0, 6)))
+            body = ''.join(rng.choice(pieces) for _ in range(rng.randint(0, 4)))
+            points = rng.choice([0, 1, -2.5, 1e3, 3.25e-2, 12345678.5])
+            members = [('title', title), ('points', points), ('body', body)]
+            rng.shuffle(members)
+            text = json.dumps(dict(members), ensure_ascii=rng.random() < 0.5)
+            text = text.replace(': ', ':' + ' ' * rng.randint(0, 2)).replace(', ', ',\n' if rng.random() < 0.3 else ', ')
+            got = post('/inputs/add', text.encode())
+            if title in notes:
+                assert got[:2] == (409, 'exists'), (text, got)
+                continue
+            assert got == (200, 'none', title.encode()), (text, got)
+            notes[title] = (body, points)
+        rows = json.loads(http(host.port, 'GET', '/views/all')[3])['items']
+        want = [{'title': t, 'body': notes[t][0], 'points': notes[t][1]} for t in sorted(notes, key=lambda t: t.encode())]
+        assert rows == want, [(a, b) for a, b in zip(rows, want) if a != b][:2]
+        # The query gives fixed fields; a body without JSON fills a message's one variable field only.
+        assert post('/inputs/count?n=3', b'', json_body=False)[:2] == (200, 'none')
+        assert post('/inputs/count', b'{"n": 4}')[:2] == (200, 'none')
+        assert http(host.port, 'GET', '/views/counted_view')[3] == b'7'
+        assert post('/inputs/add?points=2', b'{"title": "q-from-query", "body": ""}')[:2] == (200, 'none')
+        wrong = [
+            (b'{"title": "m", "points": 1}', 'missing_field'),
+            (b'{"title": "m", "points": 1, "body": "", "extra": 1}', 'json_field'),
+            (b'{"title": "m", "title": "n", "points": 1, "body": ""}', 'json_field'),
+            (b'{"title": 1, "points": 1, "body": ""}', 'json_type'),
+            (b'{"title": "m", "points": "1", "body": ""}', 'json_type'),
+            (b'{"title": "m", "points": 1e999, "body": ""}', 'json_type'),
+            (b'{"title": "m", "points": 01, "body": ""}', 'json'),
+            (b'{"title": "m", "points": NaN, "body": ""}', 'json'),
+            (b'{"title": "m", "points": 1, "body": "",}', 'json'),
+            (b'{"title": "\\ud800", "points": 1, "body": ""}', 'json'),
+            (b'{"title": "\xff", "points": 1, "body": ""}', 'json'),
+            (b'{"title": "m", "points": 1, "body": ""} x', 'json'),
+            (b'[1]', 'json'),
+            (b'{"title": "m\n", "points": 1, "body": ""}', 'json'),  # a raw newline in a string
+        ]
+        for body, error in wrong:
+            assert post('/inputs/add', body)[:2] == (400, error), (body, post('/inputs/add', body))
+        assert post('/inputs/add?points=2', b'{"title": "m", "points": 1, "body": ""}')[:2] == (400, 'json_field')
+        assert post('/inputs/add', b'plain', json_body=False)[:2] == (400, 'json')  # two text fields need JSON
+        assert post('/inputs/count', b'{"n": -1}')[:2] == (400, 'json_type')
+        assert post('/inputs/count', b'{"n": 4294967296}')[:2] == (400, 'json_type')
+    finally:
+        host.stop()
+    return rounds + len(wrong)
+
+
 def server_app(aup, pure, work, seeds, operations=200, threads=1):
     """An app served by its views and inputs, no routes written: random
     POSTs (a message with query fields and a body, a text, a key) and GETs
@@ -1602,6 +1709,7 @@ def main():
             server_app(aup, args.pure.resolve(), work, range(args.editor_seeds))
         report['server_app_owner_requests'], report['server_app_owner_acknowledged_before_kill'] = \
             server_app(aup, args.pure.resolve(), work, range(args.editor_seeds), threads=3)
+        report['server_json_requests'] = server_json(aup, args.pure.resolve(), work)
     print(json.dumps(report))
 
 

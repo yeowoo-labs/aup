@@ -19,7 +19,7 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS };
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
-enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2 };
+enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
 typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
@@ -965,7 +965,8 @@ static bool key_name(const char *key) {
     return false;
 }
 
-/* { name: u32 ... } with at most one bytes field, which comes last. */
+/* { name: type ... }: u32 and number are fixed, bytes and text of any length
+ * (Pure lays them out: docs/design/008-module-format.md). */
 static void message_fields(Compiler *c, Input *in) {
     if (!is(c, "{")) return; /* the field block opens on the declaration's line */
     take(c);
@@ -975,15 +976,17 @@ static void message_fields(Compiler *c, Input *in) {
         if (reserved_name(name.text)) fail_at(c, name.line, name.column, "'%s' is reserved", name.text);
         for (unsigned i = 0; i < in->fields; ++i)
             if (!strcmp(in->field_names[i], name.text)) fail_at(c, name.line, name.column, "duplicate field '%s'", name.text);
-        if (in->fields && in->field_types[in->fields - 1] == FIELD_BYTES)
-            fail_at(c, name.line, name.column, "a bytes field must be the last field");
         if (c->field_count == FIELDS) fail_at(c, name.line, name.column, "at most 32 message fields are allowed");
         expect(c, ":", "':'");
-        Token type = expect_name(c, "u32 or bytes");
-        if (strcmp(type.text, "u32") && strcmp(type.text, "bytes"))
-            fail_at(c, type.line, type.column, "field types are u32 and bytes");
+        Token type = expect_name(c, "u32, number, bytes or text");
+        static const struct { const char *name; int type; } types[] = {
+            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
+        int field_type = 0;
+        for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
+            if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
+        if (!field_type) fail_at(c, type.line, type.column, "field types are u32, number, bytes and text");
         memcpy(in->field_names[in->fields], name.text, NAME);
-        in->field_types[in->fields++] = type.text[0] == 'u' ? FIELD_U32 : FIELD_BYTES;
+        in->field_types[in->fields++] = field_type;
         ++c->field_count;
         end(c);
     }
@@ -1568,7 +1571,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 for (unsigned i = 0; i < in->fields; ++i)
                     if (!strcmp(in->field_names[i], e->member)) {
                         emit(c, e->line, e->column, FIELD, i, 0);
-                        return (Kind){in->field_types[i] == FIELD_U32 ? NUM : BYTES, -1};
+                        int type = in->field_types[i];
+                        return (Kind){type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : NUM, -1};
                     }
                 fail_at(c, e->line, e->column, "message '%s' has no field '%s'", base->name, e->member);
             }

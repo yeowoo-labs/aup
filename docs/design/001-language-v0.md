@@ -95,7 +95,7 @@ state documents: bytes by key          # 키마다 바이트 값 하나. 런타�
 
 input show = message by key            # 키(와 선택적 기준 버전)를 가진 메시지
 input edit = message by key {
-  start: u32                           # 필드는 u32와 마지막 bytes 하나
+  start: u32                           # 필드는 u32, number, bytes, text
   remove: u32
   insert: bytes
 }
@@ -112,6 +112,9 @@ on edit {
 ```
 
 - `on 메시지 { }`는 메시지가 도착할 때 한 번 실행된다. 필드는 `메시지.필드`, 키는 `key`로만 쓴다.
+- 필드 타입은 `u32`, `number`(유한한 수), `bytes`, `text`(UTF-8)이고 가변 필드(bytes, text)는 몇 개든 어디에나 둘 수 있다.
+  `input add = message { title: text, points: number }`. HTTP 호스트(`pure-serve`)는 JSON 본문의 객체를 이 필드들로
+  옮긴다. 도착한 메시지의 text가 UTF-8이 아니거나 수가 유한하지 않으면 그 이벤트는 실패한다.
 - `이름[key]`는 그 메시지 키의 문서다. 읽으면 bytes, `.bytes`는 크기(없으면 0)다. 없는 문서를 읽으면 `not_found`.
 - `replace(a .. b, 값)`는 문서의 `[a, b)`를 바꾼다. 정수가 아니거나 범위 밖이면 이벤트가 `limit`으로 실패한다.
 - `require 조건`이 거짓이면 이벤트가 `limit`으로 실패한다. 크기 정책처럼 저장소의 특수 인자였던 것이 문장 하나가 된다.
