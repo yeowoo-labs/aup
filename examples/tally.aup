@@ -1,0 +1,32 @@
+# Typed words, tallied. A list keyed by the word keeps each word once, in
+# order; tallies[word] finds it by halving, whatever the list's length.
+record Tally {
+  word: text
+  times = 0
+}
+state tallies: list of Tally by word
+state at: index of tallies
+input typed = text
+input forget = key Delete
+input up = key ArrowUp
+input down = key ArrowDown
+
+on typed {
+  if !tallies.has(typed) {
+    tallies.add(Tally { word: typed })
+  }
+  tallies[typed].times = tallies[typed].times + 1
+  at = tallies[typed]
+}
+on forget.down { tallies.remove(at) }
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+
+view current = if tallies.count > 0 { "{at.word}: {at.times}" } else { "-" }
+view words = tallies.count
+view typed_total = sum(t.times for t in tallies)
+view most = max(t.times for t in tallies)
+view table = each t in tallies {
+  word = t.word
+  times = t.times
+}

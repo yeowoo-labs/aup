@@ -52,6 +52,8 @@ ROOT = HERE.parent
 RECORD = 'record T {\n  a = 0\n}\n'
 ON_K = 'input k = key KeyK\non k.down {\n'
 LIST = RECORD + 'state xs: list of T\nstate at: index of xs\n'
+KEYED = 'record T {\n  a = 0\n  s: text\n}\n'
+KEYED_LIST = KEYED + 'state xs: list of T by s\nstate at: index of xs\n'
 
 DIAGNOSTICS = [
     ('state x = 1\nstate x = 2\n', '2:7', "already declared as a state"),
@@ -185,6 +187,21 @@ DIAGNOSTICS = [
     (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number or text, not an index'),
     (LIST + 'view w = each r in xs where count(y in xs) > 0 {\n  n = r.a\n}\n', '6:29',
      "a table's where cannot hold a count, sum, max or min"),
+    # Keyed lists: a key field of the record, placed by add, found by key, never changed.
+    (KEYED + 'state xs: list of T by missing\n', '5:24', "record 'T' has no field 'missing'"),
+    (KEYED_LIST + ON_K + '  xs.append(T { s: "a" })\n}\n', '9:3', "'xs' is keyed by s: xs.add(T { ... }) places an item by its key"),
+    (KEYED_LIST + ON_K + '  xs.insert(at, T { s: "a" })\n}\n', '9:3', "'xs' is keyed by s: xs.add(T { ... })"),
+    (LIST + ON_K + '  xs.add(T { a: 1 })\n}\n', '8:3', "'xs' has no key: append or insert places its items (add needs list of T by a field)"),
+    (KEYED_LIST + ON_K + '  at.s = "b"\n}\n', '9:3', "the key of 'xs' does not change; remove the item and add it again"),
+    (KEYED_LIST + ON_K + '  xs["a"].s = "b"\n}\n', '9:3', "the key of 'xs' does not change"),
+    (LIST + 'view v = xs.has(1)\n', '6:13', "'xs' has no key; declare it as list of T by a field to ask has"),
+    (KEYED_LIST + 'view v = xs[1].a\n', '7:13', "'xs' is keyed by s, text: expected text or an index, not a number"),
+    (KEYED_LIST + 'view v = xs.has(1)\n', '7:17', "'xs' is keyed by s, text: expected text, not a number"),
+    (KEYED_LIST + 'view v = xs.has("a", "b")\n', '7:13', 'xs.has takes one key'),
+    (KEYED_LIST + ON_K + '  at = xs[at]\n}\n', '9:8', 'xs[index] is the index itself; read a field, as in xs[index].a'),
+    # Texts compare with texts, by their bytes.
+    ('view v = "a" < 1\n', '1:16', 'expected text, not a number'),
+    ('view v = 1 < "a"\n', '1:14', 'expected a number, not text'),
 ]
 
 ACCEPTED = [
@@ -230,6 +247,9 @@ ACCEPTED = [
     'fn later(cursor, n) = cursor + n char\ninput k = key KeyK\n'
     'on k.down {\n  xs.append(T { a: clip(xs.count), s: "q" })\n  c = later(c, 2)\n}\n'
     'view board = each r in xs {\n  tag = tag(r)\n}\nview cur = if xs.count > 0 { tag(at) } else { "-" }\n',
+    # A keyed list: added, found, changed, asked and removed by key; texts ordered by bytes.
+    KEYED_LIST + ON_K + '  xs.add(T { s: "q" })\n  at = xs["q"]\n  xs["q"].a = xs["q"].a + 1\n  xs.remove("q")\n}\n'
+    'view v = if xs.has("q") { 1 } else { 0 }\nview w = "a" < "b" && "b" >= "b" && "a" != "ab"\n',
 ]
 
 
@@ -1009,6 +1029,132 @@ view open_list = each t in tasks where !t.done {
 """
 
 
+KEYED_SOURCE = """record Person {
+  name: text
+  visits = 0
+}
+record Score {
+  value = 0
+  label: text
+}
+state people: list of Person by name
+state at: index of people
+state known = 0
+state n = 0
+state scores: list of Score by value
+input join = text
+input visit = text
+input ask = text
+input drop = key Delete
+input up = key ArrowUp
+input more = key KeyN
+input less = key KeyP
+input keep = key KeyM
+input forget = key KeyR
+on join {
+  people.add(Person { name: join })
+  at = people[join]
+}
+on visit {
+  if !people.has(visit) { people.add(Person { name: visit }) }
+  people[visit].visits = people[visit].visits + 1
+  at = people[visit]
+}
+on ask { known = people.has(ask) }
+on drop.down { people.remove(at) }
+on up.down { at = at - 1 }
+on more.down { n = n + 3 }
+on less.down { n = n - 5 }
+on keep.down { scores.add(Score { value: n, label: "{n}" }) }
+on forget.down { scores.remove(n) }
+view current = at.name
+view position = at.position
+view total = sum(p.visits for p in people)
+view after_m = count(p in people where p.name > "m")
+view lowest = if people.count > 0 { people.first.name } else { "-" }
+view labels = each s in scores {
+  label = s.label
+}
+view board = each p in people where p.visits > 0 {
+  label = "{p.name} ({p.visits})"
+}
+"""
+
+
+def keyed(aup, pure_run, work, seeds, steps=300):
+    """A list keyed by a text and one keyed by a number, against a Python
+    model: items in key order (texts by their bytes), each key once (a second
+    add fails with exists and changes nothing), found by key, asked with has,
+    removed by key; indices follow their items; texts compare by bytes."""
+    source = work / 'keyed.aup'
+    source.write_text(KEYED_SOURCE)
+    compile_module(aup, source, work / 'keyed.pmod')
+    words = ['m', 'b', 'zed', 'a', 'ab', '', '가', 'Z', 'm2', '😀', 'b\n']
+    compared = failures = 0
+    for seed in seeds:
+        rng, people, at, known, n, scores = random.Random(seed + 7700), [], 0, 0, 0, []
+        commands, expected, faults = [], [], []
+        key = lambda name: name.encode()
+
+        def place(name):
+            """Insert a person in key order; the index follows its item."""
+            nonlocal at
+            position = sum(1 for p in people if key(p['name']) < key(name))
+            people.insert(position, {'name': name, 'visits': 0})
+            if len(people) > 1 and at >= position: at += 1
+            return position
+
+        for _ in range(steps):
+            roll, fault = rng.random(), 'none'
+            names = [p['name'] for p in people]
+            if roll < 0.45:
+                name, word = rng.choice(['join', 'visit', 'ask']), rng.choice(words)
+                commands.append(f'type {name} ' + (word.encode().hex() or '-'))
+                if name == 'join':
+                    if word in names: fault = 'exists'
+                    else: at = place(word)
+                elif name == 'visit':
+                    if word not in names: place(word)
+                    at = [p['name'] for p in people].index(word)
+                    people[at]['visits'] += 1
+                else: known = int(word in names)
+            else:
+                name = rng.choice(['drop', 'up', 'more', 'less', 'keep', 'forget'])
+                commands.append(f'down {name}')
+                if name == 'drop':
+                    if not people: fault = 'not_found'
+                    else:
+                        del people[at]
+                        at = min(at, max(len(people) - 1, 0))
+                elif name == 'up': at = max(at - 1, 0)
+                elif name == 'more': n += 3
+                elif name == 'less': n -= 5
+                elif name == 'keep':
+                    if any(s['value'] == n for s in scores): fault = 'exists'
+                    else: scores.append({'value': n, 'label': str(n)}); scores.sort(key=lambda s: s['value'])
+                elif not any(s['value'] == n for s in scores): fault = 'not_found'
+                else: scores = [s for s in scores if s['value'] != n]
+            faults.append(fault)
+            expected.append(({'people': [dict(p) for p in people], 'at': at, 'known': known, 'n': n,
+                              'scores': [dict(s) for s in scores]},
+                             {'current': people[at]['name'] if people else None, 'position': at,
+                              'total': sum(p['visits'] for p in people),
+                              'after_m': sum(1 for p in people if key(p['name']) > b'm'),
+                              'lowest': people[0]['name'] if people else '-',
+                              'labels': [{'label': s['label']} for s in scores],
+                              'board': [{'label': f"{p['name']} ({p['visits']})"} for p in people if p['visits'] > 0]}))
+        lines = run(pure_run, work / 'keyed.pmod', stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()
+        shown = [json.loads(line) for line in lines]
+        assert [(s['states'], s['views']) for s in shown] == expected, \
+            (seed, next(i for i, (s, e) in enumerate(zip(shown, expected)) if (s['states'], s['views']) != e))
+        # A failed event leaves the last fault; a later success does not clear it, so compare where it is set.
+        got = [s['fault'] if s['error'] else 'none' for s in shown]
+        assert got == faults, (seed, [(i, a, b) for i, (a, b) in enumerate(zip(got, faults)) if a != b][:3])
+        compared += len(shown)
+        failures += sum(1 for f in faults if f != 'none')
+    return compared, failures
+
+
 def folds(aup, pure_run, work, seeds, steps=300):
     """count, sum, max and min over a list, and a table filtered by a where,
     against a Python model after random adds, toggles, moves and removals (an
@@ -1265,6 +1411,7 @@ def main():
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
         report['watched_builds'] = watching(aup, pure_run, work)
         report['fold_snapshots'] = folds(aup, pure_run, work, range(args.seeds if hasattr(args, 'seeds') else 8))
+        report['keyed_snapshots'], report['keyed_failed_events'] = keyed(aup, pure_run, work, range(args.seeds))
         report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \

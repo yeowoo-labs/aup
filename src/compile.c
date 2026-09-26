@@ -17,7 +17,7 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
-       PICK, SLIDE, FOLD };
+       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS };
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
@@ -60,7 +60,7 @@ typedef struct Expr {
     size_t size;
 } Expr;
 
-typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_SET } StmtKind;
+typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
@@ -122,6 +122,9 @@ typedef struct {
     char state_names[STATES][NAME], state_target[STATES][NAME];
     int state_types[STATES], state_line[STATES], state_column[STATES];
     bool state_stays[STATES]; /* a mark: a cursor that stays before text inserted at it */
+    /* A keyed list: the field named after by, and once resolved, that field + 1. */
+    char state_key[STATES][NAME];
+    int state_key_line[STATES], state_key_column[STATES], list_key[STATES];
     double initial[STATES];
     Expr *state_text[STATES];
     unsigned states;
@@ -872,12 +875,12 @@ static Stmt *statement(Compiler *c, unsigned depth) {
                 s->last = expression(c, 0, true);
                 newlines(c);
             }
-        } else if (!strcmp(method.text, "append")) {
-            s->kind = S_APPEND;
+        } else if (!strcmp(method.text, "append") || !strcmp(method.text, "add")) {
+            s->kind = method.text[1] == 'p' ? S_APPEND : S_ADD;
             s->value = inserted(c);
             newlines(c);
         } else fail_at(c, method.line, method.column,
-                       "a text supports insert and remove; a list supports append, insert and remove");
+                       "a text supports insert and remove; a list supports append, insert and remove (add when keyed)");
         expect(c, ")", "')'");
         return s;
     }
@@ -1088,6 +1091,13 @@ static void state_declaration(Compiler *c) {
             expect_word(c, "of");
             Token target = expect_name(c, type.text[0] == 'l' ? "a record" : "a list state");
             memcpy(c->state_target[index], target.text, NAME);
+            if (type.text[0] == 'l' && word(c, "by")) { /* keyed: items in key order, each key once */
+                take(c);
+                Token key = expect_name(c, "a field of the record");
+                memcpy(c->state_key[index], key.text, NAME);
+                c->state_key_line[index] = key.line;
+                c->state_key_column[index] = key.column;
+            }
         } else fail_at(c, type.line, type.column,
                        "state types are numbers, text, cursor or mark in a text, list of a record, index of a list, "
                        "and bytes by key");
@@ -1409,6 +1419,31 @@ static void index_of(Compiler *c, const Expr *e, bool handler, int height, int l
                 c->state_names[list]);
 }
 
+/* The item name[e] names: e is an index of the list, or for a keyed list a
+ * key, found by LIST_FIND. */
+static void item_of(Compiler *c, const Expr *e, bool handler, int height, int list) {
+    Kind kind = value(c, e, handler, height);
+    int key = c->list_key[list] - 1;
+    if (kind.type != INDEX && key >= 0) {
+        const Record *r = record_of(c, list);
+        Type type = r->field_text[key] ? TEXT : NUM;
+        if (kind.type != type)
+            fail_at(c, e->line, e->column, "'%s' is keyed by %s, %s: expected %s or an index, not %s", c->state_names[list],
+                    r->field_names[key], type_name(type), type_name(type), type_name(kind.type));
+        emit(c, e->line, e->column, LIST_FIND, (uint32_t)list, 0);
+        return;
+    }
+    expect_kind(c, e, kind, INDEX);
+    if (kind.owner != list)
+        fail_at(c, e->line, e->column, "an index of '%s' cannot point into '%s'", c->state_names[kind.owner],
+                c->state_names[list]);
+}
+
+/* The key field of a keyed list, or NULL. */
+static const char *keyed_by(const Compiler *c, int list) {
+    return c->list_key[list] ? c->state_key[list] : NULL;
+}
+
 /* A fn inlined: its arguments go on the stack once, the body reads them with
  * PICK, and SLIDE leaves only the result. e names the call (E_FN), or is the
  * name of a fn without parameters. */
@@ -1580,6 +1615,22 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (!*e->member) return inline_fn(c, e, c->module, e->name, handler, height);
         int library = parameter(c, e->member) < 0 ? used_library(c, c->module, e->member) : -1;
         if (library >= 0) return inline_fn(c, e, library, e->name, handler, height);
+        int list = state_index(c, e->member);
+        if (!strcmp(e->name, "has") && list >= 0 && c->state_types[list] == STATE_LIST) {
+            /* people.has("bob"): whether a keyed list holds that key. */
+            app_name(c, e, e->member);
+            const char *key = keyed_by(c, list);
+            if (!key) fail_at(c, e->line, e->column, "'%s' has no key; declare it as list of %s by a field to ask has",
+                              e->member, record_of(c, list)->name);
+            if (e->count != 1) fail_at(c, e->line, e->column, "%s.has takes one key", e->member);
+            Type type = record_of(c, list)->field_text[c->list_key[list] - 1] ? TEXT : NUM;
+            Kind given = value(c, e->args[0], handler, height);
+            if (given.type != type)
+                fail_at(c, e->args[0]->line, e->args[0]->column, "'%s' is keyed by %s, %s: expected %s, not %s", e->member, key,
+                        type_name(type), type_name(type), type_name(given.type));
+            emit(c, e->line, e->column, LIST_HAS, (uint32_t)list, 0);
+            return (Kind){NUM, -1};
+        }
         if (strcmp(e->name, "line")) fail_at(c, e->line, e->column, "unknown library '%s'; write use %s first", e->member, e->member);
         /* note.line(at): the line a cursor is on. */
         app_name(c, e, e->member);
@@ -1610,9 +1661,18 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         app_name(c, e, e->name);
         int list = list_state(c, e->name, e->line, e->column, e->args[0]);
         const Record *r = record_of(c, list);
-        if (!*e->member) fail_at(c, e->line, e->column, "read a field of the item, as in %s[index].%s", e->name, r->field_names[0]);
+        if (!*e->member) {
+            /* people["bob"]: the index of the item with that key. */
+            if (!keyed_by(c, list))
+                fail_at(c, e->line, e->column, "read a field of the item, as in %s[index].%s", e->name, r->field_names[0]);
+            item_of(c, e->args[0], handler, height, list);
+            if (c->code[c->code_count - 1].op != LIST_FIND)
+                fail_at(c, e->line, e->column, "%s[index] is the index itself; read a field, as in %s[index].%s", e->name,
+                        e->name, r->field_names[0]);
+            return (Kind){INDEX, list};
+        }
         unsigned field = record_field(c, r, e->member, e->line, e->column);
-        index_of(c, e->args[0], handler, height, list);
+        item_of(c, e->args[0], handler, height, list);
         emit(c, e->line, e->column, ITEM_GET, (uint32_t)list | field << 16, 0);
         return (Kind){r->field_text[field] ? TEXT : NUM, -1};
     }
@@ -1699,6 +1759,19 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             else emit(c, e->line, e->column, INDEX_MOVE, 0, 0);
             return left;
         }
+        if (e->op >= LT && e->op <= NE) {
+            /* Texts compare by their bytes; numbers as numbers. */
+            Kind left = value(c, e->args[0], handler, height);
+            if (left.type == TEXT) {
+                expect_kind(c, e->args[1], value(c, e->args[1], handler, height + 1), TEXT);
+                emit(c, e->line, e->column, TEXT_COMPARE, (uint32_t)(e->op - LT), 0);
+                return (Kind){NUM, -1};
+            }
+            expect_kind(c, e->args[0], left, NUM);
+            number(c, e->args[1], handler, height + 1);
+            emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
+            return (Kind){NUM, -1};
+        }
         /* fall through */
     default:
         for (unsigned i = 0; i < e->count; ++i) number(c, e->args[i], handler, height + (int)i);
@@ -1768,7 +1841,11 @@ static void statements(Compiler *c, const Stmt *s) {
             int list = state_index(c, s->name);
             if (list >= 0 && c->state_types[list] == STATE_LIST) {
                 if (s->last) fail_at(c, s->last->line, s->last->column, "a list removes one item, as in %s.remove(index)", s->name);
-                index_of(c, s->first, true, 0, list);
+                if (s->kind == S_INSERT && keyed_by(c, list))
+                    fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
+                            keyed_by(c, list), s->name, record_of(c, list)->name);
+                if (s->kind == S_REMOVE) item_of(c, s->first, true, 0, list);
+                else index_of(c, s->first, true, 0, list);
                 if (s->kind == S_INSERT) record_fields(c, s->value, list, 1);
                 emit(c, s->line, s->column, s->kind == S_INSERT ? LIST_INSERT : LIST_REMOVE, (uint32_t)list, 0);
                 break;
@@ -1785,8 +1862,16 @@ static void statements(Compiler *c, const Stmt *s) {
             emit(c, s->line, s->column, TEXT_REMOVE, (uint32_t)text, 0);
             break;
         }
-        case S_APPEND: {
+        case S_APPEND: case S_ADD: {
+            /* A keyed list places an added item by its key (it fails if the key is there); others append. */
             int list = list_state(c, s->name, s->line, s->column, NULL);
+            const char *key = keyed_by(c, list), *record = record_of(c, list)->name;
+            if (s->kind == S_APPEND && key)
+                fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
+                        key, s->name, record);
+            if (s->kind == S_ADD && !key)
+                fail_at(c, s->line, s->column, "'%s' has no key: append or insert places its items (add needs list of %s by a field)",
+                        s->name, record);
             record_fields(c, s->value, list, 0);
             emit(c, s->line, s->column, LIST_APPEND, (uint32_t)list, 0);
             break;
@@ -1800,7 +1885,9 @@ static void statements(Compiler *c, const Stmt *s) {
             }
             const Record *r = record_of(c, list);
             unsigned field = record_field(c, r, s->member, s->line, s->column);
-            if (*s->name) index_of(c, s->first, true, 0, list);
+            if (c->list_key[list] == (int)field + 1)
+                fail_at(c, s->line, s->column, "the key of '%s' does not change; remove the item and add it again", c->state_names[list]);
+            if (*s->name) item_of(c, s->first, true, 0, list);
             expect_kind(c, s->value, value(c, s->value, true, 1), r->field_text[field] ? TEXT : NUM);
             emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
@@ -1890,6 +1977,9 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (record < 0)
                 fail_at(c, c->state_line[i], c->state_column[i], "a list holds a record; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)record;
+            if (*c->state_key[i])
+                c->list_key[i] = 1 + (int)record_field(c, &c->records[record], c->state_key[i], c->state_key_line[i],
+                                                       c->state_key_column[i]);
         }
     }
     for (unsigned i = 0; i < c->record_count; ++i) {
@@ -2001,7 +2091,10 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         p = put32(p, state_name[i]);
         p = put32(p, (uint32_t)c->state_types[i]);
         if (c->state_types[i] == STATE_NUM) p = put_double(p, c->initial[i]);
-        else { p = put32(p, state_ref[i]); p = put32(p, c->state_stays[i] ? 1 : 0); } /* 1: the cursor stays */
+        else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */
+            p = put32(p, state_ref[i]);
+            p = put32(p, c->state_types[i] == STATE_LIST ? (uint32_t)c->list_key[i] : c->state_stays[i] ? 1 : 0);
+        }
     }
     for (unsigned i = 0; i < c->collections; ++i) { p = put32(p, collection_name[i]); p = put32(p, 1); p = put32(p, 1); }
     unsigned first = 0;
