@@ -15,8 +15,9 @@
    Korean, emoji, combining marks, NUL, newlines), moves and deletions; string
    escapes and number text follow their stated rules.
 9. Server: the HTTP document server running editor.aup answers random
-   requests exactly as the server running editor.pure; concurrent edits share
-   commits, and every acknowledged edit survives kill -9.
+   requests exactly as the server running editor.pure, on persistent and
+   pipelined connections too; concurrent edits share commits, and every
+   acknowledged edit survives kill -9.
 8. Stored state: the list app and the text editor run on a tree store,
    restarting at random points (every other run saving in bursts), and still
    match their reference models.
@@ -716,7 +717,7 @@ def server_parity(aup, pure, work, seeds, operations=150):
         rng = random.Random(seed + 13000)
         old = HttpHost([pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure',
                         '--store', work / f'http-old-{seed}'])
-        new = HttpHost([pure / 'build/pure-connections-module', '--module', module, '--store', work / f'http-new-{seed}'])
+        new = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / f'http-new-{seed}'])
         try:
             revision, size = {}, {}
             for _ in range(operations):
@@ -747,6 +748,63 @@ def server_parity(aup, pure, work, seeds, operations=150):
             old.stop()
             new.stop()
     return compared
+
+
+def server_pipelining(aup, pure, work):
+    """One connection, many requests: a keep-alive client and a pipelined
+    burst (all requests in one write, one split across writes) get the same
+    answers, in order, as separate connections would."""
+    import http.client
+    import socket
+    import struct
+    module = work / 'editor-pipeline.pmod'
+    compile_module(aup, ROOT / 'examples/editor.aup', module)
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / 'pipeline'])
+    try:
+        connection = http.client.HTTPConnection('127.0.0.1', host.port, timeout=30)
+        answers = []
+        for body, headers in [(struct.pack('<II', 0, 0) + b'hello', {'If-None-Match': '*'}),
+                              (struct.pack('<II', 5, 0) + b'!', {'If-Match': '"1"'}),
+                              (struct.pack('<II', 0, 0) + b'x', {'If-Match': '"1"'})]:
+            connection.request('PUT', '/objects/p', body, headers)
+            response = connection.getresponse()
+            answers.append((response.status, response.getheader('ETag'), response.read()))
+        connection.request('GET', '/objects/p')
+        response = connection.getresponse()
+        answers.append((response.status, response.getheader('ETag'), response.read()))
+        connection.close()
+        assert answers == [(200, '"1"', b'hello'), (200, '"2"', b'!'), (412, '"2"', b''), (200, '"2"', b'hello!')], answers
+
+        def request(method, key, body=b'', condition=''):
+            return (f'{method} /objects/{key} HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n{condition}\r\n'
+                    .encode() + body)
+        pipeline = (request('GET', 'p') + request('PUT', 'q', struct.pack('<II', 0, 0) + b'q1', 'If-None-Match: *\r\n') +
+                    request('GET', 'q') + request('GET', 'missing') +
+                    request('PUT', 'q', struct.pack('<II', 2, 0) + b'!', 'If-Match: "1"\r\n') + request('GET', 'q'))
+        expected = [(200, b'hello!'), (200, b'q1'), (200, b'q1'), (404, b''), (200, b'!'), (200, b'q1!')]
+        for split in (len(pipeline), 7, 61):  # one write, and small writes that cut heads and bodies
+            with socket.create_connection(('127.0.0.1', host.port), timeout=30) as sock:
+                for at in range(0, len(pipeline), split):
+                    sock.sendall(pipeline[at:at + split])
+                reader = sock.makefile('rb')
+                for status, body in expected:
+                    code = int(reader.readline().split()[1])
+                    length = 0
+                    for line in iter(reader.readline, b'\r\n'):
+                        name, _, value = line.decode().partition(':')
+                        if name.lower() == 'content-length':
+                            length = int(value)
+                    assert (code, reader.read(length)) == (status, body), (split, code, status, body)
+            # The next round starts from the same documents.
+            host.request('PUT', 'q', struct.pack('<II', 0, 3) + b'q1', int(host.request('GET', 'q')[1].strip('"')))
+            expected = [(200, b'hello!'), (412, b''), (200, b'q1'), (404, b''), (412, b''), (200, b'q1')]
+            pipeline = (request('GET', 'p') + request('PUT', 'q', struct.pack('<II', 0, 0) + b'q1', 'If-None-Match: *\r\n') +
+                        request('GET', 'q') + request('GET', 'missing') +
+                        request('PUT', 'q', struct.pack('<II', 2, 0) + b'!', 'If-Match: "1"\r\n') + request('GET', 'q'))
+    finally:
+        stats = host.stop()
+    assert stats[0]['active'] == 0 and stats[0]['retained_payload_bytes'] == 0, stats
+    return len(answers) + 3 * len(expected)
 
 
 def server_bursts(aup, pure, work, clients=8, edits=30):
@@ -780,7 +838,7 @@ def server_bursts(aup, pure, work, clients=8, edits=30):
 
     timings = {}
     for name, args in [('program', [pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure']),
-                       ('module', [pure / 'build/pure-connections-module', '--module', module])]:
+                       ('module', [pure / 'build/pure-serve', '--module', module])]:
         host = HttpHost(args + ['--store', work / f'bursts-{name}'])
         acknowledged = [(0, 0)] * clients
         threads, start = load(host, edits, acknowledged)
@@ -794,7 +852,7 @@ def server_bursts(aup, pure, work, clients=8, edits=30):
             assert stats[0]['burst_events'] == clients * edits and (clients == 1 or bursts < clients * edits), stats
     # Kill the module server while clients edit; what it acknowledged is stored.
     store = work / 'bursts-module'
-    host = HttpHost([pure / 'build/pure-connections-module', '--module', module, '--store', store])
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
     acknowledged = [(edits, edits)] * clients
     threads, _ = load(host, 1000, acknowledged)
     time.sleep(0.5)
@@ -802,7 +860,7 @@ def server_bursts(aup, pure, work, clients=8, edits=30):
     host.process.wait()
     for thread in threads:
         thread.join()
-    host = HttpHost([pure / 'build/pure-connections-module', '--module', module, '--store', store])
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
     try:
         for number, (count, base) in enumerate(acknowledged):
             status, tag, _, body = host.request('GET', f'c{number}')
@@ -948,6 +1006,7 @@ def main():
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
         report['server_parity_requests'] = server_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
+        report['server_pipelined_answers'] = server_pipelining(aup, args.pure.resolve(), work)
         report['server_bursts'] = server_bursts(aup, args.pure.resolve(), work)
     print(json.dumps(report))
 

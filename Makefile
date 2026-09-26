@@ -15,6 +15,6 @@ $(BUILD)/aup: src/main.c src/compile.c src/aup.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c src/compile.c $(LDFLAGS) $(LDLIBS) -o $@
 
 check: $(BUILD)/aup
-	$(MAKE) -C $(PURE) BUILD=build build/pure-run build/pure-edit-module build/pure-connections-module
+	$(MAKE) -C $(PURE) BUILD=build build/pure-run build/pure-edit-module build/pure-serve
 	$(MAKE) -C $(PURE) BUILD=build/tree STORE=store-tree.c build/tree/pure-edit build/tree/pure-connections
 	python3 tests/check.py --aup $(BUILD)/aup --pure-run $(PURE)/build/pure-run --pure $(PURE)
