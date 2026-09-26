@@ -18,7 +18,7 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
        PICK, SLIDE, FOLD };
-enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN };
+enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
@@ -47,7 +47,7 @@ typedef enum {
     E_RECORD,  /* name { fields }: E_FIELD nodes linked from args[0] */
     E_FIELD,   /* member: args[0] */
     E_IF,      /* if args[0] { args[1] } else { args[2] } */
-    E_FOLD,    /* op(args[1] for name in member where args[0]): count (no value), sum, max, min */
+    E_FOLD,    /* op(args[1] for name in member where args[0]): count, first (no value), sum, max, min */
 } ExprKind;
 typedef struct Expr {
     ExprKind kind;
@@ -638,24 +638,25 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
             {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM}};
         int call = -1, how = -1;
         for (int i = 0; i < 5; ++i) if (!strcmp(token.text, calls[i].name)) call = i;
-        static const char *const folds[] = {"count", "sum", "max", "min"};
-        for (int i = 0; i < 4; ++i) if (!strcmp(token.text, folds[i])) how = i;
+        static const char *const folds[] = {"count", "sum", "max", "min", "first"};
+        for (int i = 0; i < 5; ++i) if (!strcmp(token.text, folds[i])) how = i;
         Expr *first = NULL;
-        /* count(t in tasks ...), sum(t.x for t in tasks ...): folds; max(a, b) stays a call. */
+        /* count(t in tasks ...), first(t in tasks ...), sum(t.x for t in tasks ...):
+         * folds; max(a, b) stays a call. */
+        bool itemwise = how == FOLD_COUNT || how == FOLD_FIRST;
         if (how >= 0 && is(c, "(")) {
             take(c);
             newlines(c);
-            if (how == FOLD_COUNT && c->token.kind == T_NAME && lookahead(c)->kind == T_NAME &&
-                !strcmp(lookahead(c)->text, "in")) {
-                left = fold(c, &token, how, NULL);
+            if (itemwise && c->token.kind == T_NAME && lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "in")) {
+                left = postfix(c, fold(c, &token, how, NULL)); /* first(...).title */
                 goto parsed;
             }
-            if (how != FOLD_COUNT) {
+            if (!itemwise) {
                 first = expression(c, 0, true);
                 newlines(c);
                 if (word(c, "for")) {
                     take(c);
-                    left = fold(c, &token, how, first);
+                    left = postfix(c, fold(c, &token, how, first));
                     goto parsed;
                 }
             }
@@ -1665,18 +1666,19 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         c->fold_scope = c->scope;
         memcpy(c->fold_name, e->name, NAME);
         c->joins = 0;
-        if (e->op != FOLD_COUNT) {
+        bool itemwise = e->op == FOLD_COUNT || e->op == FOLD_FIRST;
+        if (!itemwise) {
             Kind kind = value(c, e->args[1], false, 0);
             if (kind.type != NUM)
                 fail_at(c, e->args[1]->line, e->args[1]->column, "sum, max and min take numbers, not %s", type_name(kind.type));
         }
-        if (e->args[0]) number(c, e->args[0], false, e->op != FOLD_COUNT);
+        if (e->args[0]) number(c, e->args[0], false, !itemwise);
         else emit(c, e->line, e->column, CONST, 0, 1);
         c->folding = false;
         c->fold_list = -1;
         c->joins = joins;
         c->code[at].arg = (uint32_t)e->op | (uint32_t)list << 8 | (uint32_t)(c->code_count - at - 1) << 16;
-        return (Kind){NUM, -1};
+        return e->op == FOLD_FIRST ? (Kind){INDEX, list} : (Kind){NUM, -1};
     }
     case E_RECORD: case E_FIELD:
         fail_at(c, e->line, e->column, "a record value goes into a list, as in list.append(%s { ... })", e->name);

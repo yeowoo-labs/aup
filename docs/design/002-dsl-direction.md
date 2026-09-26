@@ -165,6 +165,9 @@ view best = max(p.score for p in players where p.active)
 view summary = "{count(t in tasks where !t.done)} open of {tasks.count}"
 ```
 
+- **찾기.** `first(항목 in 리스트 [where 조건])`은 조건이 참인 첫 항목의 인덱스다(그 리스트의 인덱스 타입이라
+  `at = first(t in tasks where t.title == name)`, `first(…).done = 1`, `first(…).position`으로 쓴다). 없으면 보기는
+  비고 핸들러는 `not_found`로 실패한다. 찾으면 거기서 멈춘다.
 - **모양.** `count(항목 in 리스트 [where 조건])`, `sum|max|min(값 for 항목 in 리스트 [where 조건])`. 값을 둘 받는
   `max(a, b)`·`min(a, b)`는 그대로 호출이고, 같은 이름의 fn(`fn sum(a, b)`)도 그대로 부를 수 있다. 첫 식 뒤의
   `for`, 또는 `count(`의 `이름 in`으로 가른다.

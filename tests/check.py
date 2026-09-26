@@ -177,6 +177,7 @@ DIAGNOSTICS = [
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
     (LIST + 'view v = sum(x.a for x xs)\n', '6:24', "expected 'in' and a list, as in sum(x in tasks)"),
     (LIST + 'view w = each r in xs where r {\n  n = r.a\n}\n', '6:29', 'expected a number, not an index'),
+    (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number or text, not an index'),
     (LIST + 'view w = each r in xs where count(y in xs) > 0 {\n  n = r.a\n}\n', '6:29',
      "a table's where cannot hold a count, sum, max or min"),
 ]
@@ -975,10 +976,12 @@ input toggle = key Space
 input up = key ArrowUp
 input down = key ArrowDown
 input drop = key Delete
+input jump = key KeyJ
 on add {
   tasks.append(Task { title: add, points: add.chars })
   at = tasks.last
 }
+on jump.down { at = first(t in tasks where !t.done) }
 on toggle.down { at.done = !at.done }
 on up.down { at = at - 1 }
 on down.down { at = at + 1 }
@@ -992,6 +995,8 @@ view done_points = sum(
 view longest = max(t.title.chars for t in tasks)
 view fewest_open = min(t.points for t in tasks where !t.done)
 view summary = "{count(t in tasks where !t.done)} open of {tasks.count}"
+view first_open = first(t in tasks where !t.done).position
+view at_now = at.position
 view open_list = each t in tasks where !t.done {
   label = t.title
   item = t.position
@@ -1019,9 +1024,11 @@ def folds(aup, pure_run, work, seeds, steps=300):
                 tasks.append({'title': word, 'done': 0, 'points': len(word)})
                 at = len(tasks) - 1
             else:
-                name = rng.choice(['toggle', 'up', 'down', 'drop'])
+                name = rng.choice(['toggle', 'up', 'down', 'drop', 'jump'])
                 commands.append(f'down {name}')
-                if name == 'up': at = max(at - 1, 0)
+                open_now = [i for i, t in enumerate(tasks) if not t['done']]
+                if name == 'jump' and open_now: at = open_now[0]  # none open: the event fails
+                elif name == 'up': at = max(at - 1, 0)
                 elif name == 'down': at = min(at + 1, max(len(tasks) - 1, 0))
                 elif tasks and name == 'toggle': tasks[at]['done'] = int(not tasks[at]['done'])
                 elif tasks and name == 'drop':
@@ -1033,6 +1040,7 @@ def folds(aup, pure_run, work, seeds, steps=300):
                              'longest': max((len(t['title']) for t in tasks), default=None),
                              'fewest_open': min((t['points'] for t in open_tasks), default=None),
                              'summary': f'{len(open_tasks)} open of {len(tasks)}',
+                             'first_open': next((i for i, t in enumerate(tasks) if not t['done']), None), 'at_now': at,
                              'open_list': [{'label': t['title'], 'item': i} for i, t in enumerate(tasks) if not t['done']]})
         # Toggling or removing in an empty list fails; pure-run then exits 1 but shows every event.
         lines = run(pure_run, work / 'folds.pmod', stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()
