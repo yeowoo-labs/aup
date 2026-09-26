@@ -1300,8 +1300,9 @@ def server_app(aup, pure, work, seeds, operations=200, threads=1):
     POSTs (a message with query fields and a body, a text, a key) and GETs
     (a number, a text, a table's pages) answer exactly as a Python model
     says, failures with their fault; what was acknowledged is there after
-    the server stops, and after it is killed while clients post. With
-    several threads, connection threads hand requests to the app's owner."""
+    the server stops, and after it is killed while clients post. The app's
+    owner thread applies the inputs; connection threads (one or several)
+    show views from the snapshot of its last save."""
     import signal
     import threading
     import time
@@ -1383,7 +1384,8 @@ def server_app(aup, pure, work, seeds, operations=200, threads=1):
                 compared += 1
         finally:
             stats = host.stop()
-        assert stats[0]['bursts'] <= stats[0]['requests'] and stats[0]['owner'] == (threads > 1), stats
+        assert stats[0]['bursts'] <= stats[0]['requests'] and stats[0]['owner'], stats
+        assert stats[0]['views_from_snapshots'] > 0, stats
         # A graceful stop kept every acknowledged event.
         host = HttpHost(serve + ['--store', store])
         try:
@@ -1392,11 +1394,15 @@ def server_app(aup, pure, work, seeds, operations=200, threads=1):
         finally:
             host.stop()
 
-    # Clients post while the server is killed: each acknowledged point is stored.
+    # Clients post while the server is killed: each acknowledged point is
+    # stored. Readers on other connections meanwhile see every point
+    # acknowledged before they asked, never a total going back, and never one
+    # that was not saved: the total after the kill is at least any they saw.
     store = work / f'served-kill-{threads}'
     serve = [pure / 'build/pure-serve', '--module', module, '--threads', threads]
     host = HttpHost(serve + ['--store', store])
     acknowledged = [0] * 6
+    seen = [0, 0]
 
     def client(number):
         for _ in range(10000):
@@ -1408,7 +1414,21 @@ def server_app(aup, pure, work, seeds, operations=200, threads=1):
                 return
             acknowledged[number] += 1
 
+    def reader(number):
+        for _ in range(100000):
+            floor = sum(acknowledged)
+            try:
+                status, _, _, body = http(host.port, 'GET', '/views/total')
+            except OSError:
+                return
+            if status != 200:
+                return
+            total = int(body)
+            assert floor <= total and seen[number] <= total, (floor, seen[number], total)
+            seen[number] = total
+
     clients = [threading.Thread(target=client, args=(n,)) for n in range(len(acknowledged))]
+    clients += [threading.Thread(target=reader, args=(n,)) for n in range(len(seen))]
     for thread in clients:
         thread.start()
     time.sleep(0.8)
@@ -1421,6 +1441,7 @@ def server_app(aup, pure, work, seeds, operations=200, threads=1):
         stored = {row['name']: row['points'] for row in json.loads(http(host.port, 'GET', '/views/leaders')[3])['items']}
         for number, count in enumerate(acknowledged):
             assert count > 0 and stored.get(f'c{number}', 0) in (count, count + 1), (number, count, stored)
+        assert min(seen) > 0 and max(seen) <= sum(stored.values()), (seen, stored)
     finally:
         host.stop()
     return compared, sum(acknowledged)
