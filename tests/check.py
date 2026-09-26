@@ -17,8 +17,9 @@
 9. Server: the HTTP document server running editor.aup answers random
    requests exactly as the server running editor.pure, on persistent and
    pipelined connections too; a read lends the stored extents and still
-   carries its version while the document changes; concurrent edits share
-   commits, and every acknowledged edit survives kill -9.
+   carries its version while the document changes, and lent answers count
+   against the payload budget; concurrent edits share commits, and every
+   acknowledged edit survives kill -9.
 8. Stored state: the list app and the text editor run on a tree store,
    restarting at random points (every other run saving in bursts), and still
    match their reference models.
@@ -840,6 +841,46 @@ def server_lent_reads(aup, pure, work):
     return len(big)
 
 
+def server_lent_budget(aup, pure, work):
+    """Lent extents count against the payload budget while an answer waits
+    on its socket. Two readers pipeline 1 MiB reads without reading: the
+    kernel takes what it can and each reader leaves one answer waiting. A
+    third request finds no room (503 payload_budget) until a reader goes."""
+    import socket
+    import struct
+    import time
+    module = work / 'editor-budget.pmod'
+    compile_module(aup, ROOT / 'examples/editor.aup', module)
+    big = bytes(range(256)) * 4096
+    budget = 2 * len(big) + len(big) // 2
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / 'lent-budget',
+                     '--budget', budget])
+    readers = []
+    try:
+        assert host.request('PUT', 'big', struct.pack('<II', 0, 0) + big, 0)[0] == 200
+        for _ in range(2):
+            sock = socket.create_connection(('127.0.0.1', host.port), timeout=30)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.sendall(b'GET /objects/big HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n' * 32)
+            readers.append(sock)
+        time.sleep(0.3)
+        refused = host.request('GET', 'big')
+        assert refused[0] == 503 and refused[2] == 'payload_budget', refused[:3]
+        readers.pop().close()
+        for _ in range(100):
+            answered = host.request('GET', 'big')
+            if answered[0] == 200:
+                break
+            time.sleep(0.05)
+        assert answered[0] == 200 and answered[3] == big, answered[:3]
+    finally:
+        for sock in readers:
+            sock.close()
+        stats = host.stop()
+    assert stats[0]['active'] == 0 and stats[0]['retained_payload_bytes'] == 0, stats
+    return budget
+
+
 def server_bursts(aup, pure, work, clients=8, edits=30, shards=1):
     """Concurrent edits share commits, and every acknowledged edit survives a
     kill -9 of the server."""
@@ -1042,6 +1083,7 @@ def main():
                                                              threads=threads) for threads in (1, 3))
         report['server_pipelined_answers'] = server_pipelining(aup, args.pure.resolve(), work)
         report['server_lent_read_bytes'] = server_lent_reads(aup, args.pure.resolve(), work)
+        report['server_lent_budget_bytes'] = server_lent_budget(aup, args.pure.resolve(), work)
         report['server_bursts'] = server_bursts(aup, args.pure.resolve(), work)
         report['server_bursts_three_threads'] = server_bursts(aup, args.pure.resolve(), work, shards=3)
     print(json.dumps(report))
