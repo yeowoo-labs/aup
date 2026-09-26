@@ -706,7 +706,7 @@ class HttpHost:
         return [json.loads(line) for line in error.decode().splitlines() if line.startswith('{')]
 
 
-def server_parity(aup, pure, work, seeds, operations=150):
+def server_parity(aup, pure, work, seeds, operations=150, threads=1):
     """The document server running editor.aup answers every request exactly
     as the server running editor.pure: status, revision, error and body."""
     import struct
@@ -716,8 +716,9 @@ def server_parity(aup, pure, work, seeds, operations=150):
     for seed in seeds:
         rng = random.Random(seed + 13000)
         old = HttpHost([pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure',
-                        '--store', work / f'http-old-{seed}'])
-        new = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / f'http-new-{seed}'])
+                        '--store', work / f'http-old-{seed}-{threads}'])
+        new = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / f'http-new-{seed}-{threads}',
+                        '--threads', str(threads)])
         try:
             revision, size = {}, {}
             for _ in range(operations):
@@ -807,7 +808,7 @@ def server_pipelining(aup, pure, work):
     return len(answers) + 3 * len(expected)
 
 
-def server_bursts(aup, pure, work, clients=8, edits=30):
+def server_bursts(aup, pure, work, clients=8, edits=30, shards=1):
     """Concurrent edits share commits, and every acknowledged edit survives a
     kill -9 of the server."""
     import http.client
@@ -838,8 +839,8 @@ def server_bursts(aup, pure, work, clients=8, edits=30):
 
     timings = {}
     for name, args in [('program', [pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure']),
-                       ('module', [pure / 'build/pure-serve', '--module', module])]:
-        host = HttpHost(args + ['--store', work / f'bursts-{name}'])
+                       ('module', [pure / 'build/pure-serve', '--module', module, '--threads', str(shards)])]:
+        host = HttpHost(args + ['--store', work / f'bursts-{name}-{shards}'])
         acknowledged = [(0, 0)] * clients
         threads, start = load(host, edits, acknowledged)
         for thread in threads:
@@ -851,8 +852,8 @@ def server_bursts(aup, pure, work, clients=8, edits=30):
             bursts = stats[0]['bursts']
             assert stats[0]['burst_events'] == clients * edits and (clients == 1 or bursts < clients * edits), stats
     # Kill the module server while clients edit; what it acknowledged is stored.
-    store = work / 'bursts-module'
-    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+    store = work / f'bursts-module-{shards}'
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store, '--threads', str(shards)])
     acknowledged = [(edits, edits)] * clients
     threads, _ = load(host, 1000, acknowledged)
     time.sleep(0.5)
@@ -860,7 +861,7 @@ def server_bursts(aup, pure, work, clients=8, edits=30):
     host.process.wait()
     for thread in threads:
         thread.join()
-    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store, '--threads', str(shards)])
     try:
         for number, (count, base) in enumerate(acknowledged):
             status, tag, _, body = host.request('GET', f'c{number}')
@@ -1005,9 +1006,11 @@ def main():
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
-        report['server_parity_requests'] = server_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
+        report['server_parity_requests'] = sum(server_parity(aup, args.pure.resolve(), work, range(args.editor_seeds),
+                                                             threads=threads) for threads in (1, 3))
         report['server_pipelined_answers'] = server_pipelining(aup, args.pure.resolve(), work)
         report['server_bursts'] = server_bursts(aup, args.pure.resolve(), work)
+        report['server_bursts_three_threads'] = server_bursts(aup, args.pure.resolve(), work, shards=3)
     print(json.dumps(report))
 
 
