@@ -30,6 +30,7 @@ aup는 범용 언어가 아니라 **무엇이 무엇에 연결되는지를 선�
 state title: text = "할 일"
 state note: text = ""                  # 한 줄이든 1 MiB 문서든 같은 타입
 state at: cursor in note               # 항상 글자 경계에 있고 편집을 따라간다
+state from: mark in note               # 같지만, 이 자리에 넣은 글보다 앞에 남는다
 
 input typed = text                     # 호스트가 준 확정 입력(IME 조합 완료분)
 input back = key Backspace
@@ -49,6 +50,9 @@ view current = note.line(at)           # 커서가 있는 줄. 복사하지 않�
   `cursor in 값` 타입을 둔다. 커서는 항상 글자 경계에 있고, 범위를 벗어나지 않으며, 같은 이벤트의
   편집에 맞춰 런타임이 옮긴다. 이동은 단위로 쓴다: `at + 1 char`, `at - 1 line`, `note.start`, `note.end`.
   범위는 `a .. b`, 부분은 `note[a .. b]`, 줄은 `note.line(at)`이다. 모두 복사 없는 보기다.
+- **커서와 마크.** 둘 다 편집을 따라간다. 차이는 그 자리에 글을 넣을 때뿐이다. 커서(캐럿)는 넣은 글 뒤로 가고,
+  마크(기억해 둔 위치, 선택의 시작점, 책갈피)는 글 앞에 남는다. 지울 때는 둘 다 지운 범위의 처음으로 모인다.
+  타입은 같아서 커서에 쓰는 모든 것(이동, 비교, 범위, `insert` 위치)에 마크도 쓴다.
 - **글자 단위.** 목표는 사용자가 한 글자로 보는 단위(grapheme cluster)다. 첫 구현의 `char`는 Unicode
   scalar이고, 분절 표(UAX #29)는 크기 비용이 있어 선택 모듈로 붙인다. `word`도 그때 추가한다.
 - **편집.** `insert`, `remove`, `replace(a .. b, s)`는 Pure draft의 splice가 된다. 이벤트가 성공하면 커밋된다.

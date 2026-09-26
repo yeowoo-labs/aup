@@ -119,6 +119,7 @@ typedef struct {
     /* Declarations in source order. */
     char state_names[STATES][NAME], state_target[STATES][NAME];
     int state_types[STATES], state_line[STATES], state_column[STATES];
+    bool state_stays[STATES]; /* a mark: a cursor that stays before text inserted at it */
     double initial[STATES];
     Expr *state_text[STATES];
     unsigned states;
@@ -987,15 +988,17 @@ static void state_declaration(Compiler *c) {
     c->state_column[index] = name.column;
     if (is(c, ":")) {
         take(c);
-        Token type = expect_name(c, "text, cursor, list or index");
+        Token type = expect_name(c, "text, cursor, mark, list or index");
         if (!strcmp(type.text, "text")) {
             c->state_types[index] = STATE_TEXT;
             if (is(c, "=")) {
                 take(c);
                 c->state_text[index] = plain_string(c, "a text state");
             }
-        } else if (!strcmp(type.text, "cursor")) {
+        } else if (!strcmp(type.text, "cursor") || !strcmp(type.text, "mark")) {
+            /* Both follow edits; text inserted at a cursor goes before it, at a mark after it. */
             c->state_types[index] = STATE_CURSOR;
+            c->state_stays[index] = type.text[0] == 'm';
             expect_word(c, "in");
             Token target = expect_name(c, "a text state");
             memcpy(c->state_target[index], target.text, NAME);
@@ -1005,7 +1008,8 @@ static void state_declaration(Compiler *c) {
             Token target = expect_name(c, type.text[0] == 'l' ? "a record" : "a list state");
             memcpy(c->state_target[index], target.text, NAME);
         } else fail_at(c, type.line, type.column,
-                       "state types are numbers, text, cursor in a text, list of a record, index of a list, and bytes by key");
+                       "state types are numbers, text, cursor or mark in a text, list of a record, index of a list, "
+                       "and bytes by key");
         ++c->states;
         return;
     }
@@ -1861,7 +1865,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         p = put32(p, state_name[i]);
         p = put32(p, (uint32_t)c->state_types[i]);
         if (c->state_types[i] == STATE_NUM) p = put_double(p, c->initial[i]);
-        else { p = put32(p, state_ref[i]); p = put32(p, 0); }
+        else { p = put32(p, state_ref[i]); p = put32(p, c->state_stays[i] ? 1 : 0); } /* 1: the cursor stays */
     }
     for (unsigned i = 0; i < c->collections; ++i) { p = put32(p, collection_name[i]); p = put32(p, 1); p = put32(p, 1); }
     unsigned first = 0;

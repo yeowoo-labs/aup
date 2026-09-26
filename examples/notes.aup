@@ -1,10 +1,11 @@
 # A small text editor. The runtime owns the text: typing inserts at the
 # cursor, the cursor and the mark always sit between characters and follow
-# edits, and a failed event would leave everything as it was.
+# edits (text typed at the mark goes after it: the mark stays), and a failed
+# event would leave everything as it was.
 state title: text = "메모"
 state note: text = ""
 state at: cursor in note
-state mark: cursor in note
+state mark: mark in note
 
 input typed = text
 input left = key ArrowLeft

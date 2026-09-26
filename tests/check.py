@@ -445,7 +445,8 @@ class NotesModel:
     def insert(self, text):
         p = self.at
         self.note = self.note[:p] + text + self.note[p:]
-        self.at, self.mark = [c + len(text) if c >= p else c for c in (self.at, self.mark)]
+        self.at = self.at + len(text) if self.at >= p else self.at
+        self.mark = self.mark + len(text) if self.mark > p else self.mark  # a mark stays at the insertion point
 
     def remove(self, a, b):
         self.note = self.note[:a] + self.note[b:]
