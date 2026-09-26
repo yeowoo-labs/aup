@@ -1033,12 +1033,13 @@ def http(port, method, path, body=b''):
         connection.close()
 
 
-def server_app(aup, pure, work, seeds, operations=200):
+def server_app(aup, pure, work, seeds, operations=200, threads=1):
     """An app served by its views and inputs, no routes written: random
     POSTs (a message with query fields and a body, a text, a key) and GETs
     (a number, a text, a table's pages) answer exactly as a Python model
     says, failures with their fault; what was acknowledged is there after
-    the server stops, and after it is killed while clients post."""
+    the server stops, and after it is killed while clients post. With
+    several threads, connection threads hand requests to the app's owner."""
     import signal
     import threading
     import time
@@ -1050,8 +1051,9 @@ def server_app(aup, pure, work, seeds, operations=200):
     compared = 0
     for seed in seeds:
         rng, board, at = random.Random(seed + 9100), {}, 0
-        store = work / f'served-{seed}'
-        host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+        store = work / f'served-{seed}-{threads}'
+        serve = [pure / 'build/pure-serve', '--module', module, '--threads', threads]
+        host = HttpHost(serve + ['--store', store])
         order = lambda: sorted(board, key=lambda name: name.encode())
 
         def place(name):
@@ -1119,9 +1121,9 @@ def server_app(aup, pure, work, seeds, operations=200):
                 compared += 1
         finally:
             stats = host.stop()
-        assert stats[0]['bursts'] <= stats[0]['requests']
+        assert stats[0]['bursts'] <= stats[0]['requests'] and stats[0]['owner'] == (threads > 1), stats
         # A graceful stop kept every acknowledged event.
-        host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+        host = HttpHost(serve + ['--store', store])
         try:
             got = json.loads(http(host.port, 'GET', '/views/leaders')[3])
             assert got['items'] == [{'name': k, 'points': board[k]} for k in order()], (seed, got)
@@ -1129,8 +1131,9 @@ def server_app(aup, pure, work, seeds, operations=200):
             host.stop()
 
     # Clients post while the server is killed: each acknowledged point is stored.
-    store = work / 'served-kill'
-    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+    store = work / f'served-kill-{threads}'
+    serve = [pure / 'build/pure-serve', '--module', module, '--threads', threads]
+    host = HttpHost(serve + ['--store', store])
     acknowledged = [0] * 6
 
     def client(number):
@@ -1143,15 +1146,15 @@ def server_app(aup, pure, work, seeds, operations=200):
                 return
             acknowledged[number] += 1
 
-    threads = [threading.Thread(target=client, args=(n,)) for n in range(len(acknowledged))]
-    for thread in threads:
+    clients = [threading.Thread(target=client, args=(n,)) for n in range(len(acknowledged))]
+    for thread in clients:
         thread.start()
     time.sleep(0.8)
     host.process.send_signal(signal.SIGKILL)
     host.process.wait()
-    for thread in threads:
+    for thread in clients:
         thread.join()
-    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store])
+    host = HttpHost(serve + ['--store', store])
     try:
         stored = {row['name']: row['points'] for row in json.loads(http(host.port, 'GET', '/views/leaders')[3])['items']}
         for number, count in enumerate(acknowledged):
@@ -1597,6 +1600,8 @@ def main():
         report['server_bursts_three_threads'] = server_bursts(aup, args.pure.resolve(), work, shards=3)
         report['server_app_requests'], report['server_app_acknowledged_before_kill'] = \
             server_app(aup, args.pure.resolve(), work, range(args.editor_seeds))
+        report['server_app_owner_requests'], report['server_app_owner_acknowledged_before_kill'] = \
+            server_app(aup, args.pure.resolve(), work, range(args.editor_seeds), threads=3)
     print(json.dumps(report))
 
 
