@@ -16,8 +16,9 @@
    escapes and number text follow their stated rules.
 9. Server: the HTTP document server running editor.aup answers random
    requests exactly as the server running editor.pure, on persistent and
-   pipelined connections too; concurrent edits share commits, and every
-   acknowledged edit survives kill -9.
+   pipelined connections too; a read lends the stored extents and still
+   carries its version while the document changes; concurrent edits share
+   commits, and every acknowledged edit survives kill -9.
 8. Stored state: the list app and the text editor run on a tree store,
    restarting at random points (every other run saving in bursts), and still
    match their reference models.
@@ -808,6 +809,37 @@ def server_pipelining(aup, pure, work):
     return len(answers) + 3 * len(expected)
 
 
+def server_lent_reads(aup, pure, work):
+    """A read lends the stored document's extents instead of copying them: a
+    1 MiB answer sent slowly still carries the version read while the
+    document is replaced five times meanwhile."""
+    import socket
+    import struct
+    module = work / 'editor-lent.pmod'
+    compile_module(aup, ROOT / 'examples/editor.aup', module)
+    host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / 'lent'])
+    big = bytes(range(256)) * 4096
+    try:
+        assert host.request('PUT', 'big', struct.pack('<II', 0, 0) + big, 0)[0] == 200
+        with socket.create_connection(('127.0.0.1', host.port), timeout=30) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            sock.sendall(b'GET /objects/big HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n')
+            data = sock.recv(100)
+            for revision in range(1, 6):
+                edit = struct.pack('<II', 0, len(big) if revision == 1 else 1) + b'Z'
+                assert host.request('PUT', 'big', edit, revision)[0] == 200
+            while b'\r\n\r\n' not in data or len(data) < data.index(b'\r\n\r\n') + 4 + len(big):
+                chunk = sock.recv(65536)
+                assert chunk, len(data)
+                data += chunk
+        assert data[data.index(b'\r\n\r\n') + 4:] == big
+        assert host.request('GET', 'big') == (200, '"6"', 'none', b'Z')
+    finally:
+        stats = host.stop()
+    assert stats[0]['active'] == 0 and stats[0]['retained_payload_bytes'] == 0, stats
+    return len(big)
+
+
 def server_bursts(aup, pure, work, clients=8, edits=30, shards=1):
     """Concurrent edits share commits, and every acknowledged edit survives a
     kill -9 of the server."""
@@ -1009,6 +1041,7 @@ def main():
         report['server_parity_requests'] = sum(server_parity(aup, args.pure.resolve(), work, range(args.editor_seeds),
                                                              threads=threads) for threads in (1, 3))
         report['server_pipelined_answers'] = server_pipelining(aup, args.pure.resolve(), work)
+        report['server_lent_read_bytes'] = server_lent_reads(aup, args.pure.resolve(), work)
         report['server_bursts'] = server_bursts(aup, args.pure.resolve(), work)
         report['server_bursts_three_threads'] = server_bursts(aup, args.pure.resolve(), work, shards=3)
     print(json.dumps(report))
