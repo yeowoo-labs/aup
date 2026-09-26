@@ -17,7 +17,8 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
-       PICK, SLIDE };
+       PICK, SLIDE, FOLD };
+enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, FIELD_U32 = 1, FIELD_BYTES = 2 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
@@ -46,6 +47,7 @@ typedef enum {
     E_RECORD,  /* name { fields }: E_FIELD nodes linked from args[0] */
     E_FIELD,   /* member: args[0] */
     E_IF,      /* if args[0] { args[1] } else { args[2] } */
+    E_FOLD,    /* op(args[1] for name in member where args[0]): count (no value), sum, max, min */
 } ExprKind;
 typedef struct Expr {
     ExprKind kind;
@@ -140,6 +142,12 @@ typedef struct {
     /* Code generation. */
     int message;          /* message or text input of the handler being generated, or -1 */
     int row;              /* the table whose column is being generated, or -1 */
+    /* The fold whose block is being generated: its item's name and list, and
+     * the fn scope it began in (whose parameters its block cannot read). */
+    bool folding;
+    char fold_name[NAME];
+    int fold_list;
+    Scope *fold_scope;
     /* Libraries: module 0 is the main source; each module lists the libraries it uses. */
     struct { char name[NAME], path[AUP_PATH]; bool uses[MODULES], parsing; } modules[MODULES];
     unsigned module_count;
@@ -383,8 +391,8 @@ static void index_key(Compiler *c) {
 }
 
 /* (a, b, ...) after a fn name. */
-static Expr *arguments(Compiler *c, Expr *call) {
-    expect(c, "(", "'('");
+/* Arguments once the opening parenthesis is taken. */
+static Expr *arguments_after(Compiler *c, Expr *call) {
     newlines(c);
     while (!is(c, ")")) {
         if (call->count == PARAMS) fail_at(c, c->token.line, c->token.column, "a call takes at most 8 arguments");
@@ -396,6 +404,11 @@ static Expr *arguments(Compiler *c, Expr *call) {
     }
     expect(c, ")", "')'");
     return call;
+}
+
+static Expr *arguments(Compiler *c, Expr *call) {
+    expect(c, "(", "'('");
+    return arguments_after(c, call);
 }
 
 static Expr *postfix(Compiler *c, Expr *e) {
@@ -575,6 +588,30 @@ static Expr *conditional(Compiler *c, const Token *token) {
     return e;
 }
 
+/* The rest of a fold, after its value (none for count): for item in list,
+ * then an optional where condition, then ')'. */
+static Expr *fold(Compiler *c, const Token *name, int how, Expr *value) {
+    Expr *e = node(c, E_FOLD, name->line, name->column);
+    e->op = how;
+    Token item = expect_name(c, "a name for each item");
+    memcpy(e->name, item.text, NAME);
+    newlines(c);
+    if (!word(c, "in")) fail_at(c, c->token.line, c->token.column, "expected 'in' and a list, as in %s(%s in tasks)",
+                                name->text, item.text);
+    take(c);
+    Token list = expect_name(c, "a list");
+    memcpy(e->member, list.text, NAME);
+    newlines(c);
+    e->args[1] = value;
+    if (word(c, "where")) {
+        take(c);
+        e->args[0] = expression(c, 0, true);
+        newlines(c);
+    }
+    expect(c, ")", "')'");
+    return e;
+}
+
 static Expr *expression(Compiler *c, int minimum, bool multiline) {
     if (++c->depth > DEPTH) fail_at(c, c->token.line, c->token.column, "expression nesting exceeds 64");
     if (multiline) newlines(c);
@@ -597,13 +634,53 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     } else if (token.kind == T_NAME) {
         static const struct { const char *name; unsigned count; int op; } calls[] =
             {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM}};
-        int call = -1;
+        int call = -1, how = -1;
         for (int i = 0; i < 5; ++i) if (!strcmp(token.text, calls[i].name)) call = i;
-        if (call >= 0 && is(c, "(")) {
+        static const char *const folds[] = {"count", "sum", "max", "min"};
+        for (int i = 0; i < 4; ++i) if (!strcmp(token.text, folds[i])) how = i;
+        Expr *first = NULL;
+        /* count(t in tasks ...), sum(t.x for t in tasks ...): folds; max(a, b) stays a call. */
+        if (how >= 0 && is(c, "(")) {
             take(c);
+            newlines(c);
+            if (how == FOLD_COUNT && c->token.kind == T_NAME && lookahead(c)->kind == T_NAME &&
+                !strcmp(lookahead(c)->text, "in")) {
+                left = fold(c, &token, how, NULL);
+                goto parsed;
+            }
+            if (how != FOLD_COUNT) {
+                first = expression(c, 0, true);
+                newlines(c);
+                if (word(c, "for")) {
+                    take(c);
+                    left = fold(c, &token, how, first);
+                    goto parsed;
+                }
+            }
+            if (call < 0) {
+                /* A fn of that name. */
+                if (reserved_name(token.text)) fail_at(c, token.line, token.column, "expected a number, state, or expression");
+                left = node(c, E_FN, token.line, token.column);
+                memcpy(left->name, token.text, NAME);
+                if (first) {
+                    left->args[left->count++] = first;
+                    if (is(c, ",")) take(c);
+                    else if (!is(c, ")")) fail_at(c, c->token.line, c->token.column, "expected ',' or ')'");
+                }
+                left = postfix(c, arguments_after(c, left));
+                goto parsed;
+            }
+        }
+        if (call >= 0 && (first || is(c, "("))) {
+            if (!first) take(c);
             left = node(c, call >= 3 ? E_CONVERT : E_CALL, token.line, token.column);
             left->op = calls[call].op;
             newlines(c);
+            if (first) {
+                left->args[left->count++] = first;
+                if (is(c, ",")) { take(c); newlines(c); }
+                else if (!is(c, ")")) fail_at(c, c->token.line, c->token.column, "expected ',' or ')'");
+            }
             while (!is(c, ")")) {
                 if (left->count == 3) fail_at(c, token.line, token.column, "%s expects %u arguments", token.text, calls[call].count);
                 left->args[left->count++] = expression(c, 0, true);
@@ -628,6 +705,7 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
             left = postfix(c, left);
         }
     } else fail_at(c, token.line, token.column, "expected a number, state, or expression");
+parsed:
     /* 1 char, n line: a distance that moves a cursor. */
     if (word(c, "char") || word(c, "line")) {
         Token unit = take(c);
@@ -1375,6 +1453,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     switch (e->kind) {
     case E_NUMBER: emit(c, e->line, e->column, CONST, 0, e->number); return (Kind){NUM, -1};
     case E_DT:
+        if (c->folding) fail_at(c, e->line, e->column, "dt is not available in count, sum, max or min");
         if (!handler) fail_at(c, e->line, e->column, "dt is only available in handlers");
         emit(c, e->line, e->column, DT, 0, 0);
         return (Kind){NUM, -1};
@@ -1391,7 +1470,14 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         return (Kind){TEXT, -1};
     }
     case E_NAME: {
+        if (c->folding && c->scope == c->fold_scope && !strcmp(e->name, c->fold_name)) {
+            emit(c, e->line, e->column, ROW, (uint32_t)c->fold_list, 0); /* the item a fold's block runs for */
+            return (Kind){INDEX, c->fold_list};
+        }
         int param = parameter(c, e->name);
+        if (param >= 0 && c->folding && c->scope == c->fold_scope)
+            fail_at(c, e->line, e->column,
+                    "'%s' is a parameter outside this count, sum, max or min; its block reads only its item and states", e->name);
         if (param >= 0) {
             emit(c, e->line, e->column, PICK, (uint32_t)(height - 1 - (c->scope->base + param)), 0);
             return c->scope->kinds[param];
@@ -1399,6 +1485,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (fn_index(c, c->module, e->name) >= 0) return inline_fn(c, e, c->module, e->name, handler, height);
         if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
         if (!c->scope && c->row >= 0 && !strcmp(e->name, c->view_row[c->row])) {
+            if (c->folding)
+                fail_at(c, e->line, e->column, "'%s' is the column's row; a count, sum, max or min reads only its own item", e->name);
             int list = state_index(c, c->view_list[c->row]);
             emit(c, e->line, e->column, ROW, (uint32_t)list, 0);
             return (Kind){INDEX, list};
@@ -1554,6 +1642,33 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         for (unsigned i = 0; i < arms; ++i) c->code[ends[i]].arg = c->code_count;
         c->joins = saved;
         return kind;
+    }
+    case E_FOLD: {
+        /* The block after FOLD runs once per item, as a column of the list: it
+         * starts with an empty stack and reads only its item and states. */
+        app_name(c, e, e->member);
+        int list = state_index(c, e->member);
+        if (list < 0 || c->state_types[list] != STATE_LIST) fail_at(c, e->line, e->column, "'%s' is not a list", e->member);
+        if (c->folding) fail_at(c, e->line, e->column, "a count, sum, max or min cannot hold another");
+        unsigned at = c->code_count, joins = c->joins;
+        emit(c, e->line, e->column, FOLD, 0, 0);
+        c->folding = true;
+        c->fold_list = list;
+        c->fold_scope = c->scope;
+        memcpy(c->fold_name, e->name, NAME);
+        c->joins = 0;
+        if (e->op != FOLD_COUNT) {
+            Kind kind = value(c, e->args[1], false, 0);
+            if (kind.type != NUM)
+                fail_at(c, e->args[1]->line, e->args[1]->column, "sum, max and min take numbers, not %s", type_name(kind.type));
+        }
+        if (e->args[0]) number(c, e->args[0], false, e->op != FOLD_COUNT);
+        else emit(c, e->line, e->column, CONST, 0, 1);
+        c->folding = false;
+        c->fold_list = -1;
+        c->joins = joins;
+        c->code[at].arg = (uint32_t)e->op | (uint32_t)list << 8 | (uint32_t)(c->code_count - at - 1) << 16;
+        return (Kind){NUM, -1};
     }
     case E_RECORD: case E_FIELD:
         fail_at(c, e->line, e->column, "a record value goes into a list, as in list.append(%s { ... })", e->name);
@@ -1817,6 +1932,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         c->view_code[i][1] = c->code_count - c->view_code[i][0];
     }
     c->row = -1;
+    c->fold_list = -1;
     for (unsigned i = 0; i < c->handler_count; ++i) {
         int input = handler_input[i];
         c->message = input >= 0 && c->inputs[input].kind != KIND_KEY ? input : -1;
@@ -1936,6 +2052,7 @@ bool aup_compile(const char *source, size_t length, AupLoad load, void *context,
     c->line = c->column = 1;
     c->error = error;
     c->row = -1;
+    c->fold_list = -1;
     c->load = load;
     c->load_context = context;
     c->module_count = 1; /* the main source */

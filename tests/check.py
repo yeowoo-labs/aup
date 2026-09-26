@@ -166,9 +166,21 @@ DIAGNOSTICS = [
     ('state n = 0\nview v = n(1)\n', '2:10', "'n' is a state, not a fn"),
     ('use missing\n', '1:5', "cannot find library 'missing' (missing.aup)"),
     ('view v = shapes.area(1, 2)\n', '1:17', "unknown library 'shapes'; write use shapes first"),
+    (LIST + 'view v = count(x in xs where count(y in xs) > 0)\n', '6:30', 'a count, sum, max or min cannot hold another'),
+    (LIST + 'view v = count(x in at)\n', '6:10', "'at' is not a list"),
+    ('record T {\n  t: text\n}\nstate xs: list of T\nview v = sum(x.t for x in xs)\n', '5:14',
+     'sum, max and min take numbers, not text'),
+    (LIST + 'view w = each r in xs {\n  n = count(x in xs where x.a == r.a)\n}\n', '7:34',
+     "'r' is the column's row; a count, sum, max or min reads only its own item"),
+    (LIST + 'fn f(n) = count(x in xs where x.a == n)\nview v = f(1)\n', '6:38',
+     "'n' is a parameter outside this count, sum, max or min"),
+    (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
+    (LIST + 'view v = sum(x.a for x xs)\n', '6:24', "expected 'in' and a list, as in sum(x in tasks)"),
 ]
 
 ACCEPTED = [
+    # fns named like folds stay calls, and max of two values stays max
+    'fn sum(a, b) = a + b\nfn count(x) = x\nview v = sum(1, count(2)) + max(3, 4) + min(\n  5,\n  6\n)\n',
     # else on the next line, else if chains, multiline arguments, semicolons.
     'state a = 0\non frame {\n  if a > 1 {\n    a = 1\n  }\n  else {\n    a = 2\n  }\n}\n',
     'state a = 0; state b = 1\nview v = clamp(\n  a,\n  0,\n  b\n)\non frame { a = a + 1; b = b + 2 }\n',
@@ -948,6 +960,79 @@ def server_bursts(aup, pure, work, clients=8, edits=30, shards=1):
             'acknowledged_before_kill': sum(count for count, _ in acknowledged) - clients * edits}
 
 
+FOLDS_SOURCE = """record Task {
+  title: text
+  done = 0
+  points = 0
+}
+state tasks: list of Task
+state at: index of tasks
+input add = text
+input toggle = key Space
+input up = key ArrowUp
+input down = key ArrowDown
+input drop = key Delete
+on add {
+  tasks.append(Task { title: add, points: add.chars })
+  at = tasks.last
+}
+on toggle.down { at.done = !at.done }
+on up.down { at = at - 1 }
+on down.down { at = at + 1 }
+on drop.down { tasks.remove(at) }
+view open = count(t in tasks where !t.done)
+view points = sum(t.points for t in tasks)
+view done_points = sum(
+  t.points for t in tasks
+  where t.done
+)
+view longest = max(t.title.chars for t in tasks)
+view fewest_open = min(t.points for t in tasks where !t.done)
+view summary = "{count(t in tasks where !t.done)} open of {tasks.count}"
+"""
+
+
+def folds(aup, pure_run, work, seeds, steps=300):
+    """count, sum, max and min over a list against a Python model after
+    random adds, toggles, moves and removals (an empty max or min has no
+    value)."""
+    source = work / 'folds.aup'
+    source.write_text(FOLDS_SOURCE)
+    compile_module(aup, source, work / 'folds.pmod')
+    words = ['a', 'bbb', '가나', '😀', '', 'x y z', '\n']
+    compared = 0
+    for seed in seeds:
+        rng, tasks, at, commands, expected = random.Random(seed + 4200), [], 0, [], []
+        for _ in range(steps):
+            roll = rng.random()
+            if roll < 0.35:
+                word = rng.choice(words)
+                commands.append('type add ' + (word.encode().hex() or '-'))
+                tasks.append({'title': word, 'done': 0, 'points': len(word)})
+                at = len(tasks) - 1
+            else:
+                name = rng.choice(['toggle', 'up', 'down', 'drop'])
+                commands.append(f'down {name}')
+                if name == 'up': at = max(at - 1, 0)
+                elif name == 'down': at = min(at + 1, max(len(tasks) - 1, 0))
+                elif tasks and name == 'toggle': tasks[at]['done'] = int(not tasks[at]['done'])
+                elif tasks and name == 'drop':
+                    del tasks[at]
+                    at = min(at, max(len(tasks) - 1, 0))
+            open_tasks = [t for t in tasks if not t['done']]
+            expected.append({'open': len(open_tasks), 'points': sum(t['points'] for t in tasks),
+                             'done_points': sum(t['points'] for t in tasks if t['done']),
+                             'longest': max((len(t['title']) for t in tasks), default=None),
+                             'fewest_open': min((t['points'] for t in open_tasks), default=None),
+                             'summary': f'{len(open_tasks)} open of {len(tasks)}'})
+        # Toggling or removing in an empty list fails; pure-run then exits 1 but shows every event.
+        lines = run(pure_run, work / 'folds.pmod', stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()
+        shown = [json.loads(line)['views'] for line in lines]
+        assert shown == expected, (seed, [(a, b) for a, b in zip(shown, expected) if a != b][:2])
+        compared += len(shown)
+    return compared
+
+
 def conditionals(aup, pure_run, work):
     """Only the chosen branch runs (10 / x is never computed at x = 0), else-if
     chains pick the first true arm, and conditionals nest inside arithmetic."""
@@ -1076,6 +1161,7 @@ def main():
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
+        report['fold_snapshots'] = folds(aup, pure_run, work, range(args.seeds if hasattr(args, 'seeds') else 8))
         report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \

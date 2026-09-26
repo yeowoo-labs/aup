@@ -152,6 +152,27 @@ view board = each task in tasks {        # 항목마다 한 행
 검증: 표 열과 조건 보기를 더한 할 일 목록이 참조 모델과 4,800단계에서 같고, 고르지 않은 가지가 계산되지 않음을 확인한다.
 7단계 중첩은 컴파일되고 Pure가 받아들이며, 8단계는 aup가 거부한다(Pure도 거부하는 깊이). 진단 16건을 더했다.
 
+### 집계: count, sum, max, min
+
+```text
+view open = count(t in tasks where !t.done)
+view points = sum(t.points for t in tasks)
+view best = max(p.score for p in players where p.active)
+view summary = "{count(t in tasks where !t.done)} open of {tasks.count}"
+```
+
+- **모양.** `count(항목 in 리스트 [where 조건])`, `sum|max|min(값 for 항목 in 리스트 [where 조건])`. 값을 둘 받는
+  `max(a, b)`·`min(a, b)`는 그대로 호출이고, 같은 이름의 fn(`fn sum(a, b)`)도 그대로 부를 수 있다. 첫 식 뒤의
+  `for`, 또는 `count(`의 `이름 in`으로 가른다.
+- **의미.** 항목마다 블록을 계산해 센다(조건이 참인 항목), 더한다, 가장 큰·작은 값을 고른다. 포함된 항목이 없으면
+  count·sum은 0이고 max·min은 값이 없다(보기는 비고, 핸들러는 `not_found`로 실패).
+- **블록은 표의 열처럼 돈다.** Pure의 FOLD가 뒤따르는 블록을 항목마다 열로 실행한다. 블록은 자기 항목과 상태만
+  읽는다. 바깥 fn의 매개변수, 둘러싼 열의 행, `dt`, 메시지 필드는 쓸 수 없다(쓰면 컴파일 오류로 이유를 알린다).
+  집계 안에 집계는 없다. 그래서 비용은 블록 길이 × 항목 수로 한정되고, 목록의 사본이나 집계용 상태가 필요 없다.
+
+검증: 무작위 추가·토글·이동·삭제 3,600단계에서 네 집계(조건 있는 것 포함, 빈 max·min, 보간 안의 집계)가 파이썬
+참조 모델과 같다. 진단 7건(중첩, 리스트 아님, text 합, 열의 행, 바깥 매개변수, `dt`, `in` 누락)을 더했다.
+
 ### 구현된 fn과 use (v0c-3)
 
 ```text
