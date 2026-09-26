@@ -1153,6 +1153,56 @@ def server_json(aup, pure, work, rounds=300):
     return rounds + len(wrong)
 
 
+BEAT_SOURCE = """state beats = 0
+state last = 0
+state stamped = 0
+input beat = every 50 ms
+input stamp = message {
+  note: text
+}
+on beat {
+  beats = beats + 1
+  last = now
+}
+on stamp { stamped = now }
+view beats_view = beats
+view last_view = last
+view stamped_view = stamped
+"""
+
+
+def server_timers(aup, pure, work):
+    """A served app's timers tick on the server's clock and its events see
+    the time they were applied, on one thread and with an owner; the ticks
+    are saved, so a restarted server goes on from them."""
+    import time
+    module, source = work / 'beat.pmod', work / 'beat.aup'
+    source.write_text(BEAT_SOURCE)
+    compile_module(aup, source, module)
+    seen = {}
+    for threads in (1, 3):
+        store = work / f'beat-{threads}'
+        beats = 0
+        for run_number in range(2):
+            host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', store, '--threads', threads])
+            try:
+                posted = time.time() * 1000
+                assert http(host.port, 'POST', '/inputs/stamp', b'x')[0] == 200
+                time.sleep(0.6)
+                before = time.time() * 1000
+                read = lambda view: float(http(host.port, 'GET', f'/views/{view}')[3])
+                count, last, stamped = read('beats_view'), read('last_view'), read('stamped_view')
+                after = time.time() * 1000 + 1  # the server's clock reads whole milliseconds
+                assert count >= beats + 5, (threads, run_number, count, beats)
+                assert before - 1000 < last <= after and posted - 50 <= stamped <= before, (last, stamped, posted, before)
+                beats = count
+            finally:
+                stats = host.stop()
+            assert stats[0]['ticks'] >= 5, stats
+        seen[threads] = beats
+    return seen
+
+
 def server_app(aup, pure, work, seeds, operations=200, threads=1):
     """An app served by its views and inputs, no routes written: random
     POSTs (a message with query fields and a body, a text, a key) and GETs
@@ -1784,6 +1834,7 @@ def main():
         report['server_app_owner_requests'], report['server_app_owner_acknowledged_before_kill'] = \
             server_app(aup, args.pure.resolve(), work, range(args.editor_seeds), threads=3)
         report['server_json_requests'] = server_json(aup, args.pure.resolve(), work)
+        report['server_timer_beats'] = server_timers(aup, args.pure.resolve(), work)
     print(json.dumps(report))
 
 
