@@ -8,8 +8,8 @@
 #include <string.h>
 
 /* Limits and opcodes of Pure module format v5. */
-enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 512, STACK = 64, NAME = 32, JOINS = 8,
-       DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 64, CONSTANT_BYTES = 8192,
+enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK = 64, NAME = 32, JOINS = 8,
+       DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
        RECORDS = 8, RECORD_FIELDS = 64, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, DOC, DOC_SIZE, LEN, REPLACE, REPLY, REQUIRE,
@@ -1344,7 +1344,7 @@ static void declaration(Compiler *c) {
 /* ---- Checks and code generation ------------------------------------- */
 
 static void emit(Compiler *c, int line, int column, uint8_t op, uint32_t arg, double value) {
-    if (c->code_count == CODE) fail_at(c, line, column, "program exceeds 512 instructions");
+    if (c->code_count == CODE) fail_at(c, line, column, "program exceeds 65535 instructions");
     c->code[c->code_count].op = op;
     c->code[c->code_count].arg = arg;
     c->code[c->code_count++].value = value;
@@ -1359,8 +1359,8 @@ static uint32_t constant(Compiler *c, const Expr *e) {
     for (unsigned i = 0; i < c->constants; ++i)
         if (c->constant_length[i] == e->size && (!e->size || !memcmp(c->constant_data + c->constant_offset[i], e->bytes, e->size)))
             return i;
-    if (c->constants == CONSTANTS) fail_at(c, e->line, e->column, "at most 64 distinct strings are allowed");
-    if (e->size > CONSTANT_BYTES - c->constant_used) fail_at(c, e->line, e->column, "strings exceed 8192 bytes");
+    if (c->constants == CONSTANTS) fail_at(c, e->line, e->column, "at most 4096 distinct strings are allowed");
+    if (e->size > CONSTANT_BYTES - c->constant_used) fail_at(c, e->line, e->column, "strings exceed 1 MiB");
     if (e->size) memcpy(c->constant_data + c->constant_used, e->bytes, e->size);
     c->constant_offset[c->constants] = (uint32_t)c->constant_used;
     c->constant_length[c->constants] = (uint32_t)e->size;

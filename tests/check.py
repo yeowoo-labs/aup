@@ -73,7 +73,9 @@ DIAGNOSTICS = [
     ('view v = 1 +\n', '1:13', 'expected a number, state, or expression'),
     ('state a = 0\non frame {\n  a = 1 a\n}\n', '3:9', 'expected newline or semicolon'),
     ('state a = 0\non frame {\n  if a {\n    a = 1\n  } els {\n  }\n}\n', '5:5', 'expected newline or semicolon'),
-    ('view v = ' + '+'.join(['1'] * 300) + '\n', '1:', 'program exceeds 512 instructions'),
+    # Each fn doubles what it inlines: f14 is past Pure's 65,535 instructions.
+    ('\n'.join(['fn f0(x) = x + 1'] + [f'fn f{i}(x) = f{i - 1}(f{i - 1}(x))' for i in range(1, 15)] + ['view v = f14(1)']) + '\n',
+     '1:14', "program exceeds 65535 instructions (in fn 'f0' called at 2:15)"),
     ('view v = ' + '(' * 70 + '1' + ')' * 70 + '\n', '1:', 'expression nesting exceeds 64'),
     ('state s = 0\n' * 1 + ''.join(f'state s{i} = 0\n' for i in range(32)), '33:7', 'at most 32 states are allowed'),
     # v0b: messages, keyed documents and types
@@ -266,6 +268,8 @@ ACCEPTED = [
     # A timer, now, floor and %.
     'state last = 0\ninput tick = every 500 ms\ninput slow = every 2 hours\non tick { last = floor(now / 1000) % 60 }\n'
     'on slow { last = -7 % 3 }\nview v = last % 7\n',
+    # A module of some 12,000 instructions (200 KB): hosts read it whole.
+    '\n'.join(['fn f0(x) = x + 1'] + [f'fn f{i}(x) = f{i - 1}(f{i - 1}(x))' for i in range(1, 12)] + ['view v = f11(1)']) + '\n',
 ]
 
 
@@ -390,7 +394,7 @@ def properties(aup, pure_run, work, rounds):
         path, module = work / 'generated.aup', work / 'generated.pmod'
         path.write_text(source)
         result = run(aup, 'build', path, '-o', module, check=False)
-        if result.returncode == 1 and 'program exceeds 512 instructions' in result.stderr:
+        if result.returncode == 1 and 'program exceeds 65535 instructions' in result.stderr:
             over_limit += 1  # well formed but longer than a module may be
             continue
         assert result.returncode == 0, (source, result.stderr)
