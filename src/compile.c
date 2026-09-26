@@ -134,6 +134,8 @@ typedef struct {
     /* Views in order; a table (no value) is followed by its columns. */
     char view_names[VIEWS][NAME], view_row[VIEWS][NAME], view_list[VIEWS][NAME];
     Expr *view_value[VIEWS];
+    Expr *view_filter[VIEWS];                         /* a table's where condition, or NULL */
+    unsigned char view_byte[VIEWS];                   /* a filtered table's list + 1 */
     int view_table[VIEWS];                            /* a column's table + 1, or 0 */
     int view_line[VIEWS][2], view_column[VIEWS][2];   /* a table's row name and list name */
     unsigned views;
@@ -144,7 +146,7 @@ typedef struct {
     int row;              /* the table whose column is being generated, or -1 */
     /* The fold whose block is being generated: its item's name and list, and
      * the fn scope it began in (whose parameters its block cannot read). */
-    bool folding;
+    bool folding, filtering;
     char fold_name[NAME];
     int fold_list;
     Scope *fold_scope;
@@ -1097,7 +1099,8 @@ static void state_declaration(Compiler *c) {
     ++c->states;
 }
 
-/* view name = each row in list { column = value ... }: one row per item. */
+/* view name = each row in list [where condition] { column = value ... }: one
+ * row per item, or per item the condition keeps. */
 static void table_declaration(Compiler *c, unsigned table) {
     take(c); /* each */
     Token row = expect_name(c, "a name for each item");
@@ -1110,6 +1113,10 @@ static void table_declaration(Compiler *c, unsigned table) {
     c->view_column[table][0] = row.column;
     c->view_line[table][1] = list.line;
     c->view_column[table][1] = list.column;
+    if (word(c, "where")) { /* a row only for the items it keeps */
+        take(c);
+        c->view_filter[table] = expression(c, 0, false);
+    }
     expect(c, "{", "'{' on the line of the table");
     separators(c);
     while (!is(c, "}")) {
@@ -1650,6 +1657,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         int list = state_index(c, e->member);
         if (list < 0 || c->state_types[list] != STATE_LIST) fail_at(c, e->line, e->column, "'%s' is not a list", e->member);
         if (c->folding) fail_at(c, e->line, e->column, "a count, sum, max or min cannot hold another");
+        if (c->filtering) fail_at(c, e->line, e->column, "a table's where cannot hold a count, sum, max or min");
         unsigned at = c->code_count, joins = c->joins;
         emit(c, e->line, e->column, FOLD, 0, 0);
         c->folding = true;
@@ -1920,6 +1928,16 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             c->view_types[i] = 2;
             c->view_code[i][0] = (uint32_t)list;
             c->view_code[i][1] = 0;
+            if (c->view_filter[i]) {
+                /* The filter runs as a column of the list: it reads the table's row. */
+                c->row = (int)i;
+                c->filtering = true;
+                c->view_code[i][0] = c->code_count;
+                number(c, c->view_filter[i], false, 0);
+                c->view_code[i][1] = c->code_count - c->view_code[i][0];
+                c->view_byte[i] = (unsigned char)(list + 1);
+                c->filtering = false;
+            }
             continue;
         }
         c->row = c->view_table[i] - 1;
@@ -2021,7 +2039,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->views; ++i) {
         p = put32(p, view_name[i]);
         *p++ = (unsigned char)c->view_types[i];
-        *p++ = 0;
+        *p++ = c->view_byte[i];
         p = put16(p, (uint32_t)c->view_table[i]);
         p = put32(p, c->view_code[i][0]);
         p = put32(p, c->view_code[i][1]);

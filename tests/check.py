@@ -176,6 +176,9 @@ DIAGNOSTICS = [
      "'n' is a parameter outside this count, sum, max or min"),
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
     (LIST + 'view v = sum(x.a for x xs)\n', '6:24', "expected 'in' and a list, as in sum(x in tasks)"),
+    (LIST + 'view w = each r in xs where r {\n  n = r.a\n}\n', '6:29', 'expected a number, not an index'),
+    (LIST + 'view w = each r in xs where count(y in xs) > 0 {\n  n = r.a\n}\n', '6:29',
+     "a table's where cannot hold a count, sum, max or min"),
 ]
 
 ACCEPTED = [
@@ -989,13 +992,18 @@ view done_points = sum(
 view longest = max(t.title.chars for t in tasks)
 view fewest_open = min(t.points for t in tasks where !t.done)
 view summary = "{count(t in tasks where !t.done)} open of {tasks.count}"
+view open_list = each t in tasks where !t.done {
+  label = t.title
+  item = t.position
+}
 """
 
 
 def folds(aup, pure_run, work, seeds, steps=300):
-    """count, sum, max and min over a list against a Python model after
-    random adds, toggles, moves and removals (an empty max or min has no
-    value)."""
+    """count, sum, max and min over a list, and a table filtered by a where,
+    against a Python model after random adds, toggles, moves and removals (an
+    empty max or min has no value; a filtered table's rows keep the list's
+    order and its columns read the item)."""
     source = work / 'folds.aup'
     source.write_text(FOLDS_SOURCE)
     compile_module(aup, source, work / 'folds.pmod')
@@ -1024,7 +1032,8 @@ def folds(aup, pure_run, work, seeds, steps=300):
                              'done_points': sum(t['points'] for t in tasks if t['done']),
                              'longest': max((len(t['title']) for t in tasks), default=None),
                              'fewest_open': min((t['points'] for t in open_tasks), default=None),
-                             'summary': f'{len(open_tasks)} open of {len(tasks)}'})
+                             'summary': f'{len(open_tasks)} open of {len(tasks)}',
+                             'open_list': [{'label': t['title'], 'item': i} for i, t in enumerate(tasks) if not t['done']]})
         # Toggling or removing in an empty list fails; pure-run then exits 1 but shows every event.
         lines = run(pure_run, work / 'folds.pmod', stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()
         shown = [json.loads(line)['views'] for line in lines]
