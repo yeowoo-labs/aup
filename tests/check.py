@@ -89,6 +89,14 @@ DIAGNOSTICS = [
     ('input m = message by key { a: u32 }\nview v = m.a\n', '2:10', "fields of 'm' are only available in its handler"),
     ('state x = 0\ninput m = message by key { a: bytes }\non m {\n  x = m.a\n}\n', '4:7', 'expected a number, not bytes'),
     ('input m = message by key { a: u32 }\non m {\n  reply m.z\n}\n', '3:9', "message 'm' has no field 'z'"),
+    ('input m = message {\n  g: {\n    a: text\n  }\n}\non m {\n  reply m.g\n}\n', '7:9',
+     "'m.g' is a group of fields; read one of them, as in m.g.a"),
+    ('input m = message {\n  g: {\n    a: text\n  }\n}\non m {\n  reply m.g.b\n}\n', '7:9', "message 'm' has no field 'g.b'"),
+    ('input m = message {\n  g: text\n  g: {\n    a: text\n  }\n}\n', '3:3', "duplicate field 'g'"),
+    ('input m = message {\n  g: {\n    a: text\n  }\n  g: {\n    b: text\n  }\n}\n', '5:3', "duplicate field 'g'"),
+    ('input m = message {\n  g: {\n  }\n}\n', '3:3', "the group 'g' has no fields"),
+    ('input m = message {\n  group_of_things: {\n    another_long_name: text\n  }\n}\n', '3:5',
+     "'group_of_things.another_long_name' is longer than 31 characters"),
     ('state x = 0\non frame {\n  require x.bytes\n}\n', '3:11', "a number has no 'bytes'"),
     ('state d: bytes by key\nstate e: bytes by key\n', '2:7', 'at most one keyed collection is allowed'),
     ('state d: bytes by key\ninput m = message by key { a: bytes }\non m {\n  d[key].replace(0 .. m.a, m.a)\n}\n', '4:23',
@@ -1156,16 +1164,43 @@ input add = message {
 input count = message {
   n: u32
 }
+record Shipment {
+  title: text
+  city: text
+  note: text
+  zip = 0
+}
+state shipped: list of Shipment
+input ship = message {
+  title: text
+  to: {
+    city: text
+    zip: u32
+    door: {
+      note: text
+    }
+  }
+}
 on add {
   notes.add(Note { title: add.title, body: add.body, points: add.points })
   reply add.title
 }
 on count { counted = counted + count.n }
+on ship {
+  shipped.append(Shipment { title: ship.title, city: ship.to.city, note: ship.to.door.note, zip: ship.to.zip })
+  reply ship.to.door.note
+}
 view counted_view = counted
 view all = each n in notes {
   title = n.title
   body = n.body
   points = n.points
+}
+view shipments = each s in shipped {
+  title = s.title
+  city = s.city
+  note = s.note
+  zip = s.zip
 }
 """
 
@@ -1240,9 +1275,46 @@ def server_json(aup, pure, work, rounds=300):
         assert post('/inputs/add', b'plain', json_body=False)[:2] == (400, 'json')  # two text fields need JSON
         assert post('/inputs/count', b'{"n": -1}')[:2] == (400, 'json_type')
         assert post('/inputs/count', b'{"n": 4294967296}')[:2] == (400, 'json_type')
+        # Groups: objects inside the body, members in any order, strings
+        # read where they are (escaped ones unescaped over themselves).
+        shipments = []
+        for _ in range(rounds // 3):
+            title, city, note = (''.join(rng.choice(pieces) for _ in range(rng.randint(0, 5))) for _ in range(3))
+            zip_code = rng.randint(0, 99999)
+            door = [('note', note)]
+            to = [('city', city), ('zip', zip_code), ('door', dict(door))]
+            rng.shuffle(to)
+            members = [('title', title), ('to', dict(to))]
+            rng.shuffle(members)
+            text = json.dumps(dict(members), ensure_ascii=rng.random() < 0.5)
+            got = post('/inputs/ship', text.encode())
+            assert got == (200, 'none', note.encode()), (text, got)
+            shipments.append({'title': title, 'city': city, 'note': note, 'zip': zip_code})
+        # A group's fixed field from the query, by its path.
+        assert post('/inputs/ship?to.zip=7', b'{"title": "q", "to": {"city": "c", "door": {"note": "n"}}}')[:2] == \
+            (200, 'none')
+        shipments.append({'title': 'q', 'city': 'c', 'note': 'n', 'zip': 7})
+        rows = json.loads(http(host.port, 'GET', f'/views/shipments?count={len(shipments)}')[3])['items']
+        assert rows == shipments, [(a, b) for a, b in zip(rows, shipments) if a != b][:2]
+        grouped = '{"title": "t", "to": {"city": "c", "zip": 1, "door": {"note": "n"}}}'
+        wrong_groups = [
+            (grouped.replace('"zip": 1', '"zip": 1, "lat": 2'), 'json_field'),         # unknown member of a group
+            (grouped.replace('"note": "n"', '"note": "n", "bell": {"x": 1}'), 'json_field'),
+            (grouped.replace('"door": {"note": "n"}', '"door": "n"'), 'json_type'),    # a group as a value
+            (grouped.replace('"title": "t"', '"title": {"a": "t"}'), 'json_type'),    # a field as a group
+            (grouped.replace('"door": {"note": "n"}', '"door": {}'), 'missing_field'),
+            (grouped.replace('"zip": 1', '"zip": 1, "zip": 2'), 'json_field'),
+            (grouped.replace('"zip": 1', '"zip": [1]'), 'json_type'),
+            (grouped.replace('"zip": 1', '"zip": null'), 'json_type'),
+            (grouped.replace('"note": "n"', '"note": "n\\ud800"'), 'json'),
+            (grouped.replace('"door": {"note": "n"}}', '"door": {"note": "n"}'), 'json'),  # unclosed
+        ]
+        for body, error in wrong_groups:
+            assert post('/inputs/ship', body.encode())[:2] == (400, error), (body, post('/inputs/ship', body.encode()))
+        assert post('/inputs/ship?to.zip=7', grouped.encode())[:2] == (400, 'json_field')  # given twice
     finally:
         host.stop()
-    return rounds + len(wrong)
+    return rounds + len(wrong) + rounds // 3 + len(wrong_groups)
 
 
 BEAT_SOURCE = """state beats = 0

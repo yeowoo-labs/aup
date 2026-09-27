@@ -9,7 +9,7 @@
 
 /* Limits and opcodes of Pure module format v5. */
 enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK = 64, NAME = 32, JOINS = 8,
-       DEPTH = 64, FIELDS = 32, COLLECTIONS = 1, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
+       DEPTH = 64, FIELDS = 64, COLLECTIONS = 1, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
        RECORDS = 8, RECORD_FIELDS = 64, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, DOC, DOC_SIZE, LEN, REPLACE, REPLY, REQUIRE,
@@ -968,19 +968,42 @@ static bool key_name(const char *key) {
     return false;
 }
 
+/* Whether a message already has a field or a group of this path. */
+static bool path_taken(const Input *in, const char *path) {
+    size_t length = strlen(path);
+    for (unsigned i = 0; i < in->fields; ++i) {
+        const char *name = in->field_names[i];
+        size_t size = strlen(name);
+        if (!strcmp(name, path) || (size > length && !memcmp(name, path, length) && name[length] == '.') ||
+            (length > size && !memcmp(path, name, size) && path[size] == '.')) return true;
+    }
+    return false;
+}
+
 /* { name: type ... }: u32 and number are fixed, bytes and text of any length
- * (Pure lays them out: docs/design/008-module-format.md). */
-static void message_fields(Compiler *c, Input *in) {
+ * (Pure lays them out: docs/design/008-module-format.md). name: { ... } is a
+ * group of fields inside the message, named group.name (a JSON object inside
+ * a request's body). */
+static void message_fields(Compiler *c, Input *in, const char *group) {
     if (!is(c, "{")) return; /* the field block opens on the declaration's line */
     take(c);
     separators(c);
+    unsigned first = in->fields;
     while (!is(c, "}")) {
         Token name = expect_name(c, "a field name");
         if (reserved_name(name.text)) fail_at(c, name.line, name.column, "'%s' is reserved", name.text);
-        for (unsigned i = 0; i < in->fields; ++i)
-            if (!strcmp(in->field_names[i], name.text)) fail_at(c, name.line, name.column, "duplicate field '%s'", name.text);
-        if (c->field_count == FIELDS) fail_at(c, name.line, name.column, "at most 32 message fields are allowed");
+        char path[NAME];
+        int length = snprintf(path, sizeof(path), "%s%s%s", group, *group ? "." : "", name.text);
+        if (length < 0 || length >= NAME)
+            fail_at(c, name.line, name.column, "'%s.%s' is longer than %d characters", group, name.text, NAME - 1);
+        if (path_taken(in, path)) fail_at(c, name.line, name.column, "duplicate field '%s'", path);
         expect(c, ":", "':'");
+        if (is(c, "{")) {
+            message_fields(c, in, path);
+            end(c);
+            continue;
+        }
+        if (c->field_count == FIELDS) fail_at(c, name.line, name.column, "at most %d message fields are allowed", FIELDS);
         Token type = expect_name(c, "u32, number, bytes or text");
         static const struct { const char *name; int type; } types[] = {
             {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
@@ -988,13 +1011,15 @@ static void message_fields(Compiler *c, Input *in) {
         for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
             if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
         if (!field_type) fail_at(c, type.line, type.column, "field types are u32, number, bytes and text");
-        memcpy(in->field_names[in->fields], name.text, NAME);
+        memcpy(in->field_names[in->fields], path, NAME);
         in->field_types[in->fields++] = field_type;
         ++c->field_count;
         end(c);
     }
+    if (*group && in->fields == first) fail_at(c, c->token.line, c->token.column, "the group '%s' has no fields", group);
     take(c);
 }
+
 
 /* A signed number literal: a numeric state or field default. */
 static double signed_number(Compiler *c, const char *what) {
@@ -1273,7 +1298,7 @@ static void declaration(Compiler *c) {
             in->kind = KIND_MESSAGE;
             if (word(c, "by")) { take(c); expect_word(c, "key"); in->keyed = true; }
             ++c->input_count;
-            message_fields(c, in);
+            message_fields(c, in, "");
         } else if (word(c, "text")) {
             take(c);
             in->kind = KIND_TEXT;
@@ -1508,6 +1533,28 @@ static int parameter(const Compiler *c, const char *name) {
     return -1;
 }
 
+/* A member chain on a message, as order.customer.name: the input and the
+ * path after it (customer.name). False for anything else. */
+static bool message_path(Compiler *c, const Expr *e, int *input, char path[NAME]) {
+    if (e->kind != E_MEMBER) return false;
+    const Expr *base = e->args[0];
+    if (base->kind == E_NAME) {
+        if (parameter(c, base->name) >= 0 || c->module) return false;
+        *input = input_index(c, base->name);
+        if (*input < 0 || c->inputs[*input].kind != KIND_MESSAGE) return false;
+        snprintf(path, NAME, "%s", e->member);
+        return true;
+    }
+    char inner[NAME];
+    if (!message_path(c, base, input, inner)) return false;
+    const Input *in = &c->inputs[*input];
+    for (unsigned i = 0; i < in->fields; ++i)
+        if (!strcmp(in->field_names[i], inner)) return false; /* a field's own member, as m.text.bytes */
+    int length = snprintf(path, NAME, "%s.%s", inner, e->member);
+    if (length < 0 || length >= NAME) snprintf(path, NAME, "%s", inner); /* too long: names nothing */
+    return true;
+}
+
 /* A name of the app (a state, input or collection): not visible in a library
  * fn, and hidden by a parameter of the same name. */
 static void app_name(Compiler *c, const Expr *e, const char *name) {
@@ -1588,20 +1635,27 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         const Expr *base = e->args[0];
         int library = base->kind == E_NAME && parameter(c, base->name) < 0 ? used_library(c, c->module, base->name) : -1;
         if (library >= 0) return inline_fn(c, e, library, e->member, handler, height); /* library.constant */
+        int message;
+        char path[NAME];
+        if (message_path(c, e, &message, path)) {
+            const Input *in = &c->inputs[message];
+            if (message != c->message)
+                fail_at(c, e->line, e->column, "fields of '%s' are only available in its handler", in->name);
+            size_t length = strlen(path);
+            for (unsigned i = 0; i < in->fields; ++i)
+                if (!strcmp(in->field_names[i], path)) {
+                    emit(c, e->line, e->column, FIELD, i, 0);
+                    int type = in->field_types[i];
+                    return (Kind){type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : NUM, -1};
+                }
+            for (unsigned i = 0; i < in->fields; ++i)
+                if (!strncmp(in->field_names[i], path, length) && in->field_names[i][length] == '.')
+                    fail_at(c, e->line, e->column, "'%s.%s' is a group of fields; read one of them, as in %s.%s",
+                            in->name, path, in->name, in->field_names[i]);
+            fail_at(c, e->line, e->column, "message '%s' has no field '%s'", in->name, path);
+        }
         if (base->kind == E_NAME && parameter(c, base->name) < 0 && !c->module) {
             int input = input_index(c, base->name);
-            if (input >= 0 && c->inputs[input].kind == KIND_MESSAGE) {
-                if (input != c->message)
-                    fail_at(c, e->line, e->column, "fields of '%s' are only available in its handler", base->name);
-                const Input *in = &c->inputs[input];
-                for (unsigned i = 0; i < in->fields; ++i)
-                    if (!strcmp(in->field_names[i], e->member)) {
-                        emit(c, e->line, e->column, FIELD, i, 0);
-                        int type = in->field_types[i];
-                        return (Kind){type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : NUM, -1};
-                    }
-                fail_at(c, e->line, e->column, "message '%s' has no field '%s'", base->name, e->member);
-            }
             if (input >= 0 && c->inputs[input].kind == KIND_KEY)
                 fail_at(c, base->line, base->column, "'%s' is a key input and has no fields", base->name);
             int state = state_index(c, base->name);

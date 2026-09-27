@@ -115,6 +115,10 @@ on edit {
 - 필드 타입은 `u32`, `number`(유한한 수), `bytes`, `text`(UTF-8)이고 가변 필드(bytes, text)는 몇 개든 어디에나 둘 수 있다.
   `input add = message { title: text, points: number }`. HTTP 호스트(`pure-serve`)는 JSON 본문의 객체를 이 필드들로
   옮긴다. 도착한 메시지의 text가 UTF-8이 아니거나 수가 유한하지 않으면 그 이벤트는 실패한다.
+- 필드를 그룹으로 묶을 수 있다: `to: { city: text, zip: u32 }`. 그룹 안의 필드는 `메시지.그룹.필드`(`ship.to.city`)로
+  읽고, JSON 본문에서는 안의 객체(`{"to": {"city": "Seoul", "zip": 4}}`), 쿼리에서는 경로(`?to.zip=4`)다. 그룹은 겹칠 수
+  있고, 경로는 31자 이하, 한 메시지의 필드는 그룹 안까지 합쳐 64개 이하다. 모듈에서는 `to.city` 같은 이름의 필드로 펼쳐지므로
+  실행 비용이 없다.
 - `이름[key]`는 그 메시지 키의 문서다. 읽으면 bytes, `.bytes`는 크기(없으면 0)다. 없는 문서를 읽으면 `not_found`.
 - `replace(a .. b, 값)`는 문서의 `[a, b)`를 바꾼다. 정수가 아니거나 범위 밖이면 이벤트가 `limit`으로 실패한다.
 - `require 조건`이 거짓이면 이벤트가 `limit`으로 실패한다. 크기 정책처럼 저장소의 특수 인자였던 것이 문장 하나가 된다.
