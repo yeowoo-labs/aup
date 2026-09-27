@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 static int usage(void) {
-    fputs("aup check FILE\naup build FILE -o OUT.pmod\naup watch FILE -o OUT.pmod\n"
+    fputs("aup check FILE\naup build FILE -o OUT.pmod\naup watch FILE -o OUT.pmod\naup query APP QUERY|- -o OUT.pmod\n"
           "A library `use name` is name.aup beside FILE or in a directory of AUP_PATH (':' separated).\n", stderr);
     return 2;
 }
@@ -81,14 +81,14 @@ static bool load_library(void *context, const char *name, const char **source, s
     return false;
 }
 
-/* Compile path; write the module to out (unless NULL) through a temporary
- * file renamed over it, so a reader never sees half of one. What it read is
- * left in inputs. 0 on success, 1 on a diagnostic, 2 when a file failed. */
-static int compile(const char *path, const char *out, Inputs *inputs) {
-    *inputs = (Inputs){.count = 0};
-    size_t length;
-    char *source = read_input(inputs, path, &length);
-    if (!source) { perror(path); return 2; }
+/* Compile source (read from path, whose directory libraries are looked for
+ * in); write the module to out (unless NULL) through a temporary file
+ * renamed over it, so a reader never sees half of one. What it read is left
+ * in inputs. A diagnostic from line `after` on is in the query appended to
+ * the source (aup query): it names query_path and a line of its own. 0 on
+ * success, 1 on a diagnostic, 2 when a file failed. */
+static int compile_text(const char *path, const char *source, size_t length, const char *out, Inputs *inputs,
+                        const char *query_path, int after) {
     const char *slash = strrchr(path, '/');
     snprintf(inputs->directory, sizeof(inputs->directory), "%.*s", slash ? (int)(slash - path) : 1, slash ? path : ".");
     unsigned char *module;
@@ -96,9 +96,10 @@ static int compile(const char *path, const char *out, Inputs *inputs) {
     AupDiagnostic error;
     bool compiled = aup_compile(source, length, load_library, inputs, &module, &size, &error);
     for (unsigned i = 0; i < inputs->count; ++i) free(inputs->sources[i]);
-    free(source);
     if (!compiled) {
-        fprintf(stderr, "%s:%d:%d: %s\n", *error.path ? error.path : path, error.line, error.column, error.message);
+        bool in_query = query_path && !*error.path && error.line >= after;
+        fprintf(stderr, "%s:%d:%d: %s\n", *error.path ? error.path : in_query ? query_path : path,
+                in_query ? error.line - after + 1 : error.line, error.column, error.message);
         return 1;
     }
     int status = 0;
@@ -112,6 +113,51 @@ static int compile(const char *path, const char *out, Inputs *inputs) {
         if (status) remove(temporary);
     }
     free(module);
+    return status;
+}
+
+static int compile(const char *path, const char *out, Inputs *inputs) {
+    *inputs = (Inputs){.count = 0};
+    size_t length;
+    char *source = read_input(inputs, path, &length);
+    if (!source) { perror(path); return 2; }
+    int status = compile_text(path, source, length, out, inputs, NULL, 0);
+    free(source);
+    return status;
+}
+
+/* aup query APP QUERY -o OUT: APP's declarations and then QUERY's (views
+ * and fns over APP's states; - is standard input), as one module. Pure
+ * takes it as a query of a running APP: PUT /queries/NAME checks that its
+ * states are APP's, GET /queries/NAME shows its view NAME from a snapshot. */
+static int query(const char *app, const char *query_path, const char *out) {
+    Inputs inputs = {.count = 0};
+    size_t app_length, query_length = 0;
+    char *app_source = read_input(&inputs, app, &app_length);
+    if (!app_source) { perror(app); return 2; }
+    char *query_source = NULL;
+    if (strcmp(query_path, "-")) query_source = read_input(&inputs, query_path, &query_length);
+    else if ((query_source = malloc(AUP_SOURCE_LIMIT + 1)))
+        query_length = fread(query_source, 1, AUP_SOURCE_LIMIT + 1, stdin);
+    char *source = query_source ? malloc(app_length + 1 + query_length) : NULL;
+    if (!source) {
+        perror(query_path);
+        free(app_source);
+        free(query_source);
+        return 2;
+    }
+    int after = 1;
+    for (size_t i = 0; i < app_length; ++i) after += app_source[i] == '\n';
+    if (app_length && app_source[app_length - 1] != '\n') ++after;
+    memcpy(source, app_source, app_length);
+    size_t length = app_length;
+    if (app_length && app_source[app_length - 1] != '\n') source[length++] = '\n';
+    memcpy(source + length, query_source, query_length);
+    length += query_length;
+    int status = compile_text(app, source, length, out, &inputs, strcmp(query_path, "-") ? query_path : "<stdin>", after);
+    free(source);
+    free(app_source);
+    free(query_source);
     return status;
 }
 
@@ -166,5 +212,6 @@ int main(int argc, char **argv) {
     if (argc == 5 && !strcmp(argv[3], "-o") && !strcmp(argv[1], "build")) return compile(argv[2], argv[4], &inputs);
     if (argc == 5 && !strcmp(argv[3], "-o") && !strcmp(argv[1], "watch")) return watch(argv[2], argv[4]);
     if (argc == 3 && !strcmp(argv[1], "check")) return compile(argv[2], NULL, &inputs);
+    if (argc == 6 && !strcmp(argv[4], "-o") && !strcmp(argv[1], "query")) return query(argv[2], argv[3], argv[5]);
     return usage();
 }
