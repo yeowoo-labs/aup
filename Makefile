@@ -11,8 +11,9 @@ all: $(BUILD)/aup
 $(BUILD):
 	mkdir -p $@
 
-$(BUILD)/aup: src/main.c src/compile.c src/aup.h | $(BUILD)
-	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c src/compile.c $(LDFLAGS) $(LDLIBS) -o $@
+# One part, the compiler (compiler/); tests/check.py checks it end to end on Pure.
+$(BUILD)/aup: compiler/main.c compiler/compile.c compiler/aup.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) compiler/main.c compiler/compile.c $(LDFLAGS) $(LDLIBS) -o $@
 
 check: $(BUILD)/aup
 	$(MAKE) -C $(PURE) build/pure-run build/pure-edit-module build/pure-serve
