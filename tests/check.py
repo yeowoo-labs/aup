@@ -1332,6 +1332,153 @@ def server_json(aup, pure, work, rounds=300):
     return rounds + len(wrong) + rounds // 3 + len(wrong_groups)
 
 
+LINK_SENDER = """state n = 0
+state total = 0
+input buy = message {
+  item: text
+  count: u32
+}
+output ordered = message {
+  item: text
+  count: u32
+  to: {
+    city: text
+  }
+}
+on buy {
+  n = n + 1
+  total = total + buy.count
+  send ordered { item: buy.item, count: buy.count, to: { city: "Seoul" } }
+}
+view sent = n
+view sent_total = total
+"""
+
+LINK_RECEIVER = """state stock = 0
+state orders = 0
+input order = message {
+  item: text
+  count: u32
+  to: {
+    city: text
+  }
+}
+on order {
+  require order.count < 100
+  stock = stock + order.count
+  orders = orders + 1
+}
+view total = stock
+view count = orders
+"""
+
+
+def server_links(aup, pure, work):
+    """Two served apps, one's output wired to the other's input over HTTP
+    (--send). While four clients buy from the sender, the receiver and then
+    the sender are killed (-9) and started again on their stores. In the end
+    the receiver has applied every order the sender saved exactly once (its
+    total and count equal the sender's), a refused order (count 150) was
+    delivered once and did not hold back the order after it, and every
+    acknowledged order is among the saved ones."""
+    import select
+    import signal
+    import socket
+    import threading
+    import time
+    sender_module, receiver_module = work / 'link-sender.pmod', work / 'link-receiver.pmod'
+    for module, text in ((sender_module, LINK_SENDER), (receiver_module, LINK_RECEIVER)):
+        source = module.with_suffix('.aup')
+        source.write_text(text)
+        compile_module(aup, source, module)
+
+    def free_port():
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            return probe.getsockname()[1]
+
+    def start(args, port):
+        process = subprocess.Popen([str(a) for a in args] + ['--port', str(port)], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        ready, _, _ = select.select([process.stdout], [], [], 10)
+        assert ready and process.stdout.readline(), 'host did not start'
+        return process
+
+    def post(port, path, body):
+        import http.client
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        try:
+            data = json.dumps(body).encode()
+            connection.request('POST', path, data, {'Content-Length': str(len(data)), 'Content-Type': 'application/json'})
+            response = connection.getresponse()
+            response.read()
+            return response.status
+        finally:
+            connection.close()
+
+    def number(port, view):
+        return int(http(port, 'GET', f'/views/{view}')[3])
+
+    port_a, port_b = free_port(), free_port()
+    receiver = [pure / 'build/pure-serve', '--module', receiver_module, '--store', work / 'link-b', '--threads', '2']
+    sender = [pure / 'build/pure-serve', '--module', sender_module, '--store', work / 'link-a',
+              '--send', f'ordered=http://127.0.0.1:{port_b}/inputs/order']
+    hosts = {'b': start(receiver, port_b), 'a': start(sender, port_a)}
+    acknowledged = [0] * 4
+    stop = threading.Event()
+
+    def client(which):
+        rng = random.Random(which + 7700)
+        while not stop.is_set():
+            count = rng.randint(1, 20)
+            try:
+                status = post(port_a, '/inputs/buy', {'item': f'c{which}', 'count': count})
+            except OSError:
+                time.sleep(0.02)
+                continue
+            if status == 200:
+                acknowledged[which] += count
+            else:
+                time.sleep(0.02)
+
+    clients = [threading.Thread(target=client, args=(n,)) for n in range(len(acknowledged))]
+    for thread in clients:
+        thread.start()
+    try:
+        for name, args, port in (('b', receiver, port_b), ('a', sender, port_a)):
+            time.sleep(0.6)
+            hosts[name].send_signal(signal.SIGKILL)
+            hosts[name].wait()
+            time.sleep(0.3)
+            hosts[name] = start(args, port)
+        time.sleep(0.6)
+    finally:
+        stop.set()
+        for thread in clients:
+            thread.join()
+    try:
+        assert post(port_a, '/inputs/buy', {'item': 'big', 'count': 150}) == 200
+        assert post(port_a, '/inputs/buy', {'item': 'after', 'count': 7}) == 200
+        deadline = time.time() + 30
+        while True:
+            sent, sent_total = number(port_a, 'sent'), number(port_a, 'sent_total')
+            count, total = number(port_b, 'count'), number(port_b, 'total')
+            if (count, total) == (sent - 1, sent_total - 150) or time.time() > deadline:
+                break
+            time.sleep(0.1)
+        assert (count, total) == (sent - 1, sent_total - 150), (count, total, sent, sent_total)
+        assert sent_total >= sum(acknowledged) + 157 and sum(acknowledged) > 0, (sent_total, acknowledged)
+    finally:
+        stats = {}
+        for name, process in hosts.items():
+            process.terminate()
+            _, error = process.communicate(timeout=30)
+            assert process.returncode == 0, error[-1000:]
+            stats[name] = [json.loads(line) for line in error.decode().splitlines() if line.startswith('{"active"')][-1]
+    return {'orders': sent, 'acknowledged_total': sum(acknowledged), 'delivered_after_restart': stats['a']['delivered'],
+            'attempts_after_restart': stats['a']['delivery_attempts']}
+
+
 BEAT_SOURCE = """state beats = 0
 state last = 0
 state stamped = 0
@@ -2036,6 +2183,7 @@ def main():
             server_app(aup, args.pure.resolve(), work, range(args.editor_seeds), threads=3)
         report['server_json_requests'] = server_json(aup, args.pure.resolve(), work)
         report['server_timer_beats'] = server_timers(aup, args.pure.resolve(), work)
+        report['server_links'] = server_links(aup, args.pure.resolve(), work)
     print(json.dumps(report))
 
 
