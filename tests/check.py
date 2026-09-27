@@ -1484,7 +1484,7 @@ def server_webhook(aup, pure, work):
     a certificate of its own): five orders arrive in order as JSON with the
     sender's headers, one answered 503 at first arrives again, and none goes
     to a receiver whose certificate the sender does not trust."""
-    import http.server
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import ssl
     import threading
     import time
@@ -1498,7 +1498,7 @@ def server_webhook(aup, pure, work):
                        check=True, capture_output=True)
     received, refused_once = [], set()
 
-    class Hook(http.server.BaseHTTPRequestHandler):
+    class Hook(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
         def do_POST(self):
@@ -1515,7 +1515,7 @@ def server_webhook(aup, pure, work):
         def log_message(self, *args):
             pass
 
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Hook)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Hook)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(work / 'trusted.pem', work / 'trusted.key')
     server.socket = context.wrap_socket(server.socket, server_side=True)
@@ -1563,6 +1563,148 @@ def server_webhook(aup, pure, work):
     finally:
         server.shutdown()
     return {'hooks': len(received), 'delivered': stats['delivered']}
+
+
+PAY_SOURCE = """state sent = 0
+state paid = 0
+state declined = 0
+state paid_total = 0
+input buy = message {
+  order: text
+  amount: u32
+}
+output charge = message {
+  order: text
+  amount: u32
+}
+input charged = message {
+  order: text
+  amount: u32
+  status: text
+  http_status: u32
+}
+on buy {
+  sent = sent + 1
+  send charge { order: buy.order, amount: buy.amount }
+}
+on charged {
+  if charged.http_status == 200 {
+    paid = paid + 1
+    paid_total = paid_total + charged.amount
+  } else {
+    declined = declined + 1
+  }
+}
+view sent_view = sent
+view paid_view = paid
+view declined_view = declined
+view paid_total_view = paid_total
+"""
+
+
+def server_answers(aup, pure, work):
+    """An output wired to a payments API whose answers come back as events
+    (--reply): the API answers 200 or 402 and gives a key's first answer to
+    every request with that Idempotency-Key. While clients buy, the sender is
+    killed (-9) and started again; in the end every saved order was answered
+    exactly once: the app's paid and declined counts and paid total match the
+    API's answers, one per key."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import select
+    import signal
+    import socket
+    import threading
+    import time
+    module = work / 'pay.pmod'
+    module.with_suffix('.aup').write_text(PAY_SOURCE)
+    compile_module(aup, module.with_suffix('.aup'), module)
+    answers, lock = {}, threading.Lock()
+
+    class Payments(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            with lock:
+                key = self.headers['Idempotency-Key']
+                if key not in answers:
+                    ok = body['amount'] <= 1000
+                    answers[key] = (body, 200 if ok else 402,
+                                    {'status': 'succeeded' if ok else 'declined', 'id': f'ch_{len(answers)}', 'x': [1, {}]})
+                _, status, answer = answers[key]
+            data = json.dumps(answer).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Payments)
+    server.handle_error = lambda request, address: None  # a sender killed mid-request
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    args = [pure / 'build/pure-serve', '--module', module, '--store', work / 'pay-store', '--port', port,
+            '--send', f'charge=http://127.0.0.1:{server.server_address[1]}/charge', '--reply', 'charge=charged']
+
+    def start():
+        process = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ready, _, _ = select.select([process.stdout], [], [], 10)
+        assert ready and process.stdout.readline(), 'host did not start'
+        return process
+
+    def number(view):
+        return int(http(port, 'GET', f'/views/{view}')[3])
+
+    host = start()
+    stop = threading.Event()
+
+    def client(which):
+        import http.client
+        rng = random.Random(which + 8800)
+        while not stop.is_set():
+            data = json.dumps({'order': f'o{which}-{rng.randrange(10**6)}', 'amount': rng.randint(1, 1500)}).encode()
+            try:
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+                connection.request('POST', '/inputs/buy', data, {'Content-Length': str(len(data)), 'Content-Type': 'application/json'})
+                connection.getresponse().read()
+                connection.close()
+            except OSError:
+                time.sleep(0.02)
+
+    clients = [threading.Thread(target=client, args=(n,)) for n in range(3)]
+    for thread in clients:
+        thread.start()
+    try:
+        time.sleep(0.8)
+        host.send_signal(signal.SIGKILL)
+        host.wait()
+        host = start()
+        time.sleep(0.8)
+    finally:
+        stop.set()
+        for thread in clients:
+            thread.join()
+    try:
+        deadline = time.time() + 30
+        while number('paid_view') + number('declined_view') < number('sent_view') and time.time() < deadline:
+            time.sleep(0.1)
+        sent, paid, declined, total = (number(v) for v in ('sent_view', 'paid_view', 'declined_view', 'paid_total_view'))
+        with lock:
+            keys = list(answers.values())
+        assert paid + declined == sent == len(keys), (paid, declined, sent, len(keys))
+        assert paid == sum(1 for _, status, _ in keys if status == 200), (paid, len(keys))
+        assert total == sum(body['amount'] for body, status, _ in keys if status == 200)
+    finally:
+        host.terminate()
+        _, error = host.communicate(timeout=30)
+        server.shutdown()
+    stats = [json.loads(line) for line in error.decode().splitlines() if line.startswith('{"active"')][-1]
+    return {'orders': sent, 'paid': paid, 'declined': declined, 'answers_after_restart': stats['answers']}
 
 
 BEAT_SOURCE = """state beats = 0
@@ -2271,6 +2413,7 @@ def main():
         report['server_timer_beats'] = server_timers(aup, args.pure.resolve(), work)
         report['server_links'] = server_links(aup, args.pure.resolve(), work)
         report['server_webhook'] = server_webhook(aup, args.pure.resolve(), work)
+        report['server_answers'] = server_answers(aup, args.pure.resolve(), work)
     print(json.dumps(report))
 
 
