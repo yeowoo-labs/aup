@@ -1479,6 +1479,92 @@ def server_links(aup, pure, work):
             'attempts_after_restart': stats['a']['delivery_attempts']}
 
 
+def server_webhook(aup, pure, work):
+    """An output wired to a third-party HTTPS endpoint (a Python server with
+    a certificate of its own): five orders arrive in order as JSON with the
+    sender's headers, one answered 503 at first arrives again, and none goes
+    to a receiver whose certificate the sender does not trust."""
+    import http.server
+    import ssl
+    import threading
+    import time
+    module = work / 'hook-sender.pmod'
+    module.with_suffix('.aup').write_text(LINK_SENDER)
+    compile_module(aup, module.with_suffix('.aup'), module)
+    for name in ('trusted', 'other'):
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes',
+                        '-keyout', work / f'{name}.key', '-out', work / f'{name}.pem', '-days', '1',
+                        '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'],
+                       check=True, capture_output=True)
+    received, refused_once = [], set()
+
+    class Hook(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers['Content-Length']))
+            received.append((dict(self.headers), json.loads(body)))
+            status = 200
+            if self.headers['X-Pure-Sequence'] == '2' and '2' not in refused_once:
+                refused_once.add('2')
+                status = 503
+            self.send_response(status)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Hook)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(work / 'trusted.pem', work / 'trusted.key')
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f'ordered=https://127.0.0.1:{server.server_address[1]}/hook'
+    try:
+        def buy(host, count):
+            import http.client
+            connection = http.client.HTTPConnection('127.0.0.1', host.port, timeout=10)
+            data = json.dumps({'item': f'i{count}', 'count': count}).encode()
+            connection.request('POST', '/inputs/buy', data, {'Content-Length': str(len(data)), 'Content-Type': 'application/json'})
+            assert connection.getresponse().status == 200
+            connection.close()
+
+        host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / 'hook-a', '--send', url,
+                         '--send-ca', work / 'trusted.pem'])
+        try:
+            for count in range(1, 6):
+                buy(host, count)
+            deadline = time.time() + 20
+            while len({h['X-Pure-Sequence'] for h, _ in received}) < 5 and time.time() < deadline:
+                time.sleep(0.05)
+        finally:
+            stats = host.stop()[-1]
+        firsts = []
+        for headers, body in received:
+            seq = int(headers['X-Pure-Sequence'])
+            assert headers['X-Pure-Source'] == 'hook-sender.ordered' and headers['Content-Type'] == 'application/json'
+            assert headers['Idempotency-Key'] == f'hook-sender.ordered-{seq}' and 'X-Pure-Count' not in headers
+            assert body == {'item': f'i{seq}', 'count': seq, 'to': {'city': 'Seoul'}}, body
+            if seq not in firsts:
+                firsts.append(seq)
+        assert firsts == [1, 2, 3, 4, 5] and len(received) == 6 and stats['delivered'] == 5, (firsts, len(received), stats)
+        # A receiver the sender cannot trust gets nothing; the send waits in the outbox.
+        before = len(received)
+        host = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / 'hook-b', '--send', url,
+                         '--send-ca', work / 'other.pem'])
+        try:
+            buy(host, 1)
+            time.sleep(1)
+        finally:
+            host.process.terminate()
+            _, error = host.process.communicate(timeout=30)
+        assert len(received) == before and b'not trusted' in error, error[-500:]
+    finally:
+        server.shutdown()
+    return {'hooks': len(received), 'delivered': stats['delivered']}
+
+
 BEAT_SOURCE = """state beats = 0
 state last = 0
 state stamped = 0
@@ -2184,6 +2270,7 @@ def main():
         report['server_json_requests'] = server_json(aup, args.pure.resolve(), work)
         report['server_timer_beats'] = server_timers(aup, args.pure.resolve(), work)
         report['server_links'] = server_links(aup, args.pure.resolve(), work)
+        report['server_webhook'] = server_webhook(aup, args.pure.resolve(), work)
     print(json.dumps(report))
 
 
