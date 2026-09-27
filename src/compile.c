@@ -17,9 +17,9 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
-       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD };
+       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND };
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
-enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4 };
+enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
 typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
@@ -60,7 +60,7 @@ typedef struct Expr {
     size_t size;
 } Expr;
 
-typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET } StmtKind;
+typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
@@ -177,7 +177,7 @@ typedef struct {
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
-                                       "floor"};
+                                       "floor", "output", "send"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -766,6 +766,29 @@ static Expr *record_value(Compiler *c) {
     return r;
 }
 
+/* send's fields { field: value, group: { ... } }: E_FIELD nodes linked from
+ * args[0] of an E_RECORD without a name; a group's value is such a record. */
+static Expr *send_fields(Compiler *c) {
+    Token open = take(c); /* { */
+    Expr *r = node(c, E_RECORD, open.line, open.column), **tail = &r->args[0];
+    separators(c);
+    while (!is(c, "}")) {
+        Token field = expect_name(c, "a field name");
+        expect(c, ":", "':'");
+        Expr *f = node(c, E_FIELD, field.line, field.column);
+        memcpy(f->member, field.text, NAME);
+        f->args[0] = is(c, "{") ? send_fields(c) : expression(c, 0, false);
+        f->count = 1;
+        *tail = f;
+        tail = &f->next;
+        if (!is(c, ",") && !is(c, ";") && !is(c, "}") && c->token.kind != T_NL)
+            fail_at(c, c->token.line, c->token.column, "expected ',' or a new line between fields");
+        while (is(c, ",") || is(c, ";") || c->token.kind == T_NL) take(c);
+    }
+    take(c);
+    return r;
+}
+
 /* A value inserted into a text or a list: an expression or a record. */
 static Expr *inserted(Compiler *c) {
     newlines(c);
@@ -804,6 +827,15 @@ static Stmt *statement(Compiler *c, unsigned depth) {
             if (word(c, "if")) s->otherwise = statement(c, depth + 1);
             else s->otherwise = block(c, depth + 1);
         }
+        return s;
+    }
+    if (!strcmp(token.text, "send")) {
+        /* send output { field: value, ... }: every field of the output, groups as their own braces. */
+        s->kind = S_SEND;
+        Token name = expect_name(c, "an output");
+        memcpy(s->name, name.text, NAME);
+        if (!is(c, "{")) fail_at(c, c->token.line, c->token.column, "expected '{' and the fields, as in send %s { field: value }", name.text);
+        s->value = send_fields(c);
         return s;
     }
     if (!strcmp(token.text, "reply") || !strcmp(token.text, "require")) {
@@ -938,25 +970,26 @@ static int used_library(const Compiler *c, int module, const char *name) {
 }
 
 static const char *declared_kind(const Compiler *c, const char *name) {
-    static const char *const states[] = {"state", "text state", "cursor", "list", "list index"};
-    if (fn_index(c, c->module, name) >= 0) return "fn";
-    if (used_library(c, c->module, name) >= 0) return "library";
+    static const char *const states[] = {"a state", "a text state", "a cursor", "a list", "a list index"};
+    if (fn_index(c, c->module, name) >= 0) return "a fn";
+    if (used_library(c, c->module, name) >= 0) return "a library";
     if (c->module) return NULL; /* a library has only fns and uses */
     int state = state_index(c, name);
     if (state >= 0) return states[c->state_types[state]];
-    if (record_index(c, name) >= 0) return "record";
-    for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) return "collection";
+    if (record_index(c, name) >= 0) return "a record";
+    for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) return "a collection";
     int input = input_index(c, name);
-    if (input >= 0) return c->inputs[input].kind == KIND_KEY ? "key input" :
-                           c->inputs[input].kind == KIND_TEXT ? "text input" : "message";
-    for (unsigned i = 0; i < c->views; ++i) if (!c->view_table[i] && !strcmp(c->view_names[i], name)) return "view";
+    if (input >= 0) return c->inputs[input].kind == KIND_KEY ? "a key input" :
+                           c->inputs[input].kind == KIND_TEXT ? "a text input" :
+                           c->inputs[input].kind == KIND_OUTPUT ? "an output" : "a message";
+    for (unsigned i = 0; i < c->views; ++i) if (!c->view_table[i] && !strcmp(c->view_names[i], name)) return "a view";
     return NULL;
 }
 
 static void declare(Compiler *c, const Token *name) {
     if (reserved_name(name->text)) fail_at(c, name->line, name->column, "'%s' is reserved", name->text);
     const char *kind = declared_kind(c, name->text);
-    if (kind) fail_at(c, name->line, name->column, "'%s' is already declared as a %s", name->text, kind);
+    if (kind) fail_at(c, name->line, name->column, "'%s' is already declared as %s", name->text, kind);
 }
 
 static bool key_name(const char *key) {
@@ -1276,7 +1309,7 @@ static void library_declaration(Compiler *c) {
 }
 
 static void declaration(Compiler *c) {
-    Token kind = expect_name(c, "state, record, input, view, fn, use, or on");
+    Token kind = expect_name(c, "state, record, input, output, view, fn, use, or on");
     if (!strcmp(kind.text, "fn")) {
         fn_declaration(c);
     } else if (!strcmp(kind.text, "use")) {
@@ -1334,6 +1367,19 @@ static void declaration(Compiler *c) {
             memcpy(in->key, key.text, NAME);
             ++c->input_count;
         }
+    } else if (!strcmp(kind.text, "output")) {
+        /* output ordered = message { ... }: what the app sends; its receiver is the host's wiring. */
+        Token name = expect_name(c, "output name");
+        declare(c, &name);
+        if (c->input_count == INPUTS) fail_at(c, name.line, name.column, "at most 32 inputs and outputs are allowed");
+        expect(c, "=", "'='");
+        Input *in = &c->inputs[c->input_count];
+        memset(in, 0, sizeof(*in));
+        memcpy(in->name, name.text, NAME);
+        expect_word(c, "message");
+        in->kind = KIND_OUTPUT;
+        ++c->input_count;
+        message_fields(c, in, "");
     } else if (!strcmp(kind.text, "view")) {
         Token name = expect_name(c, "view name");
         declare(c, &name);
@@ -1399,7 +1445,7 @@ static uint32_t collection(Compiler *c, const char *name, int line, int column) 
     for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) index = (int)i;
     if (index < 0) {
         const char *kind = declared_kind(c, name);
-        if (kind) fail_at(c, line, column, "'%s' is a %s, not a collection", name, kind);
+        if (kind) fail_at(c, line, column, "'%s' is %s, not a collection", name, kind);
         fail_at(c, line, column, "unknown collection '%s'", name);
     }
     if (c->message < 0 || c->inputs[c->message].kind != KIND_MESSAGE || !c->inputs[c->message].keyed)
@@ -1411,7 +1457,7 @@ static int text_state(Compiler *c, const char *name, int line, int column) {
     int index = state_index(c, name);
     if (index < 0 || c->state_types[index] != STATE_TEXT) {
         const char *kind = declared_kind(c, name);
-        if (kind) fail_at(c, line, column, "'%s' is a %s, not a text state", name, kind);
+        if (kind) fail_at(c, line, column, "'%s' is %s, not a text state", name, kind);
         fail_at(c, line, column, "unknown text state '%s'", name);
     }
     return index;
@@ -1427,7 +1473,7 @@ static int list_state(Compiler *c, const char *name, int line, int column, const
         if (!strcmp(c->collection_names[i], name) && where)
             fail_at(c, where->line, where->column, "a collection is indexed by the message key, as in name[key]");
     const char *kind = declared_kind(c, name);
-    if (kind) fail_at(c, line, column, "'%s' is a %s, not a list", name, kind);
+    if (kind) fail_at(c, line, column, "'%s' is %s, not a list", name, kind);
     fail_at(c, line, column, "unknown list '%s'", name);
 }
 
@@ -1502,7 +1548,7 @@ static Kind inline_fn(Compiler *c, const Expr *e, int module, const char *name, 
     if (index < 0) {
         if (module != c->module) fail_at(c, e->line, e->column, "library '%s' has no fn '%s'", c->modules[module].name, name);
         const char *kind = declared_kind(c, name);
-        if (kind) fail_at(c, e->line, e->column, "'%s' is a %s, not a fn", name, kind);
+        if (kind) fail_at(c, e->line, e->column, "'%s' is %s, not a fn", name, kind);
         fail_at(c, e->line, e->column, "unknown fn '%s'", name);
     }
     Fn *f = &c->fns[index];
@@ -1628,7 +1674,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             return (Kind){TEXT, -1};
         }
         const char *kind = declared_kind(c, e->name);
-        if (kind) fail_at(c, e->line, e->column, "'%s' is a %s, not a state", e->name, kind);
+        if (kind) fail_at(c, e->line, e->column, "'%s' is %s, not a state", e->name, kind);
         fail_at(c, e->line, e->column, "unknown state '%s'", e->name);
     }
     case E_MEMBER: {
@@ -1893,6 +1939,31 @@ static void record_fields(Compiler *c, const Expr *e, int list, int height) {
     }
 }
 
+/* send's values by the output's fields, groups by their paths. */
+static void send_values(Compiler *c, const Input *out, const Expr *group, const char *path, const Expr **given) {
+    for (const Expr *f = group->args[0]; f; f = f->next) {
+        char name[NAME];
+        int length = snprintf(name, sizeof(name), "%s%s%s", path, *path ? "." : "", f->member);
+        if (length < 0 || length >= NAME) fail_at(c, f->line, f->column, "output '%s' has no field '%s.%s'", out->name, path, f->member);
+        bool group_named = false;
+        int field = -1;
+        for (unsigned i = 0; i < out->fields; ++i) {
+            if (!strcmp(out->field_names[i], name)) field = (int)i;
+            else if (!strncmp(out->field_names[i], name, (size_t)length) && out->field_names[i][length] == '.') group_named = true;
+        }
+        const Expr *v = f->args[0];
+        if (v->kind == E_RECORD && !v->name[0]) {
+            if (!group_named) fail_at(c, f->line, f->column, "output '%s' has no group '%s'", out->name, name);
+            send_values(c, out, v, name, given);
+            continue;
+        }
+        if (group_named) fail_at(c, f->line, f->column, "'%s' is a group of fields; give them in braces, as in %s: { ... }", name, f->member);
+        if (field < 0) fail_at(c, f->line, f->column, "output '%s' has no field '%s'", out->name, name);
+        if (given[field]) fail_at(c, f->line, f->column, "field '%s' is given twice", name);
+        given[field] = v;
+    }
+}
+
 static void statements(Compiler *c, const Stmt *s) {
     for (; s; s = s->next) {
         switch (s->kind) {
@@ -1982,6 +2053,26 @@ static void statements(Compiler *c, const Stmt *s) {
             number(c, s->last, true, 1);
             bytes_value(c, s->value, 2, "replace");
             emit(c, s->line, s->column, REPLACE, target, 0);
+            break;
+        }
+        case S_SEND: {
+            int output = input_index(c, s->name);
+            if (output < 0 || c->inputs[output].kind != KIND_OUTPUT) {
+                const char *kind = declared_kind(c, s->name);
+                if (kind) fail_at(c, s->line, s->column, "'%s' is %s, not an output", s->name, kind);
+                fail_at(c, s->line, s->column, "unknown output '%s'", s->name);
+            }
+            const Input *out = &c->inputs[output];
+            const Expr *given[FIELDS] = {0};
+            send_values(c, out, s->value, "", given);
+            if (out->fields > STACK) fail_at(c, s->line, s->column, "an output of more than %d fields cannot be sent", STACK);
+            for (unsigned f = 0; f < out->fields; ++f) {
+                if (!given[f]) fail_at(c, s->line, s->column, "send %s needs '%s'", s->name, out->field_names[f]);
+                int type = out->field_types[f];
+                if (type == FIELD_BYTES) bytes_value(c, given[f], (int)f, "a bytes field");
+                else expect_kind(c, given[f], value(c, given[f], true, (int)f), type == FIELD_TEXT ? TEXT : NUM);
+            }
+            emit(c, s->line, s->column, SEND, (uint32_t)output, 0);
             break;
         }
         case S_REPLY:
@@ -2082,9 +2173,11 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         int input = input_index(c, name);
         if (input < 0) {
             const char *kind = declared_kind(c, name);
-            if (kind) fail_at(c, line, column, "'%s' is a %s, not an input", name, kind);
+            if (kind) fail_at(c, line, column, "'%s' is %s, not an input", name, kind);
             fail_at(c, line, column, "unknown input '%s'", name);
         }
+        if (c->inputs[input].kind == KIND_OUTPUT)
+            fail_at(c, line, column, "'%s' is an output: the app sends it (send %s { ... }) and does not handle it", name, name);
         const char *what = c->inputs[input].kind == KIND_MESSAGE ? "message" :
                            c->inputs[input].kind == KIND_TIMER ? "timer" : "text input";
         if (c->inputs[input].kind != KIND_KEY && c->handlers[i].edge >= 0)
@@ -2100,7 +2193,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->views; ++i) {
         if (!c->view_value[i]) {
             const char *row = c->view_row[i], *kind = declared_kind(c, row);
-            if (kind) fail_at(c, c->view_line[i][0], c->view_column[i][0], "'%s' is already declared as a %s", row, kind);
+            if (kind) fail_at(c, c->view_line[i][0], c->view_column[i][0], "'%s' is already declared as %s", row, kind);
             int list = list_state(c, c->view_list[i], c->view_line[i][1], c->view_column[i][1], NULL);
             c->view_types[i] = 2;
             c->view_code[i][0] = (uint32_t)list;
@@ -2190,7 +2283,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         *p++ = in->keyed;
         p = put16(p, 0);
         p = put32(p, in->kind == KIND_TIMER ? in->period : input_key[i]);
-        p = put16(p, in->kind == KIND_MESSAGE ? first : 0);
+        p = put16(p, in->kind == KIND_MESSAGE || in->kind == KIND_OUTPUT ? first : 0);
         p = put16(p, in->fields);
         first += in->fields;
     }

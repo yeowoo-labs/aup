@@ -55,6 +55,9 @@ LIST = RECORD + 'state xs: list of T\nstate at: index of xs\n'
 KEYED = 'record T {\n  a = 0\n  s: text\n}\n'
 KEYED_LIST = KEYED + 'state xs: list of T by s\nstate at: index of xs\n'
 
+# An app with an output: bought items go out as orders.
+SENDS = ('state n = 0\ninput buy = message {\n  item: text\n  count: u32\n}\noutput ordered = message {\n'
+         '  item: text\n  count: u32\n  to: {\n    city: text\n  }\n}\n')
 DIAGNOSTICS = [
     ('state x = 1\nstate x = 2\n', '2:7', "already declared as a state"),
     ('state a = b\n', '1:11', 'expected a numeric state initializer'),
@@ -64,7 +67,7 @@ DIAGNOSTICS = [
     ('on missing.down {\n}\n', '1:4', "unknown input 'missing'"),
     ('state a = 0\non a.down {\n}\n', '2:4', "'a' is a state, not an input"),
     ('state a = 0\non frame {\n  b = 1\n}\n', '3:3', "unknown state 'b'"),
-    ('state a = 0\nview v = a\non frame {\n  v = 1\n}\n', '4:3', "cannot assign to view 'v'"),
+    ('state a = 0\nview v = a\non frame {\n  v = 1\n}\n', '4:3', "cannot assign to a view 'v'"),
     ('input k = key Space\nview v = k\n', '2:10', "'k' is a key input, not a state"),
     ('state a = 0\nview v = min(a)\n', '2:10', 'min expects 2 arguments'),
     ('state if = 0\n', '1:7', "'if' is reserved"),
@@ -95,6 +98,17 @@ DIAGNOSTICS = [
     ('input m = message {\n  g: text\n  g: {\n    a: text\n  }\n}\n', '3:3', "duplicate field 'g'"),
     ('input m = message {\n  g: {\n    a: text\n  }\n  g: {\n    b: text\n  }\n}\n', '5:3', "duplicate field 'g'"),
     ('input m = message {\n  g: {\n  }\n}\n', '3:3', "the group 'g' has no fields"),
+    (SENDS + 'on buy {\n  send ordered { item: buy.item, count: buy.count }\n}\n', '14:3', "send ordered needs 'to.city'"),
+    (SENDS + 'on buy {\n  send ordered { item: buy.item, count: 1, to: "x" }\n}\n', '14:44',
+     "'to' is a group of fields; give them in braces"),
+    (SENDS + 'on buy {\n  send ordered { item: buy.item, count: 1, to: { town: "x" } }\n}\n', '14:50',
+     "output 'ordered' has no field 'to.town'"),
+    (SENDS + 'on buy {\n  send ordered { item: buy.count, count: 1, to: { city: "x" } }\n}\n', '14:24', 'expected text, not a number'),
+    (SENDS + 'on buy {\n  send buy { item: buy.item }\n}\n', '14:3', "'buy' is a message, not an output"),
+    (SENDS + 'on ordered {\n}\n', '13:4', "'ordered' is an output: the app sends it"),
+    (SENDS + 'on buy {\n  send ordered { item: buy.item, item: buy.item, count: 1, to: { city: "x" } }\n}\n', '14:34',
+     "field 'item' is given twice"),
+    (SENDS + 'view v = ordered.item\n', '13:10', "'ordered' is an output"),
     ('input m = message {\n  group_of_things: {\n    another_long_name: text\n  }\n}\n', '3:5',
      "'group_of_things.another_long_name' is longer than 31 characters"),
     ('state x = 0\non frame {\n  require x.bytes\n}\n', '3:11', "a number has no 'bytes'"),
@@ -225,6 +239,7 @@ DIAGNOSTICS = [
 ]
 
 ACCEPTED = [
+    SENDS + 'on buy {\n  n = n + 1\n  send ordered { to: { city: "Seoul" }, count: buy.count, item: buy.item }\n}\nview sent = n\n',
     # fns named like folds stay calls, and max of two values stays max
     'fn sum(a, b) = a + b\nfn count(x) = x\nview v = sum(1, count(2)) + max(3, 4) + min(\n  5,\n  6\n)\n',
     # else on the next line, else if chains, multiline arguments, semicolons.
