@@ -17,18 +17,18 @@ v0c(레코드·리스트·`index of`·조건식·표 보기·`fn`·`use` 라이�
 make                                   # build/aup
 build/aup build examples/counter.aup -o counter.pmod
 build/aup watch examples/counter.aup -o counter.pmod   # 저장할 때마다 다시 빌드(vega ... --watch가 받아 바꾼다)
-printf 'down tap\nup tap\nshow\n' | ../pure/prototypes/connections/build/pure-run counter.pmod
+printf 'down tap\nup tap\nshow\n' | ../pure/build/pure-run counter.pmod
 build/aup build examples/notes.aup -o notes.pmod
-printf 'type typed %s\ndown left\nshow\n' "$(printf '안녕' | xxd -p)" | ../pure/prototypes/connections/build/pure-run notes.pmod
+printf 'type typed %s\ndown left\nshow\n' "$(printf '안녕' | xxd -p)" | ../pure/build/pure-run notes.pmod
 build/aup build examples/tasks.aup -o tasks.pmod
-printf 'type typed %s\ndown again\ndown toggle\nshow\n' "$(printf '우유' | xxd -p)" | ../pure/prototypes/connections/build/pure-run tasks.pmod
-../pure/prototypes/connections/build/pure-run tasks.pmod --store /tmp/tasks < /dev/null   # 상태는 저장소에 남는다
+printf 'type typed %s\ndown again\ndown toggle\nshow\n' "$(printf '우유' | xxd -p)" | ../pure/build/pure-run tasks.pmod
+../pure/build/pure-run tasks.pmod --store /tmp/tasks < /dev/null   # 상태는 저장소에 남는다
 build/aup build examples/editor.aup -o editor.pmod
-../pure/prototypes/connections/build/pure-edit-module --module editor.pmod --store /tmp/docs show note
+../pure/build/pure-edit-module --module editor.pmod --store /tmp/docs show note
 make check                             # Pure 검증, 결정성, 진단, 워크벤치·기존 편집기·text·리스트 참조 모델과의 대조, 재시작을 끼운 영속 대조
 ```
 
-`make check`는 옆의 Pure 체크아웃(`PURE=../pure/prototypes/connections`)의 검증기와 시험 호스트를 쓰고,
+`make check`는 옆의 Pure 체크아웃(`PURE=../pure`)의 검증기와 시험 호스트를 쓰고,
 워크벤치 대조에는 Node가 필요하다.
 
 ## 원칙

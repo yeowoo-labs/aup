@@ -444,9 +444,9 @@ def properties(aup, pure_run, work, rounds):
 
 def editor_parity(aup, pure, work, seeds, operations=160):
     """Differential run of the old and the new editor on separate stores."""
-    old, new = pure / 'build/tree/pure-edit', pure / 'build/pure-edit-module'
-    variants = [('examples/editor.aup', pure / 'examples/editor.pure'),
-                ('examples/bounded-editor.aup', pure / 'examples/bounded-editor.pure')]
+    old, new = pure / 'prototypes/connections/build/tree/pure-edit', pure / 'build/pure-edit-module'
+    variants = [('examples/editor.aup', pure / 'prototypes/connections/examples/editor.pure'),
+                ('examples/bounded-editor.aup', pure / 'prototypes/connections/examples/bounded-editor.pure')]
     compared, outcomes = 0, {}
     for source, program in variants:
         module = work / (Path(source).stem + '.pmod')
@@ -802,7 +802,7 @@ def server_parity(aup, pure, work, seeds, operations=150, threads=1):
     compared = 0
     for seed in seeds:
         rng = random.Random(seed + 13000)
-        old = HttpHost([pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure',
+        old = HttpHost([pure / 'prototypes/connections/build/tree/pure-connections', '--program', pure / 'prototypes/connections/examples/editor.pure',
                         '--store', work / f'http-old-{seed}-{threads}'])
         new = HttpHost([pure / 'build/pure-serve', '--module', module, '--store', work / f'http-new-{seed}-{threads}',
                         '--threads', str(threads)])
@@ -1084,7 +1084,7 @@ def server_bursts(aup, pure, work, clients=8, edits=30, shards=1):
         return threads, start
 
     timings = {}
-    for name, args in [('program', [pure / 'build/tree/pure-connections', '--program', pure / 'examples/editor.pure']),
+    for name, args in [('program', [pure / 'prototypes/connections/build/tree/pure-connections', '--program', pure / 'prototypes/connections/examples/editor.pure']),
                        ('module', [pure / 'build/pure-serve', '--module', module, '--threads', str(shards)])]:
         host = HttpHost(args + ['--store', work / f'bursts-{name}-{shards}'])
         acknowledged = [(0, 0)] * clients
@@ -2319,7 +2319,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--aup', type=Path, required=True)
     parser.add_argument('--pure-run', type=Path, required=True)
-    parser.add_argument('--pure', type=Path, default=ROOT.parent / 'pure' / 'prototypes' / 'connections')
+    parser.add_argument('--pure', type=Path, default=ROOT.parent / 'pure')
     parser.add_argument('--editor-seeds', type=int, default=4)
     parser.add_argument('--text-seeds', type=int, default=12)
     parser.add_argument('--workbench', type=Path, default=ROOT.parent / 'pure' / 'prototypes' / 'workbench')
