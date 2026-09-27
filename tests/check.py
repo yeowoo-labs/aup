@@ -196,8 +196,6 @@ DIAGNOSTICS = [
     (LIST + 'view v = count(x in at)\n', '6:10', "'at' is not a list"),
     ('record T {\n  t: text\n}\nstate xs: list of T\nview v = sum(x.t for x in xs)\n', '5:14',
      'sum, max and min take numbers, not text'),
-    (LIST + 'view w = each r in xs {\n  n = count(x in xs where x.a == r.a)\n}\n', '7:34',
-     "'r' is the column's row; a count, sum, max or min reads only its own item"),
     (LIST + 'fn f(n) = count(x in xs where x.a == n)\nview v = f(1)\n', '6:38',
      "'n' is a parameter outside this count, sum, max or min"),
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
@@ -234,6 +232,8 @@ DIAGNOSTICS = [
 ]
 
 ACCEPTED = [
+    # A fold in a column reads the column's row too (a correlated subquery).
+    LIST + 'view w = each r in xs {\n  n = count(x in xs where x.a == r.a)\n}\n',
     SENDS + 'on buy {\n  n = n + 1\n  send ordered { to: { city: "Seoul" }, count: buy.count, item: buy.item }\n}\nview sent = n\n',
     # fns named like folds stay calls, and max of two values stays max
     'fn sum(a, b) = a + b\nfn count(x) = x\nview v = sum(1, count(2)) + max(3, 4) + min(\n  5,\n  6\n)\n',

@@ -17,7 +17,7 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
-       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND };
+       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW };
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
@@ -1650,10 +1650,10 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (fn_index(c, c->module, e->name) >= 0) return inline_fn(c, e, c->module, e->name, handler, height);
         if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
         if (!c->scope && c->row >= 0 && !strcmp(e->name, c->view_row[c->row])) {
-            if (c->folding)
-                fail_at(c, e->line, e->column, "'%s' is the column's row; a count, sum, max or min reads only its own item", e->name);
+            /* In a count, sum, max or min the column's row is still there (a
+             * correlated fold: per branch, the sum of its accounts). */
             int list = state_index(c, c->view_list[c->row]);
-            emit(c, e->line, e->column, ROW, (uint32_t)list, 0);
+            emit(c, e->line, e->column, c->folding ? OUTER_ROW : ROW, (uint32_t)list, 0);
             return (Kind){INDEX, list};
         }
         int index = state_index(c, e->name);
