@@ -50,6 +50,8 @@ LIST = RECORD + 'state xs: list of T\nstate at: index of xs\n'
 KEYED = 'record T {\n  a = 0\n  s: text\n}\n'
 KEYED_LIST = KEYED + 'state xs: list of T by s\nstate at: index of xs\n'
 
+# A message with rows (a list of a record) beside a list state.
+ROWS = 'record L {\n  item = 0\n  qty = 1\n}\nstate xs: list of L\nstate n = 0\ninput o = message {\n  rows: list of L\n}\n'
 # An app with an output: bought items go out as orders.
 SENDS = ('state n = 0\ninput buy = message {\n  item: text\n  count: u32\n}\noutput ordered = message {\n'
          '  item: text\n  count: u32\n  to: {\n    city: text\n  }\n}\n')
@@ -79,7 +81,7 @@ DIAGNOSTICS = [
     # v0b: messages, keyed documents and types
     ('state d: bytes by key\ninput m = message\non m {\n  reply d[key]\n}\n', '4:9', 'd[key] needs the handler of a message by key'),
     ('input m = message by key { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'reply takes bytes or text, not a number'),
-    ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, number, bytes and text'),
+    ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, number, bytes, text and list of a record'),
     ('input m = message by key\non m.down {\n}\n', '2:4', "'m' is a message; write on m { }"),
     ('input k = key Space\non k {\n}\n', '2:4', "'k' is a key input; write on k.down or on k.up"),
     ('state d: bytes by key\ninput m = message by key { a: bytes }\non m {\n  d[1].replace(0 .. 0, m.a)\n}\n', '4:5',
@@ -229,9 +231,32 @@ DIAGNOSTICS = [
     ('input t = every 1 second\non t.down {\n}\n', '2:4', "'t' is a timer; write on t { }"),
     ('view v = floor(1, 2)\n', '1:10', 'floor expects 1 argument'),
     ('state now = 1\n', '1:7', "'now' is reserved"),
+    # A for walks a list once; a message's rows are a list its handler reads.
+    (ROWS + 'on o {\n  for a in xs {\n    for b in xs {\n      n = n + 1\n    }\n  }\n}\n', '12:5',
+     'a for cannot hold another for'),
+    (ROWS + 'on o {\n  for a in xs {\n    xs.append(L { item: 1 })\n  }\n}\n', '12:5',
+     'a for does not add to the list it walks; add to another list, or after the for'),
+    (ROWS + 'on o {\n  for a in o.rows {\n    reply "x"\n  }\n}\n', '12:5', 'a message replies once: reply after the for'),
+    ('record L {\n  item = 0\n}\noutput o = message {\n  rows: list of L\n}\n', '5:9',
+     'an output sends no rows: send one message a row'),
+    (ROWS + 'view v = o.rows.count\n', '10:10', "the rows of 'o' are only available in its handler"),
+    (ROWS + 'on o {\n  n = o.rows\n}\n', '11:7',
+     "'o.rows' holds a message's rows: walk them (for r in o.rows) or read .count, .first or .last"),
+    (ROWS + 'on o {\n  for a in n {\n  }\n}\n', '11:12', "'n' is a state, not a list"),
+    (ROWS + 'on o {\n  for n in xs {\n  }\n}\n', '11:7', "'n' is already declared as a state"),
+    ('input o = message {\n  rows: list of Nope\n}\n', '2:17', "a list holds a record; 'Nope' is not one"),
 ]
 
 ACCEPTED = [
+    # A message's rows (in a group too) walked with for, a fold reading the walk's item, a walk that removes.
+    'record Line {\n  item = 0\n  qty = 1\n  note: text\n}\nrecord Stock {\n  item = 0\n  left = 0\n}\n'
+    'state stock: list of Stock by item\nstate lines = 0\n'
+    'input order = message {\n  customer: u32\n  lines: list of Line\n  ship: {\n    rows: list of Line\n  }\n}\n'
+    'on order {\n  for l in order.lines where l.qty > 0 {\n    stock[l.item].left = stock[l.item].left - l.qty\n'
+    '    lines = lines + sum(m.qty for m in order.lines where m.item == l.item)\n  }\n'
+    '  lines = lines + order.lines.count + order.ship.rows.count\n}\n'
+    'input clean = key KeyC\non clean.down {\n  for s in stock where s.left <= 0 {\n    stock.remove(s)\n  }\n}\n'
+    'view left = sum(s.left for s in stock)\n',
     # A fold in a column reads the column's row too (a correlated subquery).
     LIST + 'view w = each r in xs {\n  n = count(x in xs where x.a == r.a)\n}\n',
     SENDS + 'on buy {\n  n = n + 1\n  send ordered { to: { city: "Seoul" }, count: buy.count, item: buy.item }\n}\nview sent = n\n',

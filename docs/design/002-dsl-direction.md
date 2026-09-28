@@ -68,7 +68,7 @@ view current = note.line(at)           # 커서가 있는 줄. 복사하지 않�
 |---|---|---|
 | v0a ✅ | 스칼라 상태, 키 입력, 핸들러, 보기 | 워크벤치 엔진과 비트 단위 일치 |
 | v0b ✅ | `bytes`, 키별 영속 문서, `message` 입력, 응답, `require`, `text`(리터럴·보간·`cursor in`·`char`/`line`), `text` 입력 | 기존 편집기 CLI와 바이트 단위 일치, text 편집이 참조 모델과 일치 |
-| v0c | `record`, `list of`, `index of`, 조건식, 항목 투영(`each`), 순수 `fn`, `use` 라이브러리, 집계, 키 있는 리스트(`map`의 자리), text 비교 ✅ / `i64 bool` | 모든 연산에 실행량 상한, 리스트가 참조 모델과 일치 ✅ |
+| v0c | `record`, `list of`, `index of`, 조건식, 항목 투영(`each`), 순수 `fn`, `use` 라이브러리, 집계, 키 있는 리스트(`map`의 자리), text 비교, 걷기(`for`)와 메시지의 행 ✅ / `i64 bool` | 모든 연산에 실행량 상한, 리스트가 참조 모델과 일치 ✅ |
 | v0d ✅ | `use vega`로 첫 인터페이스 투영(목록·표·커서·톤), [Vega 001](/srv/git/vega.git) | 한 명세가 세 표면(TUI·CLI·NUI 문장)에서 동작, 표면은 보이는 칸만 계산 |
 
 ### 구현된 text (v0b)
@@ -290,5 +290,48 @@ vega tui app.pmod --watch         # 실행 중인 앱이 새 모듈로 바뀐다
 검증: 소스 수정, 라이브러리 수정, 라이브러리의 오류와 수정, 앞선 위치에 라이브러리가 생김, 같은 바이트 저장, 두
 번에 나눠 쓴 저장 10회(앞부분만으로도 컴파일되는 소스)에서 빌드된 모듈이 매번 기대한 보기를 낸다. 두 번 읽기를
 빼면 나눠 쓴 저장 검사가 8번 중 8번 실패한다.
+
+### 걷기와 메시지의 행
+
+```text
+record Line {
+  item = 0
+  qty = 1                                # 빠진 필드는 기본값
+  note: text
+}
+input order = message {
+  customer: u32
+  lines: list of Line                    # 메시지의 행: JSON에서는 객체의 배열
+}
+
+on order {
+  for l in order.lines {                 # 행마다 한 번, 순서대로
+    stock[l.item].left = stock[l.item].left - l.qty
+    require stock[l.item].left >= 0      # 한 행이 실패하면 주문 전체가 실패한다
+    log.append(Entry { item: l.item, qty: l.qty })
+  }
+  count = count + order.lines.count
+}
+on clean {
+  for s in stock where s.left <= 0 {     # UPDATE … WHERE, DELETE … WHERE
+    stock.remove(s)
+  }
+}
+```
+
+- **`for 항목 in 리스트 [where 조건] { … }`** 은 핸들러 안에서 리스트가 가진 항목마다 블록을 한 번씩 돈다(Pure의 EACH).
+  항목은 그 리스트의 인덱스라서 `l.qty`로 읽고 `s.left = 0`으로 바꾸며 `stock.remove(s)`로 지운다. 지우면 다음 항목을
+  건너뛰지 않는다. 걷는 리스트에 넣을 수는 없어서(다른 리스트나 `for` 뒤에는 된다) 걷기는 끝난다. 블록 안의 집계는 걷는
+  항목을 읽을 수 있다(`sum(m.qty for m in order.lines where m.item == l.item)`). `for` 안의 `for`와 `reply`는 없다.
+- **메시지의 행.** 메시지 필드의 타입으로 `list of 레코드`를 쓴다. 핸들러에서 `order.lines`는 그 메시지의 행을 담은 리스트다
+  (`for`, 집계, `.count`·`.first`·`.last`). 그 핸들러 밖에서는 쓸 수 없다. 모듈에서는 `order.lines`라는 이름의 행 목록
+  상태가 되고, 이벤트가 끝나면 비워지며 저장되지 않는다(Pure 008). HTTP로는 JSON 객체의 배열로 보내고, 행 필드 하나뿐인
+  메시지는 행을 리스트의 저장 형식 바이트로 보내도 된다(대량 넣기). 출력은 행을 보내지 않는다.
+- 이것으로 여러 행을 한꺼번에 바꾸는 트랜잭션(TPC-C의 주문처럼 행마다 재고를 줄이고 주문 행을 넣는 일)이 이벤트 하나다.
+
+검증: 진단 9건(`for` 안의 `for`, 걷는 리스트에 넣기, `for` 안의 `reply`, 행을 보내는 출력, 핸들러 밖의 행, 값으로 쓴 행, 리스트가
+아닌 것, 이미 선언된 항목 이름, 없는 레코드)과, 그룹 안의 행·`where`·걷는 항목을 읽는 집계·지우는 걷기를 쓴 앱을 Pure가
+받아들이는 것. 실행은 Pure의 `walks`(모델과 대조한 주문·정리 3,000단계)와 `server_rows`(HTTP로 3만 행 한 요청, 무작위 주문
+400개와 모델, 재시작)가 확인한다.
 
 구현은 C로 손수 쓴 재귀 하강 파서를 유지한다. 문법은 EBNF로 문서화하고, 이후 `aup fmt`와 언어 서버를 붙인다.

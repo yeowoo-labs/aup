@@ -17,9 +17,12 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
-       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW };
+       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH };
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
-enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4 };
+enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
+       FIELD_ROWS = 5 };
+/* A list of a message's rows: filled as the message arrives, emptied when its event ends (Pure's flag). */
+enum { LIST_ROWS = 256 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
 typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
@@ -60,11 +63,11 @@ typedef struct Expr {
     size_t size;
 } Expr;
 
-typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND } StmtKind;
+typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
-    char name[NAME], member[NAME]; /* member: the item field an S_SET changes */
+    char name[NAME], member[NAME]; /* member: the item field an S_SET changes; S_FOR: name is the item, member the list */
     Expr *value;          /* assigned value, condition, reply, requirement or insertion */
     Expr *first, *last;   /* a range, the insertion cursor or index, or the item index; last may be NULL */
                           /* S_SET: name is the list, or empty when first is an index naming the item */
@@ -78,6 +81,9 @@ typedef struct {
     bool keyed;
     char field_names[FIELDS][NAME];
     int field_types[FIELDS];
+    /* A rows field's record, where it was written, and the list its rows fill. */
+    char field_record[FIELDS][NAME];
+    int field_line[FIELDS], field_column[FIELDS], field_list[FIELDS];
     unsigned fields;
 } Input;
 
@@ -123,6 +129,7 @@ typedef struct {
     char state_names[STATES][NAME], state_target[STATES][NAME];
     int state_types[STATES], state_line[STATES], state_column[STATES];
     bool state_stays[STATES]; /* a mark: a cursor that stays before text inserted at it */
+    int state_rows[STATES];   /* a list of a message's rows: its input + 1, or 0 */
     /* A keyed list: the field named after by, and once resolved, that field + 1. */
     char state_key[STATES][NAME];
     int state_key_line[STATES], state_key_column[STATES], list_key[STATES];
@@ -154,6 +161,11 @@ typedef struct {
     char fold_name[NAME];
     int fold_list;
     Scope *fold_scope;
+    /* The for whose block is being generated: its item's name and list. */
+    bool walking;
+    char walk_name[NAME];
+    int walk_list;
+    Scope *walk_scope;
     /* Libraries: module 0 is the main source; each module lists the libraries it uses. */
     struct { char name[NAME], path[AUP_PATH]; bool uses[MODULES], parsing; } modules[MODULES];
     unsigned module_count;
@@ -177,7 +189,7 @@ typedef struct {
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
-                                       "floor", "output", "send"};
+                                       "floor", "output", "send", "for"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -595,6 +607,23 @@ static Expr *conditional(Compiler *c, const Token *token) {
     return e;
 }
 
+/* A list's name, or a message's rows as input.field (a group's too). */
+static void list_path(Compiler *c, char out[NAME]) {
+    Token list = expect_name(c, "a list");
+    size_t length = strlen(list.text);
+    memcpy(out, list.text, length + 1);
+    while (is(c, ".") && lookahead(c)->kind == T_NAME) {
+        take(c);
+        Token part = take(c);
+        size_t more = strlen(part.text);
+        if (length + 1 + more >= NAME)
+            fail_at(c, part.line, part.column, "'%s.%s' is longer than %d characters", out, part.text, NAME - 1);
+        out[length++] = '.';
+        memcpy(out + length, part.text, more + 1);
+        length += more;
+    }
+}
+
 /* The rest of a fold, after its value (none for count): for item in list,
  * then an optional where condition, then ')'. */
 static Expr *fold(Compiler *c, const Token *name, int how, Expr *value) {
@@ -606,8 +635,7 @@ static Expr *fold(Compiler *c, const Token *name, int how, Expr *value) {
     if (!word(c, "in")) fail_at(c, c->token.line, c->token.column, "expected 'in' and a list, as in %s(%s in tasks)",
                                 name->text, item.text);
     take(c);
-    Token list = expect_name(c, "a list");
-    memcpy(e->member, list.text, NAME);
+    list_path(c, e->member);
     newlines(c);
     e->args[1] = value;
     if (word(c, "where")) {
@@ -829,6 +857,25 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         }
         return s;
     }
+    if (!strcmp(token.text, "for")) {
+        /* for item in list [where condition] { ... }: the block runs once for every item the list has */
+        s->kind = S_FOR;
+        Token item = expect_name(c, "a name for each item");
+        if (reserved_name(item.text)) fail_at(c, item.line, item.column, "'%s' is reserved", item.text);
+        memcpy(s->name, item.text, NAME);
+        s->last = node(c, E_NAME, item.line, item.column); /* where the item is named */
+        if (!word(c, "in")) fail_at(c, c->token.line, c->token.column, "expected 'in' and a list, as in for %s in tasks { }",
+                                    item.text);
+        take(c);
+        s->first = node(c, E_NAME, c->token.line, c->token.column); /* where the list is named */
+        list_path(c, s->member);
+        if (word(c, "where")) {
+            take(c);
+            s->value = expression(c, 0, false);
+        }
+        s->then = block(c, depth + 1);
+        return s;
+    }
     if (!strcmp(token.text, "send")) {
         /* send output { field: value, ... }: every field of the output, groups as their own braces. */
         s->kind = S_SEND;
@@ -1037,13 +1084,23 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
             continue;
         }
         if (c->field_count == FIELDS) fail_at(c, name.line, name.column, "at most %d message fields are allowed", FIELDS);
-        Token type = expect_name(c, "u32, number, bytes or text");
+        Token type = expect_name(c, "u32, number, bytes, text or list of a record");
         static const struct { const char *name; int type; } types[] = {
             {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
         int field_type = 0;
         for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
             if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
-        if (!field_type) fail_at(c, type.line, type.column, "field types are u32, number, bytes and text");
+        if (!strcmp(type.text, "list")) {
+            /* rows: list of a record, a JSON array of objects; the handler walks them as a list */
+            if (in->kind == KIND_OUTPUT) fail_at(c, type.line, type.column, "an output sends no rows: send one message a row");
+            expect_word(c, "of");
+            Token record = expect_name(c, "a record");
+            memcpy(in->field_record[in->fields], record.text, NAME);
+            in->field_line[in->fields] = record.line;
+            in->field_column[in->fields] = record.column;
+            field_type = FIELD_ROWS;
+        }
+        if (!field_type) fail_at(c, type.line, type.column, "field types are u32, number, bytes, text and list of a record");
         memcpy(in->field_names[in->fields], path, NAME);
         in->field_types[in->fields++] = field_type;
         ++c->field_count;
@@ -1468,7 +1525,11 @@ static int cursor_owner(const Compiler *c, int cursor) { return state_index(c, c
 /* The list state name[...] indexes; where points at the index for a collection. */
 static int list_state(Compiler *c, const char *name, int line, int column, const Expr *where) {
     int index = state_index(c, name);
-    if (index >= 0 && c->state_types[index] == STATE_LIST) return index;
+    if (index >= 0 && c->state_types[index] == STATE_LIST) {
+        if (c->state_rows[index] && c->state_rows[index] - 1 != c->message)
+            fail_at(c, line, column, "the rows of '%s' are only available in its handler", c->inputs[c->state_rows[index] - 1].name);
+        return index;
+    }
     for (unsigned i = 0; i < c->collections; ++i)
         if (!strcmp(c->collection_names[i], name) && where)
             fail_at(c, where->line, where->column, "a collection is indexed by the message key, as in name[key]");
@@ -1601,6 +1662,21 @@ static bool message_path(Compiler *c, const Expr *e, int *input, char path[NAME]
     return true;
 }
 
+/* The list a message's rows fill, when e names them (input.field): only in
+ * that message's handler. -1 otherwise. */
+static int rows_list(Compiler *c, const Expr *e) {
+    int input;
+    char path[NAME];
+    if (!message_path(c, e, &input, path)) return -1;
+    const Input *in = &c->inputs[input];
+    for (unsigned f = 0; f < in->fields; ++f)
+        if (in->field_types[f] == FIELD_ROWS && !strcmp(in->field_names[f], path)) {
+            if (input != c->message) fail_at(c, e->line, e->column, "the rows of '%s' are only available in its handler", in->name);
+            return in->field_list[f];
+        }
+    return -1;
+}
+
 /* A name of the app (a state, input or collection): not visible in a library
  * fn, and hidden by a parameter of the same name. */
 static void app_name(Compiler *c, const Expr *e, const char *name) {
@@ -1638,6 +1714,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (c->folding && c->scope == c->fold_scope && !strcmp(e->name, c->fold_name)) {
             emit(c, e->line, e->column, ROW, (uint32_t)c->fold_list, 0); /* the item a fold's block runs for */
             return (Kind){INDEX, c->fold_list};
+        }
+        if (c->walking && c->scope == c->walk_scope && !strcmp(e->name, c->walk_name)) {
+            /* the item a for's block runs for; in a count, sum, max or min inside it, still there */
+            emit(c, e->line, e->column, c->folding ? OUTER_ROW : ROW, (uint32_t)c->walk_list, 0);
+            return (Kind){INDEX, c->walk_list};
         }
         int param = parameter(c, e->name);
         if (param >= 0 && c->folding && c->scope == c->fold_scope)
@@ -1683,6 +1764,9 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (library >= 0) return inline_fn(c, e, library, e->member, handler, height); /* library.constant */
         int message;
         char path[NAME];
+        if (rows_list(c, e) >= 0)
+            fail_at(c, e->line, e->column, "'%s' holds a message's rows: walk them (for r in %s) or read .count, .first or .last",
+                    c->state_names[rows_list(c, e)], c->state_names[rows_list(c, e)]);
         if (message_path(c, e, &message, path)) {
             const Input *in = &c->inputs[message];
             if (message != c->message)
@@ -1719,6 +1803,16 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 }
                 fail_at(c, e->line, e->column, "a list has count, first and last, not '%s'", m);
             }
+        }
+        int rows = rows_list(c, base);
+        if (rows >= 0) { /* order.lines.count: a message's rows are a list */
+            const char *m = e->member;
+            if (!strcmp(m, "count")) { emit(c, e->line, e->column, LIST_COUNT, (uint32_t)rows, 0); return (Kind){NUM, -1}; }
+            if (!strcmp(m, "first") || !strcmp(m, "last")) {
+                emit(c, e->line, e->column, m[0] == 'f' ? INDEX_FIRST : INDEX_LAST, (uint32_t)rows, 0);
+                return (Kind){INDEX, rows};
+            }
+            fail_at(c, e->line, e->column, "a message's rows have count, first and last, not '%s'", m);
         }
         Kind inner = value(c, base, handler, height);
         const char *m = e->member;
@@ -1847,6 +1941,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         app_name(c, e, e->member);
         int list = state_index(c, e->member);
         if (list < 0 || c->state_types[list] != STATE_LIST) fail_at(c, e->line, e->column, "'%s' is not a list", e->member);
+        list = list_state(c, e->member, e->line, e->column, NULL); /* a message's rows: in its handler */
         if (c->folding) fail_at(c, e->line, e->column, "a count, sum, max or min cannot hold another");
         if (c->filtering) fail_at(c, e->line, e->column, "a table's where cannot hold a count, sum, max or min");
         unsigned at = c->code_count, joins = c->joins;
@@ -1996,6 +2091,8 @@ static void statements(Compiler *c, const Stmt *s) {
             int list = state_index(c, s->name);
             if (list >= 0 && c->state_types[list] == STATE_LIST) {
                 if (s->last) fail_at(c, s->last->line, s->last->column, "a list removes one item, as in %s.remove(index)", s->name);
+                if (s->kind == S_INSERT && c->walking && list == c->walk_list)
+                    fail_at(c, s->line, s->column, "a for does not add to the list it walks; add to another list, or after the for");
                 if (s->kind == S_INSERT && keyed_by(c, list))
                     fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
                             keyed_by(c, list), s->name, record_of(c, list)->name);
@@ -2020,6 +2117,8 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_APPEND: case S_ADD: {
             /* A keyed list places an added item by its key (it fails if the key is there); others append. */
             int list = list_state(c, s->name, s->line, s->column, NULL);
+            if (c->walking && list == c->walk_list)
+                fail_at(c, s->line, s->column, "a for does not add to the list it walks; add to another list, or after the for");
             const char *key = keyed_by(c, list), *record = record_of(c, list)->name;
             if (s->kind == S_APPEND && key)
                 fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
@@ -2078,6 +2177,7 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_REPLY:
             if (c->message < 0 || c->inputs[c->message].kind != KIND_MESSAGE)
                 fail_at(c, s->line, s->column, "reply is only available in a message handler");
+            if (c->walking) fail_at(c, s->line, s->column, "a message replies once: reply after the for");
             bytes_value(c, s->value, 0, "reply");
             emit(c, s->line, s->column, REPLY, 0, 0);
             break;
@@ -2085,6 +2185,30 @@ static void statements(Compiler *c, const Stmt *s) {
             number(c, s->value, true, 0);
             emit(c, s->line, s->column, REQUIRE, 0, 0);
             break;
+        case S_FOR: {
+            /* EACH and the block after it, run once for every item the list has, with the item as ROW. */
+            if (c->walking) fail_at(c, s->line, s->column, "a for cannot hold another for");
+            int list = list_state(c, s->member, s->first->line, s->first->column, NULL);
+            const char *kind = declared_kind(c, s->name);
+            if (kind) fail_at(c, s->last->line, s->last->column, "'%s' is already declared as %s", s->name, kind);
+            unsigned at = c->code_count, jump = 0;
+            emit(c, s->line, s->column, EACH, 0, 0);
+            c->walking = true;
+            c->walk_list = list;
+            c->walk_scope = c->scope;
+            memcpy(c->walk_name, s->name, NAME);
+            if (s->value) {
+                number(c, s->value, true, 0);
+                jump = c->code_count;
+                emit(c, s->line, s->column, JZ, 0, 0);
+            }
+            statements(c, s->then);
+            if (s->value) c->code[jump].arg = c->code_count;
+            c->walking = false;
+            if (c->code_count == at + 1) c->code_count = at; /* nothing to do for any item */
+            else c->code[at].arg = (uint32_t)list << 8 | (c->code_count - at - 1) << 16;
+            break;
+        }
         case S_IF: {
             number(c, s->value, true, 0);
             unsigned jump = c->code_count;
@@ -2133,9 +2257,35 @@ static uint32_t intern(unsigned char *strings, size_t *used, const char *text) {
     return offset;
 }
 
+/* A message's rows field fills a list of its own, named by the input and the
+ * field (order.lines): a state that holds rows only while its event runs. */
+static void rows_lists(Compiler *c) {
+    for (unsigned i = 0; i < c->input_count; ++i) {
+        Input *in = &c->inputs[i];
+        for (unsigned f = 0; f < in->fields; ++f) {
+            if (in->field_types[f] != FIELD_ROWS) continue;
+            char name[2 * NAME + 2];
+            int length = snprintf(name, sizeof(name), "%s.%s", in->name, in->field_names[f]);
+            if (length < 0 || length >= NAME)
+                fail_at(c, in->field_line[f], in->field_column[f], "'%s' is longer than %d characters", name, NAME - 1);
+            if (c->states == STATES)
+                fail_at(c, in->field_line[f], in->field_column[f], "at most 32 states are allowed (a message's rows take one)");
+            unsigned index = c->states++;
+            memcpy(c->state_names[index], name, (size_t)length + 1);
+            memcpy(c->state_target[index], in->field_record[f], NAME);
+            c->state_types[index] = STATE_LIST;
+            c->state_line[index] = in->field_line[f];
+            c->state_column[index] = in->field_column[f];
+            c->state_rows[index] = (int)i + 1;
+            in->field_list[f] = (int)index;
+        }
+    }
+}
+
 static void generate(Compiler *c, unsigned char **module, size_t *size) {
     uint32_t events[HANDLERS], state_ref[STATES] = {0};
     int handler_input[HANDLERS];
+    rows_lists(c);
     for (unsigned i = 0; i < c->states; ++i) {
         if (c->state_types[i] == STATE_TEXT) {
             Expr empty = {.kind = E_TEXT, .line = c->state_line[i], .column = c->state_column[i]};
@@ -2271,7 +2421,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         if (c->state_types[i] == STATE_NUM) p = put_double(p, c->initial[i]);
         else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */
             p = put32(p, state_ref[i]);
-            p = put32(p, c->state_types[i] == STATE_LIST ? (uint32_t)c->list_key[i] : c->state_stays[i] ? 1 : 0);
+            p = put32(p, c->state_types[i] == STATE_LIST ? (c->state_rows[i] ? LIST_ROWS : (uint32_t)c->list_key[i]) :
+                         c->state_stays[i] ? 1 : 0);
         }
     }
     for (unsigned i = 0; i < c->collections; ++i) { p = put32(p, collection_name[i]); p = put32(p, 1); p = put32(p, 1); }
@@ -2291,7 +2442,9 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->input_count; ++i)
         for (unsigned f = 0; f < c->inputs[i].fields; ++f) {
             p = put32(p, field_name[fields++]);
-            p = put32(p, (uint32_t)c->inputs[i].field_types[f]);
+            /* a rows field names the list its rows fill */
+            p = put32(p, (uint32_t)c->inputs[i].field_types[f] |
+                             (c->inputs[i].field_types[f] == FIELD_ROWS ? (uint32_t)c->inputs[i].field_list[f] << 8 : 0));
         }
     for (unsigned i = 0; i < c->constants; ++i) { p = put32(p, c->constant_offset[i]); p = put32(p, c->constant_length[i]); }
     first = 0;
