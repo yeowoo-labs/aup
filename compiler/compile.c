@@ -19,7 +19,8 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH };
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
-enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
+enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6,
+       FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
        FIELD_ROWS = 5 };
 /* A list of a message's rows: filled as the message arrives, emptied when its event ends (Pure's flag). */
 enum { LIST_ROWS = 256 };
@@ -85,6 +86,7 @@ typedef struct {
     char field_record[FIELDS][NAME];
     int field_line[FIELDS], field_column[FIELDS], field_list[FIELDS];
     unsigned fields;
+    unsigned view; /* arguments: the view they are for */
 } Input;
 
 /* A record: fields in order, each a number or text with its default. */
@@ -148,12 +150,14 @@ typedef struct {
     Expr *view_filter[VIEWS];                         /* a table's where condition, or NULL */
     unsigned char view_byte[VIEWS];                   /* a filtered table's list + 1 */
     int view_table[VIEWS];                            /* a column's table + 1, or 0 */
+    int view_arguments[VIEWS];                        /* the input of a view's arguments + 1, or 0 */
     int view_line[VIEWS][2], view_column[VIEWS][2];   /* a table's row name and list name */
     unsigned views;
     struct { char input[NAME]; int edge, line, column; Stmt *body; } handlers[HANDLERS];
     unsigned handler_count;
     /* Code generation. */
     int message;          /* message or text input of the handler being generated, or -1 */
+    int arguments;        /* the arguments' input of the view being generated (its table's), or -1 */
     int row;              /* the table whose column is being generated, or -1 */
     /* The fold whose block is being generated: its item's name and list, and
      * the fn scope it began in (whose parameters its block cannot read). */
@@ -1365,6 +1369,51 @@ static void library_declaration(Compiler *c) {
     end(c);
 }
 
+/* (name: type, ...) after a view's name: its arguments, the fields of an
+ * input of their own named view.args, which a request gives (?name=value). */
+static void view_arguments(Compiler *c, unsigned view, const Token *name) {
+    take(c); /* ( */
+    if (c->input_count == INPUTS) fail_at(c, name->line, name->column, "at most 32 inputs are allowed (a view's arguments take one)");
+    Input *in = &c->inputs[c->input_count];
+    memset(in, 0, sizeof(*in));
+    if (strlen(name->text) + 5 >= NAME)
+        fail_at(c, name->line, name->column, "a view with arguments has a name of at most %d characters", NAME - 6);
+    snprintf(in->name, NAME, "%s.args", name->text);
+    in->kind = KIND_ARGUMENTS;
+    in->view = view;
+    newlines(c);
+    while (!is(c, ")")) {
+        Token argument = expect_name(c, "an argument name");
+        if (reserved_name(argument.text)) fail_at(c, argument.line, argument.column, "'%s' is reserved", argument.text);
+        if (!strcmp(argument.text, "from") || !strcmp(argument.text, "count"))
+            fail_at(c, argument.line, argument.column, "from and count page a view's rows; name the argument otherwise");
+        for (unsigned f = 0; f < in->fields; ++f)
+            if (!strcmp(in->field_names[f], argument.text))
+                fail_at(c, argument.line, argument.column, "duplicate argument '%s'", argument.text);
+        expect(c, ":", "':'");
+        Token type = expect_name(c, "u32, number, bytes or text");
+        static const struct { const char *name; int type; } types[] = {
+            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
+        int field_type = 0;
+        for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
+            if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
+        if (!field_type) fail_at(c, type.line, type.column, "an argument is a u32, number, bytes or text");
+        if (c->field_count == FIELDS) fail_at(c, argument.line, argument.column, "at most %d message fields are allowed", FIELDS);
+        memcpy(in->field_names[in->fields], argument.text, NAME);
+        in->field_line[in->fields] = argument.line;
+        in->field_column[in->fields] = argument.column;
+        in->field_types[in->fields++] = field_type;
+        ++c->field_count;
+        newlines(c);
+        if (!is(c, ",")) break;
+        take(c);
+        newlines(c);
+    }
+    expect(c, ")", "')'");
+    if (!in->fields) fail_at(c, name->line, name->column, "'%s()' takes no argument: write view %s = ...", name->text, name->text);
+    c->view_arguments[view] = (int)++c->input_count;
+}
+
 static void declaration(Compiler *c) {
     Token kind = expect_name(c, "state, record, input, output, view, fn, use, or on");
     if (!strcmp(kind.text, "fn")) {
@@ -1441,8 +1490,9 @@ static void declaration(Compiler *c) {
         Token name = expect_name(c, "view name");
         declare(c, &name);
         if (c->views == VIEWS) fail_at(c, name.line, name.column, "at most 64 views are allowed");
-        expect(c, "=", "'='");
         unsigned index = c->views++;
+        if (is(c, "(")) view_arguments(c, index, &name);
+        expect(c, "=", "'='");
         memcpy(c->view_names[index], name.text, NAME);
         if (!word(c, "each")) c->view_value[index] = expression(c, 0, false);
         else table_declaration(c, index);
@@ -1730,6 +1780,15 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         }
         if (fn_index(c, c->module, e->name) >= 0) return inline_fn(c, e, c->module, e->name, handler, height);
         if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
+        if (!c->scope && c->arguments >= 0) { /* an argument of the view (a table's, in its columns and filter) */
+            const Input *in = &c->inputs[c->arguments];
+            for (unsigned f = 0; f < in->fields; ++f)
+                if (!strcmp(in->field_names[f], e->name)) {
+                    emit(c, e->line, e->column, FIELD, f, 0);
+                    int type = in->field_types[f];
+                    return (Kind){type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : NUM, -1};
+                }
+        }
         if (!c->scope && c->row >= 0 && !strcmp(e->name, c->view_row[c->row])) {
             /* In a count, sum, max or min the column's row is still there (a
              * correlated fold: per branch, the sum of its accounts). */
@@ -2337,6 +2396,18 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         handler_input[i] = input;
         events[i] = 1u + 2u * (uint32_t)input + (c->handlers[i].edge > 0);
     }
+    /* A view's argument names nothing else the view reads: not a state or
+     * another declaration, not its table's row. */
+    for (unsigned i = 0; i < c->views; ++i) {
+        if (!c->view_arguments[i]) continue;
+        const Input *in = &c->inputs[c->view_arguments[i] - 1];
+        for (unsigned f = 0; f < in->fields; ++f) {
+            const char *kind = declared_kind(c, in->field_names[f]);
+            if (kind) fail_at(c, in->field_line[f], in->field_column[f], "'%s' is already declared as %s", in->field_names[f], kind);
+            if (!c->view_value[i] && !strcmp(c->view_row[i], in->field_names[f]))
+                fail_at(c, in->field_line[f], in->field_column[f], "'%s' names the table's row", in->field_names[f]);
+        }
+    }
     /* Views, then handlers, each as one contiguous block. A table names its
      * list in place of code; its columns may read its row. */
     c->message = -1;
@@ -2351,6 +2422,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (c->view_filter[i]) {
                 /* The filter runs as a column of the list: it reads the table's row. */
                 c->row = (int)i;
+                c->arguments = c->view_arguments[i] - 1;
                 c->filtering = true;
                 c->view_code[i][0] = c->code_count;
                 number(c, c->view_filter[i], false, 0);
@@ -2361,6 +2433,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             continue;
         }
         c->row = c->view_table[i] - 1;
+        c->arguments = c->view_arguments[c->row >= 0 ? (unsigned)c->row : i] - 1;
         c->view_code[i][0] = c->code_count;
         Kind kind = value(c, c->view_value[i], false, 0);
         if (kind.type != NUM && kind.type != TEXT)
@@ -2370,6 +2443,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         c->view_code[i][1] = c->code_count - c->view_code[i][0];
     }
     c->row = -1;
+    c->arguments = -1;
     c->fold_list = -1;
     for (unsigned i = 0; i < c->handler_count; ++i) {
         int input = handler_input[i];
@@ -2433,8 +2507,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         *p++ = (unsigned char)in->kind;
         *p++ = in->keyed;
         p = put16(p, 0);
-        p = put32(p, in->kind == KIND_TIMER ? in->period : input_key[i]);
-        p = put16(p, in->kind == KIND_MESSAGE || in->kind == KIND_OUTPUT ? first : 0);
+        p = put32(p, in->kind == KIND_TIMER ? in->period : in->kind == KIND_ARGUMENTS ? in->view : input_key[i]);
+        p = put16(p, in->kind == KIND_MESSAGE || in->kind == KIND_OUTPUT || in->kind == KIND_ARGUMENTS ? first : 0);
         p = put16(p, in->fields);
         first += in->fields;
     }
@@ -2496,6 +2570,7 @@ bool aup_compile(const char *source, size_t length, AupLoad load, void *context,
     c->line = c->column = 1;
     c->error = error;
     c->row = -1;
+    c->arguments = -1;
     c->fold_list = -1;
     c->load = load;
     c->load_context = context;

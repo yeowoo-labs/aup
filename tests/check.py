@@ -50,6 +50,8 @@ LIST = RECORD + 'state xs: list of T\nstate at: index of xs\n'
 KEYED = 'record T {\n  a = 0\n  s: text\n}\n'
 KEYED_LIST = KEYED + 'state xs: list of T by s\nstate at: index of xs\n'
 
+# A list and a number beside views with arguments.
+ARGS = 'record T {\n  a = 0\n}\nstate xs: list of T\nstate n = 0\n'
 # A message with rows (a list of a record) beside a list state.
 ROWS = 'record L {\n  item = 0\n  qty = 1\n}\nstate xs: list of L\nstate n = 0\ninput o = message {\n  rows: list of L\n}\n'
 # An app with an output: bought items go out as orders.
@@ -245,9 +247,27 @@ DIAGNOSTICS = [
     (ROWS + 'on o {\n  for a in n {\n  }\n}\n', '11:12', "'n' is a state, not a list"),
     (ROWS + 'on o {\n  for n in xs {\n  }\n}\n', '11:7', "'n' is already declared as a state"),
     ('input o = message {\n  rows: list of Nope\n}\n', '2:17', "a list holds a record; 'Nope' is not one"),
+    # A view's arguments are named, typed, its own, and only its.
+    (ARGS + 'view v(from: u32) = from\n', '6:8', "from and count page a view's rows; name the argument otherwise"),
+    (ARGS + 'view v(k: u32, k: u32) = k\n', '6:16', "duplicate argument 'k'"),
+    (ARGS + 'view v(n: u32) = n\n', '6:8', "'n' is already declared as a state"),
+    (ARGS + 'view t(r: u32) = each r in xs {\n  a = r.a\n}\n', '6:8', "'r' names the table's row"),
+    (ARGS + 'view v(k: list) = 1\n', '6:11', 'an argument is a u32, number, bytes or text'),
+    (ARGS + 'view v() = 1\n', '6:6', "'v()' takes no argument: write view v = ..."),
+    (ARGS + 'view averylongviewnamethatistoolong(k: u32) = k\n', '6:6',
+     'a view with arguments has a name of at most 26 characters'),
+    (ARGS + 'view v(k: u32) = k\nview w = k\n', '7:10', "unknown state 'k'"),
 ]
 
 ACCEPTED = [
+    # Views with arguments: a keyed lookup, a fold and a filtered table reading them, texts, a handler's fold reading its message.
+    'record A {\n  aid = 0\n  bid = 0\n  balance = 0\n  owner: text\n}\nstate accounts: list of A by aid\nstate seen = 0\n'
+    'input pay = message {\n  bid: u32\n}\non pay {\n  seen = count(a in accounts where a.bid == pay.bid)\n}\n'
+    'view balance(aid: u32) = accounts[aid].balance\nview richer(low: number) = count(a in accounts where a.balance > low)\n'
+    'view hello(name: text, times: u32) = "{name} x{times}"\n'
+    'view branch(b: u32, over: number) = each a in accounts where a.bid == b && a.balance > over {\n  aid = a.aid\n'
+    '  share = a.balance / sum(x.balance for x in accounts where x.bid == b)\n  owner = a.owner\n}\n'
+    'view owned(who: text) = count(a in accounts where a.owner == who)\n',
     # A message's rows (in a group too) walked with for, a fold reading the walk's item, a walk that removes.
     'record Line {\n  item = 0\n  qty = 1\n  note: text\n}\nrecord Stock {\n  item = 0\n  left = 0\n}\n'
     'state stock: list of Stock by item\nstate lines = 0\n'

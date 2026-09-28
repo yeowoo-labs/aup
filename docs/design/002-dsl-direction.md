@@ -334,4 +334,24 @@ on clean {
 받아들이는 것. 실행은 Pure의 `walks`(모델과 대조한 주문·정리 3,000단계)와 `server_rows`(HTTP로 3만 행 한 요청, 무작위 주문
 400개와 모델, 재시작)가 확인한다.
 
+### 인자를 받는 보기
+
+```text
+view balance(aid: u32) = accounts[aid].balance
+view richer(low: number) = count(a in accounts where a.balance > low)
+view branch(b: u32, over: number) = each a in accounts where a.bid == b && a.balance > over {
+  aid = a.aid
+  share = a.balance / sum(x.balance for x in accounts where x.bid == b)
+}
+```
+
+- **보기는 인자를 받는 함수다.** `view 이름(인자: 타입, …) = …`의 인자는 u32, number, bytes, text이고, 보기 안에서(표라면 그 필터와
+  열, 그 안의 집계에서도) 이름으로 읽는다. HTTP로는 `GET /views/balance?aid=42`, 표는 `?b=1&over=0&from=20&count=20`이다. 등록한
+  질의(`aup query`)도 인자를 받는다. 인자 이름은 상태나 다른 선언, 표의 행과 겹칠 수 없고 `from`·`count`는 쪽 나누기의 몫이다.
+- 모듈에서는 `balance.args`라는 인자 입력이 보기를 가리키고, 보기는 메시지 핸들러가 필드를 읽듯 인자를 읽는다(Pure 008).
+- 집계 안에서도 둘레의 인자와 메시지 필드를 읽는다. 그래서 핸들러의 `count(a in accounts where a.bid == pay.bid)`도 된다.
+
+검증: 진단 8건(쪽 나누기 이름, 중복, 상태와 겹침, 표의 행과 겹침, 타입, 빈 괄호, 긴 이름, 보기 밖에서 쓴 인자)과 인자를 받는
+보기들을 쓴 앱. HTTP는 Pure의 `server_arguments`가 모델과 대조한다.
+
 구현은 C로 손수 쓴 재귀 하강 파서를 유지한다. 문법은 EBNF로 문서화하고, 이후 `aup fmt`와 언어 서버를 붙인다.
