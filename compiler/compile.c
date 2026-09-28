@@ -53,7 +53,8 @@ typedef enum {
     E_RECORD,  /* name { fields }: E_FIELD nodes linked from args[0] */
     E_FIELD,   /* member: args[0] */
     E_IF,      /* if args[0] { args[1] } else { args[2] } */
-    E_FOLD,    /* op(args[1] for name in member where args[0]): count, first (no value), sum, max, min */
+    E_FOLD,    /* op(args[1] for name in member[args[2] .. args[3]] where args[0]): count, first (no value), sum, max, min,
+                  distinct; args[2] and args[3], when given, slice a list keyed by a number */
 } ExprKind;
 typedef struct Expr {
     ExprKind kind;
@@ -74,6 +75,7 @@ typedef struct Stmt {
     char name[NAME], member[NAME]; /* member: the item field an S_SET changes; S_FOR: name is the item, member the list */
     Expr *value;          /* assigned value, condition, reply, requirement or insertion */
     Expr *first, *last;   /* a range, the insertion cursor or index, or the item index; last may be NULL */
+    Expr *low, *high;     /* S_FOR: a slice of the list's keys, or NULL */
                           /* S_SET: name is the list, or empty when first is an index naming the item */
     struct Stmt *then, *otherwise, *next;
 } Stmt;
@@ -617,6 +619,17 @@ static Expr *conditional(Compiler *c, const Token *token) {
     return e;
 }
 
+/* [low .. high] after a list: the items whose keys are from low up to before high. */
+static void slice(Compiler *c, Expr **low, Expr **high) {
+    take(c); /* [ */
+    *low = expression(c, 0, true);
+    newlines(c);
+    expect(c, "..", "'..'");
+    *high = expression(c, 0, true);
+    newlines(c);
+    expect(c, "]", "']'");
+}
+
 /* A list's name, or a message's rows as input.field (a group's too). */
 static void list_path(Compiler *c, char out[NAME]) {
     Token list = expect_name(c, "a list");
@@ -646,6 +659,7 @@ static Expr *fold(Compiler *c, const Token *name, int how, Expr *value) {
                                 name->text, item.text);
     take(c);
     list_path(c, e->member);
+    if (is(c, "[")) slice(c, &e->args[2], &e->args[3]);
     newlines(c);
     e->args[1] = value;
     if (word(c, "where")) {
@@ -892,6 +906,7 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         take(c);
         s->first = node(c, E_NAME, c->token.line, c->token.column); /* where the list is named */
         list_path(c, s->member);
+        if (is(c, "[")) slice(c, &s->low, &s->high);
         if (word(c, "where")) {
             take(c);
             s->value = expression(c, 0, false);
@@ -2039,6 +2054,13 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         list = list_state(c, e->member, e->line, e->column, NULL); /* a message's rows: in its handler */
         if (c->folding) fail_at(c, e->line, e->column, "a count, sum, max or min cannot hold another");
         if (c->filtering) fail_at(c, e->line, e->column, "a table's where cannot hold a count, sum, max or min");
+        bool sliced = e->args[2] != NULL;
+        if (sliced) { /* the keys from low up to before high, found by key */
+            if (!keyed_by(c, list) || record_of(c, list)->field_text[c->list_key[list] - 1])
+                fail_at(c, e->line, e->column, "'%s' is not keyed by a number: a slice takes one", e->member);
+            number(c, e->args[2], handler, height);
+            number(c, e->args[3], handler, height + 1);
+        }
         unsigned at = c->code_count, joins = c->joins;
         emit(c, e->line, e->column, FOLD, 0, 0);
         c->folding = true;
@@ -2058,7 +2080,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         c->folding = false;
         c->fold_list = -1;
         c->joins = joins;
-        c->code[at].arg = (uint32_t)e->op | (uint32_t)list << 8 | (uint32_t)(c->code_count - at - 1) << 16;
+        c->code[at].arg = (uint32_t)e->op | (sliced ? 0x80u : 0) | (uint32_t)list << 8 | (uint32_t)(c->code_count - at - 1) << 16;
         return e->op == FOLD_FIRST ? (Kind){INDEX, list} : (Kind){NUM, -1};
     }
     case E_RECORD: case E_FIELD:
@@ -2314,6 +2336,12 @@ static void statements(Compiler *c, const Stmt *s) {
             int list = list_state(c, s->member, s->first->line, s->first->column, NULL);
             const char *kind = declared_kind(c, s->name);
             if (kind) fail_at(c, s->last->line, s->last->column, "'%s' is already declared as %s", s->name, kind);
+            if (s->low) { /* a slice: the keys from low up to before high */
+                if (!keyed_by(c, list) || record_of(c, list)->field_text[c->list_key[list] - 1])
+                    fail_at(c, s->first->line, s->first->column, "'%s' is not keyed by a number: a slice takes one", s->member);
+                number(c, s->low, true, 0);
+                number(c, s->high, true, 1);
+            }
             unsigned at = c->code_count, jump = 0;
             emit(c, s->line, s->column, EACH, 0, 0);
             c->walking = true;
@@ -2328,8 +2356,15 @@ static void statements(Compiler *c, const Stmt *s) {
             statements(c, s->then);
             if (s->value) c->code[jump].arg = c->code_count;
             c->walking = false;
-            if (c->code_count == at + 1) c->code_count = at; /* nothing to do for any item */
-            else c->code[at].arg = (uint32_t)list << 8 | (c->code_count - at - 1) << 16;
+            bool empty = c->code_count == at + 1;
+            if (empty && !s->low) c->code_count = at; /* nothing to do for any item */
+            else {
+                if (empty) { /* a slice's keys were computed (they fault or not): a block that does nothing */
+                    emit(c, s->line, s->column, CONST, 0, 0);
+                    emit(c, s->line, s->column, JZ, c->code_count + 1, 0);
+                }
+                c->code[at].arg = (uint32_t)list << 8 | (s->low ? 1u : 0) | (c->code_count - at - 1) << 16;
+            }
             break;
         }
         case S_IF: {

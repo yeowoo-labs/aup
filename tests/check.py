@@ -270,6 +270,9 @@ DIAGNOSTICS = [
     (LETS + 'on k.down {\n  for r in xs {\n    let r = 1\n  }\n}\n', '11:9', "'r' is the item this for walks"),
     (LETS + 'view v = x\non k.down {\n  let x = 1\n}\n', '9:10', "unknown state 'x'"),
     (LETS + 'on k.down {\n  let let = 1\n}\n', '10:7', "'let' is reserved"),
+    # A slice takes a list keyed by a number.
+    (LETS + 'view v = count(x in xs[0 .. 3])\n', '9:10', "'xs' is not keyed by a number: a slice takes one"),
+    (LETS + 'on k.down {\n  for x in xs[0 .. 1] {\n    n = 1\n  }\n}\n', '10:12', "'xs' is not keyed by a number: a slice takes one"),
 ]
 
 ACCEPTED = [
@@ -279,6 +282,11 @@ ACCEPTED = [
     '  for l in lines where l.id >= start && l.id < start + 16 {\n    l.done = 1\n  }\n}\n'
     'view items(order: u32) = distinct(l.item for l in lines where l.id >= order * 16 && l.id < order * 16 + 16)\n'
     'view level = distinct(l.item for l in lines where l.qty < 10)\n',
+    # Slices: a fold over the keys of one order whose test may fault, a walk over them, one that does nothing.
+    'record L {\n  id = 0\n  item = 0\n  qty = 0\n}\nrecord S {\n  id = 0\n  quantity = 0\n}\nstate lines: list of L by id\n'
+    'state stock: list of S by id\ninput k = message {\n  o: u32\n}\n'
+    'view level(o: u32, t: number) = distinct(l.item for l in lines[o * 16 .. o * 16 + 16] where stock[l.item].quantity < t)\n'
+    'on k {\n  for l in lines[k.o * 16 .. k.o * 16 + 16] {\n    l.qty = 0\n  }\n  for l in lines[0 .. 1] {\n  }\n}\n',
     # Lets: a sum in a for, an index let changing an item, a let in a for, one read in a fold, one per branch.
     'record Stock {\n  item = 0\n  left = 0\n  price = 0\n}\nrecord Line {\n  item = 0\n  qty = 1\n}\n'
     'state stock: list of Stock by item\nstate revenue = 0\nstate sold = 0\ninput order = message {\n  lines: list of Line\n}\n'
