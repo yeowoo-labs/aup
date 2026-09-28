@@ -50,6 +50,9 @@ LIST = RECORD + 'state xs: list of T\nstate at: index of xs\n'
 KEYED = 'record T {\n  a = 0\n  s: text\n}\n'
 KEYED_LIST = KEYED + 'state xs: list of T by s\nstate at: index of xs\n'
 
+# Two lists, a number, a text and a key for lets.
+LETS = ('record T {\n  a = 0\n}\nstate xs: list of T\nstate ys: list of T\nstate n = 0\nstate t: text\n'
+        'input k = key KeyK\n')
 # A list and a number beside views with arguments.
 ARGS = 'record T {\n  a = 0\n}\nstate xs: list of T\nstate n = 0\n'
 # A message with rows (a list of a record) beside a list state.
@@ -257,9 +260,27 @@ DIAGNOSTICS = [
     (ARGS + 'view averylongviewnamethatistoolong(k: u32) = k\n', '6:6',
      'a view with arguments has a name of at most 26 characters'),
     (ARGS + 'view v(k: u32) = k\nview w = k\n', '7:10', "unknown state 'k'"),
+    # A let holds a number or an index for the rest of its block, in its handler.
+    (LETS + 'on k.down {\n  let n = 1\n}\n', '10:7', "'n' is already declared as a state"),
+    (LETS + 'on k.down {\n  let x = 1\n  let x = 2\n}\n', '11:7', "'x' is already a let here"),
+    (LETS + 'on k.down {\n  let x = t\n}\n', '10:11', 'a let holds a number or an index, not text'),
+    (LETS + 'on k.down {\n  let x = 1\n  x = xs.first\n}\n', '11:7', "'x' holds a number"),
+    (LETS + 'on k.down {\n  let i = xs.first\n  i = ys.first\n}\n', '11:7', "'i' holds an index of its list"),
+    (LETS + 'on k.down {\n  if n > 0 {\n    let x = 1\n  }\n  n = x\n}\n', '13:7', "unknown state 'x'"),
+    (LETS + 'on k.down {\n  for r in xs {\n    let r = 1\n  }\n}\n', '11:9', "'r' is the item this for walks"),
+    (LETS + 'view v = x\non k.down {\n  let x = 1\n}\n', '9:10', "unknown state 'x'"),
+    (LETS + 'on k.down {\n  let let = 1\n}\n', '10:7', "'let' is reserved"),
 ]
 
 ACCEPTED = [
+    # Lets: a sum in a for, an index let changing an item, a let in a for, one read in a fold, one per branch.
+    'record Stock {\n  item = 0\n  left = 0\n  price = 0\n}\nrecord Line {\n  item = 0\n  qty = 1\n}\n'
+    'state stock: list of Stock by item\nstate revenue = 0\nstate sold = 0\ninput order = message {\n  lines: list of Line\n}\n'
+    'on order {\n  let total = 0\n  let count = 0\n  for l in order.lines {\n    let s = stock[l.item]\n'
+    '    s.left = s.left - l.qty\n    require s.left >= 0\n    total = total + l.qty * s.price\n    count = count + l.qty\n  }\n'
+    '  let extra = sum(l.qty for l in order.lines where l.qty > total)\n  if extra > 0 {\n    let bonus = extra * 2\n'
+    '    revenue = revenue + bonus\n  } else {\n    let bonus = stock.first\n    bonus.left = bonus.left + 1\n  }\n'
+    '  revenue = revenue + total\n  sold = sold + count\n}\n',
     # Views with arguments: a keyed lookup, a fold and a filtered table reading them, texts, a handler's fold reading its message.
     'record A {\n  aid = 0\n  bid = 0\n  balance = 0\n  owner: text\n}\nstate accounts: list of A by aid\nstate seen = 0\n'
     'input pay = message {\n  bid: u32\n}\non pay {\n  seen = count(a in accounts where a.bid == pay.bid)\n}\n'

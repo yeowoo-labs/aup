@@ -334,6 +334,27 @@ on clean {
 받아들이는 것. 실행은 Pure의 `walks`(모델과 대조한 주문·정리 3,000단계)와 `server_rows`(HTTP로 3만 행 한 요청, 무작위 주문
 400개와 모델, 재시작)가 확인한다.
 
+### let
+
+```text
+on order {
+  let total = 0                          # 수
+  for l in order.lines {
+    let s = stock[l.item]                # 인덱스: 그 항목을 가리킨다
+    s.left = s.left - l.qty
+    total = total + l.qty * s.price      # let은 다시 줄 수 있다(같은 종류로)
+  }
+  revenue = revenue + total + sum(l.qty for l in order.lines where l.qty > total)
+}
+```
+
+- **`let 이름 = 값`** 은 핸들러 안에서 수나 인덱스 하나를 블록 끝까지 이름 붙인다. 같은 종류의 값으로 다시 줄 수 있고(`total = …`),
+  안쪽의 `for`와 집계에서 읽는다. 상태가 아니라 저장되지 않고 이벤트마다 새로 시작한다(Pure의 LOCAL_LOAD·LOCAL_STORE, 이벤트의 칸
+  64개). 그래서 행마다 같은 항목을 다시 찾지 않고, 걷기 안에서 값을 모을 수 있다. text는 담지 않는다(text는 상태에 둔다).
+- 이름은 선언된 이름, 블록 안의 다른 let, 걷는 항목과 겹칠 수 없다. 보기에는 let이 없다(보기는 식 하나다).
+
+검증: 진단 9건과, 걷기 안의 합, 항목을 바꾸는 인덱스 let, 걷기 안의 let, 집계가 읽는 let, 가지마다의 let을 쓴 앱.
+
 ### 인자를 받는 보기
 
 ```text

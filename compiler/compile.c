@@ -17,7 +17,9 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
-       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH };
+       PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
+       LOCAL_LOAD, LOCAL_STORE };
+enum { LOCALS = 64 }; /* an event's locals (Pure's) */
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6,
        FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
@@ -64,7 +66,8 @@ typedef struct Expr {
     size_t size;
 } Expr;
 
-typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR } StmtKind;
+typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
+               S_LET } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
@@ -165,6 +168,9 @@ typedef struct {
     char fold_name[NAME];
     int fold_list;
     Scope *fold_scope;
+    /* A handler's locals in scope (let), innermost last, and the slots it used. */
+    struct { char name[NAME]; unsigned slot; Kind kind; } locals[LOCALS];
+    unsigned local_count, local_slots;
     /* The for whose block is being generated: its item's name and list. */
     bool walking;
     char walk_name[NAME];
@@ -193,7 +199,7 @@ typedef struct {
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
-                                       "floor", "output", "send", "for"};
+                                       "floor", "output", "send", "for", "let"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -859,6 +865,18 @@ static Stmt *statement(Compiler *c, unsigned depth) {
             if (word(c, "if")) s->otherwise = statement(c, depth + 1);
             else s->otherwise = block(c, depth + 1);
         }
+        return s;
+    }
+    if (!strcmp(token.text, "let")) {
+        /* let name = value: a number or an index, for the rest of the block */
+        s->kind = S_LET;
+        Token name = expect_name(c, "a name");
+        if (reserved_name(name.text)) fail_at(c, name.line, name.column, "'%s' is reserved", name.text);
+        memcpy(s->name, name.text, NAME);
+        s->line = name.line;
+        s->column = name.column;
+        expect(c, "=", "'='");
+        s->value = expression(c, 0, false);
         return s;
     }
     if (!strcmp(token.text, "for")) {
@@ -1734,6 +1752,18 @@ static void app_name(Compiler *c, const Expr *e, const char *name) {
     if (parameter(c, name) >= 0) fail_at(c, e->line, e->column, "'%s' is a parameter here", name);
 }
 
+/* The local named name in scope, or -1. */
+static int local_named(const Compiler *c, const char *name) {
+    for (unsigned i = c->local_count; i-- > 0;)
+        if (!strcmp(c->locals[i].name, name)) return (int)i;
+    return -1;
+}
+
+static uint32_t local_arg(const Compiler *c, int local) {
+    const Kind *kind = &c->locals[local].kind;
+    return c->locals[local].slot | (kind->type == INDEX ? 1u << 8 | (uint32_t)kind->owner << 16 : 0);
+}
+
 /* Emit an expression; height is the stack height before it. */
 static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
@@ -1780,6 +1810,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         }
         if (fn_index(c, c->module, e->name) >= 0) return inline_fn(c, e, c->module, e->name, handler, height);
         if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
+        int local = c->scope ? -1 : local_named(c, e->name);
+        if (local >= 0) { /* a let in the handler */
+            emit(c, e->line, e->column, LOCAL_LOAD, local_arg(c, local), 0);
+            return c->locals[local].kind;
+        }
         if (!c->scope && c->arguments >= 0) { /* an argument of the view (a table's, in its columns and filter) */
             const Input *in = &c->inputs[c->arguments];
             for (unsigned f = 0; f < in->fields; ++f)
@@ -2119,9 +2154,36 @@ static void send_values(Compiler *c, const Input *out, const Expr *group, const 
 }
 
 static void statements(Compiler *c, const Stmt *s) {
+    unsigned scope = c->local_count; /* a block's lets end with it */
     for (; s; s = s->next) {
         switch (s->kind) {
+        case S_LET: {
+            const char *kind = declared_kind(c, s->name);
+            if (kind) fail_at(c, s->line, s->column, "'%s' is already declared as %s", s->name, kind);
+            if (local_named(c, s->name) >= 0) fail_at(c, s->line, s->column, "'%s' is already a let here", s->name);
+            if (c->walking && !strcmp(s->name, c->walk_name))
+                fail_at(c, s->line, s->column, "'%s' is the item this for walks", s->name);
+            if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+            Kind held = value(c, s->value, true, 0);
+            if (held.type != NUM && held.type != INDEX)
+                fail_at(c, s->value->line, s->value->column, "a let holds a number or an index, not %s", type_name(held.type));
+            unsigned local = c->local_count++;
+            memcpy(c->locals[local].name, s->name, NAME);
+            c->locals[local].slot = c->local_slots++;
+            c->locals[local].kind = held;
+            emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, (int)local), 0);
+            break;
+        }
         case S_ASSIGN: {
+            int local = local_named(c, s->name);
+            if (local >= 0) { /* a let takes a new value of its kind */
+                Kind kind = value(c, s->value, true, 0);
+                if (kind.type != c->locals[local].kind.type || (kind.type == INDEX && kind.owner != c->locals[local].kind.owner))
+                    fail_at(c, s->value->line, s->value->column, "'%s' holds %s", s->name,
+                            c->locals[local].kind.type == INDEX ? "an index of its list" : "a number");
+                emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, local), 0);
+                break;
+            }
             int index = state_index(c, s->name);
             if (index < 0) {
                 const char *kind = declared_kind(c, s->name);
@@ -2284,6 +2346,7 @@ static void statements(Compiler *c, const Stmt *s) {
         }
         }
     }
+    c->local_count = scope;
 }
 
 static unsigned char *put16(unsigned char *p, uint32_t v) {
@@ -2448,6 +2511,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->handler_count; ++i) {
         int input = handler_input[i];
         c->message = input >= 0 && c->inputs[input].kind != KIND_KEY ? input : -1;
+        c->local_count = c->local_slots = 0;
         c->handler_code[i][0] = c->code_count;
         statements(c, c->handlers[i].body);
         c->handler_code[i][1] = c->code_count - c->handler_code[i][0];
