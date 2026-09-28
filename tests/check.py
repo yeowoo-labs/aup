@@ -202,7 +202,7 @@ DIAGNOSTICS = [
     (LIST + 'view v = count(x in xs where count(y in xs) > 0)\n', '6:30', 'a count, sum, max or min cannot hold another'),
     (LIST + 'view v = count(x in at)\n', '6:10', "'at' is not a list"),
     ('record T {\n  t: text\n}\nstate xs: list of T\nview v = sum(x.t for x in xs)\n', '5:14',
-     'sum, max and min take numbers, not text'),
+     'sum, max, min and distinct take numbers, not text'),
     (LIST + 'fn f(n) = count(x in xs where x.a == n)\nview v = f(1)\n', '6:38',
      "'n' is a parameter outside this count, sum, max or min"),
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
@@ -273,6 +273,12 @@ DIAGNOSTICS = [
 ]
 
 ACCEPTED = [
+    # distinct, and tests bounding a keyed list's key: a range walk (Pure reads only the items in bounds) and a range view.
+    'record Line {\n  id = 0\n  item = 0\n  qty = 0\n  done = 0\n}\nstate lines: list of Line by id\n'
+    'input deliver = message {\n  order: u32\n}\non deliver {\n  let start = deliver.order * 16\n'
+    '  for l in lines where l.id >= start && l.id < start + 16 {\n    l.done = 1\n  }\n}\n'
+    'view items(order: u32) = distinct(l.item for l in lines where l.id >= order * 16 && l.id < order * 16 + 16)\n'
+    'view level = distinct(l.item for l in lines where l.qty < 10)\n',
     # Lets: a sum in a for, an index let changing an item, a let in a for, one read in a fold, one per branch.
     'record Stock {\n  item = 0\n  left = 0\n  price = 0\n}\nrecord Line {\n  item = 0\n  qty = 1\n}\n'
     'state stock: list of Stock by item\nstate revenue = 0\nstate sold = 0\ninput order = message {\n  lines: list of Line\n}\n'

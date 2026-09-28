@@ -169,7 +169,8 @@ view summary = "{count(t in tasks where !t.done)} open of {tasks.count}"
 - **찾기.** `first(항목 in 리스트 [where 조건])`은 조건이 참인 첫 항목의 인덱스다(그 리스트의 인덱스 타입이라
   `at = first(t in tasks where t.title == name)`, `first(…).done = 1`, `first(…).position`으로 쓴다). 없으면 보기는
   비고 핸들러는 `not_found`로 실패한다. 찾으면 거기서 멈춘다.
-- **모양.** `count(항목 in 리스트 [where 조건])`, `sum|max|min(값 for 항목 in 리스트 [where 조건])`. 값을 둘 받는
+- **모양.** `count(항목 in 리스트 [where 조건])`, `sum|max|min|distinct(값 for 항목 in 리스트 [where 조건])`. `distinct`는
+  포함된 항목의 서로 다른 값의 수다(SQL의 `count(distinct …)`). 값을 둘 받는
   `max(a, b)`·`min(a, b)`는 그대로 호출이고, 같은 이름의 fn(`fn sum(a, b)`)도 그대로 부를 수 있다. 첫 식 뒤의
   `for`, 또는 `count(`의 `이름 in`으로 가른다.
 - **의미.** 항목마다 블록을 계산해 센다(조건이 참인 항목), 더한다, 가장 큰·작은 값을 고른다. 포함된 항목이 없으면
@@ -328,6 +329,8 @@ on clean {
   상태가 되고, 이벤트가 끝나면 비워지며 저장되지 않는다(Pure 008). HTTP로는 JSON 객체의 배열로 보내고, 행 필드 하나뿐인
   메시지는 행을 리스트의 저장 형식 바이트로 보내도 된다(대량 넣기). 출력은 행을 보내지 않는다.
 - 이것으로 여러 행을 한꺼번에 바꾸는 트랜잭션(TPC-C의 주문처럼 행마다 재고를 줄이고 주문 행을 넣는 일)이 이벤트 하나다.
+- 키 있는 리스트의 키를 범위로 묻는 `where`(`for l in lines where l.id >= start && l.id < start + 16`)와 집계, 표의 필터는 Pure가
+  그 범위의 항목만 읽는다(키로 찾아서). 인덱스를 선언하지 않는다.
 
 검증: 진단 9건(`for` 안의 `for`, 걷는 리스트에 넣기, `for` 안의 `reply`, 행을 보내는 출력, 핸들러 밖의 행, 값으로 쓴 행, 리스트가
 아닌 것, 이미 선언된 항목 이름, 없는 레코드)과, 그룹 안의 행·`where`·걷는 항목을 읽는 집계·지우는 걷기를 쓴 앱을 Pure가

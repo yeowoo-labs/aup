@@ -20,7 +20,7 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
        LOCAL_LOAD, LOCAL_STORE };
 enum { LOCALS = 64 }; /* an event's locals (Pure's) */
-enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST };
+enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6,
        FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
        FIELD_ROWS = 5 };
@@ -682,11 +682,12 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
              {"floor", 1, FLOOR}};
         int call = -1, how = -1;
         for (int i = 0; i < (int)(sizeof(calls) / sizeof(*calls)); ++i) if (!strcmp(token.text, calls[i].name)) call = i;
-        static const char *const folds[] = {"count", "sum", "max", "min", "first"};
-        for (int i = 0; i < 5; ++i) if (!strcmp(token.text, folds[i])) how = i;
+        static const char *const folds[] = {"count", "sum", "max", "min", "first", "distinct"};
+        for (int i = 0; i < 6; ++i) if (!strcmp(token.text, folds[i])) how = i;
         Expr *first = NULL;
-        /* count(t in tasks ...), first(t in tasks ...), sum(t.x for t in tasks ...):
-         * folds; max(a, b) stays a call. */
+        /* count(t in tasks ...), first(t in tasks ...), sum(t.x for t in tasks ...),
+         * distinct(t.x for t in tasks ...) (how many different values): folds;
+         * max(a, b) stays a call. */
         bool itemwise = how == FOLD_COUNT || how == FOLD_FIRST;
         if (how >= 0 && is(c, "(")) {
             take(c);
@@ -2049,7 +2050,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (!itemwise) {
             Kind kind = value(c, e->args[1], false, 0);
             if (kind.type != NUM)
-                fail_at(c, e->args[1]->line, e->args[1]->column, "sum, max and min take numbers, not %s", type_name(kind.type));
+                fail_at(c, e->args[1]->line, e->args[1]->column, "sum, max, min and distinct take numbers, not %s",
+                        type_name(kind.type));
         }
         if (e->args[0]) number(c, e->args[0], false, !itemwise);
         else emit(c, e->line, e->column, CONST, 0, 1);
