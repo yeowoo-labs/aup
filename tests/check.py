@@ -244,6 +244,11 @@ DIAGNOSTICS = [
     (ROWS + 'on o {\n  for a in o.rows {\n    reply "x"\n  }\n}\n', '12:5', 'a message replies once: reply after the for'),
     ('record L {\n  item = 0\n}\noutput o = message {\n  rows: list of L\n}\n', '5:9',
      'an output sends no rows: send one message a row'),
+    ('input a = message like nothing\n', '1:24', "'nothing' is no message input or output declared before"),
+    ('input k = key Space\ninput a = message like k\n', '2:24', "'k' is no message input or output declared before"),
+    ('input a = message like a\n', '1:24', "'a' is no message input or output declared before"),
+    ('record L {\n  item = 0\n}\ninput i = message {\n  rows: list of L\n}\noutput o = message like i\n', '7:25',
+     "an output sends no rows: 'i' has rows (rows)"),
     (ROWS + 'view v = o.rows.count\n', '10:10', "the rows of 'o' are only available in its handler"),
     (ROWS + 'on o {\n  n = o.rows\n}\n', '11:7',
      "'o.rows' holds a message's rows: walk them (for r in o.rows) or read .count, .first or .last"),
@@ -1278,6 +1283,19 @@ def main():
             assert json.loads(run(pure_run, work / f'good{number}.pmod', stdin='frame\nshow\n').stdout.splitlines()[-1])['error'] is None
         report['diagnostics'] = len(DIAGNOSTICS)
         report['accepted_forms'] = len(ACCEPTED)
+
+        # message like X is X's fields, written once: the same module, byte for byte.
+        fields = '  title: text\n  lane: u32\n  to: {\n    city: text\n  }\n'
+        body = 'on remote {\n  n = remote.lane\n}\non tap.down {\n  send changed { title: "t", lane: 1, to: { city: "c" } }\n}\n'
+        written = (f'state n = 0\ninput tap = key Space\noutput changed = message {{\n{fields}}}\n'
+                   f'input remote = message {{\n{fields}}}\n{body}')
+        liked = (f'state n = 0\ninput tap = key Space\noutput changed = message {{\n{fields}}}\n'
+                 f'input remote = message like changed\n{body}')
+        (work / 'written.aup').write_text(written)
+        (work / 'liked.aup').write_text(liked)
+        assert compile_module(aup, work / 'written.aup', work / 'written.pmod') == \
+            compile_module(aup, work / 'liked.aup', work / 'liked.pmod'), 'message like differs from its fields written'
+        report['message_like'] = True
 
         # Replacing a running module keeps states by name.
         compile_module(aup, ROOT / 'examples/counter.aup', work / 'counter.pmod')

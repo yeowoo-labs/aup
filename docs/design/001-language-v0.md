@@ -123,6 +123,10 @@ on edit {
   `send 이름 { 필드: 값, 그룹: { 필드: 값 } }`으로 모든 필드를 한 번씩 주어 보낸다. 보냄은 이벤트의 일부라서 이벤트가
   실패하면 보내지 않았고, 호스트는 저장된 보냄만 전한다. 무엇이 받는지는 앱 밖(호스트의 배선)이 정한다. 받는 앱은 같은
   메시지를 여러 번 받아도 한 번만 적용한다(Pure `docs/research/078-app-connections.md`). 출력에는 핸들러가 없다.
+- `message like 이름`은 앞에 선언한 메시지 입력이나 출력의 필드를 그 순서대로 갖는다. 다른 노드가 보내는 것을 받는 입력과
+  제 출력을 한 번만 적는다(`output changed = message { ... }`, `input remote = message like changed`). 필드를 적은 것과
+  같은 모듈이 나온다. 노드 사이에서는 필드를 이름으로 받으므로(Pure `docs/design/014-fields-by-name.md`) 순서가 달라도
+  되지만, 같은 모양이면 옮기는 일이 없다.
 - 외부 API의 응답은 보통의 메시지 입력으로 받는다. 호스트가 출력의 응답을 그 입력에 이으면(`pure-serve --reply 출력=입력`),
   필드는 응답 JSON에서, 응답에 없는 필드는 보낸 메시지의 같은 이름 필드에서, `http_status: u32`는 상태 코드로 채워진다
   (Pure `docs/research/083-delivery-over-http.md`).

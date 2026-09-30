@@ -1102,6 +1102,30 @@ static bool path_taken(const Input *in, const char *path) {
  * (Pure lays them out: docs/design/008-module-format.md). name: { ... } is a
  * group of fields inside the message, named group.name (a JSON object inside
  * a request's body). */
+/* message like other: the fields of a message input or output declared
+ * before, in its order. So an output and the input that takes what another
+ * node sends from it are written once. */
+static void message_like(Compiler *c, Input *in) {
+    Token other = expect_name(c, "a message input or output declared before");
+    const Input *from = NULL;
+    for (unsigned i = 0; i + 1 < c->input_count && !from; ++i)
+        if (!strcmp(c->inputs[i].name, other.text)) from = &c->inputs[i];
+    if (!from || (from->kind != KIND_MESSAGE && from->kind != KIND_OUTPUT))
+        fail_at(c, other.line, other.column, "'%s' is no message input or output declared before", other.text);
+    for (unsigned f = 0; f < from->fields; ++f) {
+        if (in->kind == KIND_OUTPUT && from->field_types[f] == FIELD_ROWS)
+            fail_at(c, other.line, other.column, "an output sends no rows: '%s' has rows (%s)", other.text,
+                    from->field_names[f]);
+        if (c->field_count == FIELDS) fail_at(c, other.line, other.column, "at most %d message fields are allowed", FIELDS);
+        memcpy(in->field_names[in->fields], from->field_names[f], NAME);
+        memcpy(in->field_record[in->fields], from->field_record[f], NAME);
+        in->field_line[in->fields] = from->field_line[f];
+        in->field_column[in->fields] = from->field_column[f];
+        in->field_types[in->fields++] = from->field_types[f];
+        ++c->field_count;
+    }
+}
+
 static void message_fields(Compiler *c, Input *in, const char *group) {
     if (!is(c, "{")) return; /* the field block opens on the declaration's line */
     take(c);
@@ -1471,7 +1495,11 @@ static void declaration(Compiler *c) {
             in->kind = KIND_MESSAGE;
             if (word(c, "by")) { take(c); expect_word(c, "key"); in->keyed = true; }
             ++c->input_count;
-            message_fields(c, in, "");
+            if (word(c, "like")) {
+                take(c);
+                message_like(c, in);
+            } else
+                message_fields(c, in, "");
         } else if (word(c, "text")) {
             take(c);
             in->kind = KIND_TEXT;
@@ -1519,7 +1547,11 @@ static void declaration(Compiler *c) {
         expect_word(c, "message");
         in->kind = KIND_OUTPUT;
         ++c->input_count;
-        message_fields(c, in, "");
+        if (word(c, "like")) {
+            take(c);
+            message_like(c, in);
+        } else
+            message_fields(c, in, "");
     } else if (!strcmp(kind.text, "view")) {
         Token name = expect_name(c, "view name");
         declare(c, &name);
