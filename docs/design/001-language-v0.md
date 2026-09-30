@@ -1,6 +1,6 @@
 # aup v0 — 한 언어, 한 모듈 형식
 
-2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use·`bool`) 구현.
+2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use·`bool`·`i64`) 구현.
 text와 리스트 문법은 [002](002-dsl-direction.md).
 
 착수 기준:
@@ -113,7 +113,7 @@ on edit {
 ```
 
 - `on 메시지 { }`는 메시지가 도착할 때 한 번 실행된다. 필드는 `메시지.필드`, 키는 `key`로만 쓴다.
-- 필드 타입은 `u32`, `number`(유한한 수), `bool`, `bytes`, `text`(UTF-8)이고 가변 필드(bytes, text)는 몇 개든 어디에나 둘 수 있다.
+- 필드 타입은 `u32`, `i64`, `number`(유한한 수), `bool`, `bytes`, `text`(UTF-8)이고 가변 필드(bytes, text)는 몇 개든 어디에나 둘 수 있다.
   필드는 쉼표나 줄바꿈(또는 세미콜론)으로 나눈다. 메시지와 그룹과 레코드의 선언에서도, 값(`Kept { id: 1, t: "a" }`)에서와 같다.
   `input add = message { title: text, points: number }`. HTTP 호스트(`pure-serve`)는 JSON 본문의 객체를 이 필드들로
   옮긴다. 도착한 메시지의 text가 UTF-8이 아니거나 수가 유한하지 않으면 그 이벤트는 실패한다.
@@ -164,4 +164,32 @@ view status = "{on}"                 # true 또는 false
 - bool은 상태, 레코드 필드, 메시지와 출력의 필드, 보기의 인자, `let`, 보기와 표의 열이 될 수 있다. 보간은 `true`·`false`를 쓴다.
 - 모듈을 바꾸면 수였던 상태나 필드가 bool이 될 때 0과 1은 `false`와 `true`가 되고, 다른 수는 새 기본값이 된다. bool이 수가 되면
   0과 1이다.
+
+## i64 (구현)
+
+정확한 64비트 정수다. 수(binary64)는 2^53을 넘는 정수를 정확히 담지 못한다. 밖에서 오는 ID, 나노초, 큰 누계는 i64로 둔다
+(Pure [016](/srv/git/pure.git): `docs/design/016-bool-and-i64.md`).
+
+```text
+record Order { id: i64, total: i64 = 0 }
+state orders: list of Order by id
+state next: i64 = 9007199254740993     # 2^53 + 1, 정확하게
+input put = message { id: i64 }         # JSON과 쿼리에서 정수의 자릿수만
+
+on put { orders.add(Order { id: put.id }) }
+view sum = sum(o.total for o in orders)
+view next_text = "{next}"               # 모든 자릿수
+```
+
+- 상태 `state n: i64`(0부터) 또는 `state n: i64 = 5`, 레코드 필드 `id: i64`(`= 5`도), 메시지·출력·인자의 필드 `id: i64`,
+  `let`, 보기와 열이 i64가 될 수 있다. 키 있는 목록의 키(`by id`)와 조각(`xs[lo .. hi]`)도 된다.
+- 정수 리터럴(점과 지수가 없는 자릿수, 부호가 붙은 것도)은 문맥의 타입이 된다. 연산이나 비교의 다른 쪽이 i64이거나,
+  i64 상태·필드·인자·키·보냄에 주면 i64다. 리터럴끼리의 식(`60 * 60 * 1000`)도 다른 쪽을 따른다. 문맥이 없으면 수다.
+- `+ - *`와 단항 `-`는 범위를 넘으면 사건이 `overflow`로 실패한다. `/`와 `%`는 내림한다(나머지는 나누는 수의 부호를
+  따른다). 0으로 나누면 `divide`다.
+- 수와 섞지 않는다. `i64(x)`는 x가 정수이고 범위 안일 때, `number(i)`는 |i| ≤ 2^53일 때만 되고, 아니면 사건이 `limit`으로
+  실패한다. 진단이 섞인 자리를 가리키고 변환을 권한다(`an i64 and a number do not mix: convert one, as in i64(x) or
+  number(n)`).
+- `min`·`max`, 비교, 집계(`sum`은 넘치면 `overflow`, `max`·`min`, `distinct`)가 된다. `clamp`와 `floor`는 수만 받는다.
+- 보간과 보기는 모든 자릿수를 쓴다. 모듈을 바꾸면 수와 i64는 값이 맞을 때 서로 옮겨지고, 아니면 기본값이 된다.
 

@@ -68,7 +68,7 @@ view current = note.line(at)           # 커서가 있는 줄. 복사하지 않�
 |---|---|---|
 | v0a ✅ | 스칼라 상태, 키 입력, 핸들러, 보기 | 워크벤치 엔진과 비트 단위 일치 |
 | v0b ✅ | `bytes`, 키별 영속 문서, `message` 입력, 응답, `require`, `text`(리터럴·보간·`cursor in`·`char`/`line`), `text` 입력 | 기존 편집기 CLI와 바이트 단위 일치, text 편집이 참조 모델과 일치 |
-| v0c | `record`, `list of`, `index of`, 조건식, 항목 투영(`each`), 순수 `fn`, `use` 라이브러리, 집계, 키 있는 리스트(`map`의 자리), text 비교, 걷기(`for`)와 메시지의 행, `bool` ✅ / `i64` | 모든 연산에 실행량 상한, 리스트가 참조 모델과 일치 ✅ |
+| v0c | `record`, `list of`, `index of`, 조건식, 항목 투영(`each`), 순수 `fn`, `use` 라이브러리, 집계, 키 있는 리스트(`map`의 자리), text 비교, 걷기(`for`)와 메시지의 행, `bool`, `i64` ✅ | 모든 연산에 실행량 상한, 리스트가 참조 모델과 일치 ✅ |
 | v0d ✅ | `use vega`로 첫 인터페이스 투영(목록·표·커서·톤), [Vega 001](/srv/git/vega.git) | 한 명세가 세 표면(TUI·CLI·NUI 문장)에서 동작, 표면은 보이는 칸만 계산 |
 
 ### 구현된 text (v0b)
@@ -372,7 +372,7 @@ view branch(b: u32, over: number) = each a in accounts where a.bid == b && a.bal
 }
 ```
 
-- **보기는 인자를 받는 함수다.** `view 이름(인자: 타입, …) = …`의 인자는 u32, number, bool, bytes, text이고, 보기 안에서(표라면 그 필터와
+- **보기는 인자를 받는 함수다.** `view 이름(인자: 타입, …) = …`의 인자는 u32, i64, number, bool, bytes, text이고, 보기 안에서(표라면 그 필터와
   열, 그 안의 집계에서도) 이름으로 읽는다. HTTP로는 `GET /views/balance?aid=42`, 표는 `?b=1&over=0&from=20&count=20`이다. 등록한
   질의(`aup query`)도 인자를 받는다. 인자 이름은 상태나 다른 선언, 표의 행과 겹칠 수 없고 `from`·`count`는 쪽 나누기의 몫이다.
 - 모듈에서는 `balance.args`라는 인자 입력이 보기를 가리키고, 보기는 메시지 핸들러가 필드를 읽듯 인자를 읽는다(Pure 008).

@@ -10,7 +10,7 @@ aup는 [Pure](/srv/git/pure.git) 런타임을 위한 **언어와 툴체인**이�
 | [Vega](/srv/git/vega.git) | aup와 Pure 위의 인터페이스 구현자(TUI·CLI·GUI·NUI) |
 
 상태: v0a(scalar 상태·키 입력·원자적 이벤트·보기), v0b(바이트·영속 문서·메시지·응답·text·커서),
-v0c(레코드·리스트·`index of`·조건식·표 보기·`fn`·`use` 라이브러리·집계·키 있는 리스트·text 비교·`bool`) 동작. 그 위의 첫 인터페이스는 [Vega](/srv/git/vega.git)(`use vega`, 목록·표·톤을 TUI·CLI·문장으로).
+v0c(레코드·리스트·`index of`·조건식·표 보기·`fn`·`use` 라이브러리·집계·키 있는 리스트·text 비교·`bool`·`i64`) 동작. 그 위의 첫 인터페이스는 [Vega](/srv/git/vega.git)(`use vega`, 목록·표·톤을 TUI·CLI·문장으로).
 [언어 v0](docs/design/001-language-v0.md).
 
 ```sh

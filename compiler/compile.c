@@ -18,19 +18,20 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
-       LOCAL_LOAD, LOCAL_STORE };
+       LOCAL_LOAD, LOCAL_STORE, I64_ADD, I64_SUB, I64_MUL, I64_DIV, I64_MOD, I64_NEG, I64_COMPARE, I64_MIN, I64_MAX,
+       I64_FROM, NUM_FROM };
 enum { LOCALS = 64 }; /* an event's locals (Pure's) */
-enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT };
+enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT, FOLD_INTEGER = 0x40 };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6,
        FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
-       FIELD_ROWS = 5, FIELD_BOOL = 6 };
+       FIELD_ROWS = 5, FIELD_BOOL = 6, FIELD_I64 = 7 };
 /* A list of a message's rows: filled as the message arrives, emptied when its event ends (Pure's flag). */
 enum { LIST_ROWS = 256 };
-enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, STATE_BOOL = 5,
+enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, STATE_BOOL = 5, STATE_I64 = 6,
        UNIT_CHAR = 0, UNIT_LINE = 1 };
-/* Pure's view types; a bool record field is type 2 and a bool local holds 2. */
-enum { VIEW_NUM = 0, VIEW_TEXT = 1, VIEW_TABLE = 2, VIEW_BOOL = 3, FIELD_RECORD_BOOL = 2, LOCAL_BOOL = 2 };
-typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX, BOOL } Type;
+/* Pure's view types, record field types (0 a number, 1 a text, 2 a bool, 3 an i64) and what a local holds. */
+enum { VIEW_NUM = 0, VIEW_TEXT = 1, VIEW_TABLE = 2, VIEW_BOOL = 3, VIEW_I64 = 4, LOCAL_BOOL = 2, LOCAL_I64 = 3 };
+typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX, BOOL, I64 } Type;
 typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
 
 typedef enum { T_EOF, T_NL, T_NUMBER, T_NAME, T_PUNCT, T_STRING } TokenKind;
@@ -38,6 +39,8 @@ typedef struct {
     TokenKind kind;
     int line, column;
     double number;
+    int64_t integer; /* a literal of digits alone (whole): its exact value, when not past an i64's range (wide) */
+    bool whole, wide;
     char text[NAME + 1]; /* name, or punctuation of one or two characters */
     size_t start, end;   /* string contents in the source */
 } Token;
@@ -63,6 +66,8 @@ typedef struct Expr {
     ExprKind kind;
     int line, column, op;
     double number;
+    int64_t integer; /* E_NUMBER: as its token's */
+    bool whole, wide;
     char name[NAME], member[NAME];
     struct Expr *args[PARAMS], *next;
     unsigned count;
@@ -97,13 +102,14 @@ typedef struct {
     unsigned view; /* arguments: the view they are for */
 } Input;
 
-/* A record: fields in order, each a number, a bool or text with its default. */
+/* A record: fields in order, each a number, a bool, an i64 or text with its default. */
 typedef struct {
     char name[NAME];
     int line, column;
     char field_names[FIELDS_PER_RECORD][NAME];
-    bool field_text[FIELDS_PER_RECORD], field_bool[FIELDS_PER_RECORD];
+    Type field_kinds[FIELDS_PER_RECORD]; /* NUM, BOOL, I64 or TEXT */
     double field_number[FIELDS_PER_RECORD];
+    int64_t field_integer[FIELDS_PER_RECORD];
     Expr *field_string[FIELDS_PER_RECORD]; /* a text default, or NULL for "" */
     uint32_t field_constant[FIELDS_PER_RECORD];
     unsigned fields;
@@ -144,6 +150,7 @@ typedef struct {
     char state_key[STATES][NAME];
     int state_key_line[STATES], state_key_column[STATES], list_key[STATES];
     double initial[STATES];
+    int64_t state_integer[STATES]; /* an i64 state's start */
     Expr *state_text[STATES];
     unsigned states;
     char collection_names[COLLECTIONS][NAME];
@@ -191,7 +198,8 @@ typedef struct {
     unsigned fn_count;
     Scope *scope;         /* the fn being inlined, or NULL */
     unsigned joins;       /* branches ahead that carry a value */
-    struct { uint8_t op; uint32_t arg; double value; } code[CODE];
+    Type want;            /* what the expression value() compiles next is wanted as: an i64 makes a literal one */
+    struct { uint8_t op; uint32_t arg; union { double value; int64_t integer; }; } code[CODE];
     unsigned code_count;
     uint32_t view_code[VIEWS][2], handler_code[HANDLERS][2];
     int view_types[VIEWS];
@@ -299,6 +307,15 @@ static Token scan(Compiler *c) {
         token.kind = T_NUMBER;
         token.number = strtod(text, NULL);
         if (!isfinite(token.number)) fail_at(c, token.line, token.column, "number must be finite");
+        /* Digits alone: exactly, for an i64 (past its range, wide). */
+        token.whole = strspn(text, "0123456789") == n;
+        uint64_t exact = 0;
+        for (size_t i = 0; token.whole && i < n && !token.wide; ++i) {
+            unsigned digit = (unsigned)(text[i] - '0');
+            token.wide = exact > (UINT64_C(9223372036854775807) - digit) / 10;
+            exact = exact * 10 + digit;
+        }
+        token.integer = token.wide ? 0 : (int64_t)exact;
         return token;
     }
     if (letter(ch)) {
@@ -695,6 +712,9 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     if (token.kind == T_NUMBER) {
         left = node(c, E_NUMBER, token.line, token.column);
         left->number = token.number;
+        left->integer = token.integer;
+        left->whole = token.whole;
+        left->wide = token.wide;
     } else if (token.kind == T_STRING) {
         left = string(c, &token);
     } else if (token.kind == T_PUNCT && (!strcmp(token.text, "-") || !strcmp(token.text, "!"))) {
@@ -702,6 +722,13 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
         left->op = token.text[0] == '-' ? NEG : NOT;
         left->args[0] = expression(c, 7, multiline);
         left->count = 1;
+        if (left->op == NEG && left->args[0]->kind == E_NUMBER) { /* -5: one literal, a number or an i64 */
+            Expr *literal = left->args[0];
+            literal->number = -literal->number;
+            literal->integer = -literal->integer;
+            literal->line = left->line, literal->column = left->column;
+            left = literal;
+        }
     } else if (token.kind == T_PUNCT && !strcmp(token.text, "(")) {
         left = expression(c, 0, true);
         newlines(c);
@@ -712,7 +739,7 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     } else if (token.kind == T_NAME) {
         static const struct { const char *name; unsigned count; int op; } calls[] =
             {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM},
-             {"floor", 1, FLOOR}};
+             {"floor", 1, FLOOR}, {"i64", 1, I64_FROM}, {"number", 1, NUM_FROM}};
         int call = -1, how = -1;
         for (int i = 0; i < (int)(sizeof(calls) / sizeof(*calls)); ++i) if (!strcmp(token.text, calls[i].name)) call = i;
         static const char *const folds[] = {"count", "sum", "max", "min", "first", "distinct"};
@@ -1097,7 +1124,7 @@ static int used_library(const Compiler *c, int module, const char *name) {
 }
 
 static const char *declared_kind(const Compiler *c, const char *name) {
-    static const char *const states[] = {"a state", "a text state", "a cursor", "a list", "a list index", "a state"};
+    static const char *const states[] = {"a state", "a text state", "a cursor", "a list", "a list index", "a state", "a state"};
     if (fn_index(c, c->module, name) >= 0) return "a fn";
     if (used_library(c, c->module, name) >= 0) return "a library";
     if (c->module) return NULL; /* a library has only fns and uses */
@@ -1188,9 +1215,10 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
             continue;
         }
         if (c->field_count == FIELDS) fail_at(c, name.line, name.column, "at most %d message fields are allowed", FIELDS);
-        Token type = expect_name(c, "u32, number, bool, bytes, text or list of a record");
+        Token type = expect_name(c, "u32, i64, number, bool, bytes, text or list of a record");
         static const struct { const char *name; int type; } types[] = {
-            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bool", FIELD_BOOL}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
+            {"u32", FIELD_U32}, {"i64", FIELD_I64}, {"number", FIELD_NUMBER}, {"bool", FIELD_BOOL}, {"bytes", FIELD_BYTES},
+            {"text", FIELD_TEXT}};
         int field_type = 0;
         for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
             if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
@@ -1204,7 +1232,7 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
             in->field_column[in->fields] = record.column;
             field_type = FIELD_ROWS;
         }
-        if (!field_type) fail_at(c, type.line, type.column, "field types are u32, number, bool, bytes, text and list of a record");
+        if (!field_type) fail_at(c, type.line, type.column, "field types are u32, i64, number, bool, bytes, text and list of a record");
         memcpy(in->field_names[in->fields], path, NAME);
         in->field_types[in->fields++] = field_type;
         ++c->field_count;
@@ -1221,6 +1249,17 @@ static double signed_number(Compiler *c, const char *what) {
     if (is(c, "-") || is(c, "+")) sign = take(c).text[0] == '-' ? -1 : 1;
     if (c->token.kind != T_NUMBER) fail_at(c, c->token.line, c->token.column, "expected a numeric %s", what);
     return sign * take(c).number;
+}
+
+/* A signed integer literal in an i64's range: an i64 state's or field's start. */
+static int64_t signed_integer(Compiler *c, const char *what) {
+    bool negative = false;
+    if (is(c, "-") || is(c, "+")) negative = take(c).text[0] == '-';
+    if (c->token.kind != T_NUMBER || !c->token.whole)
+        fail_at(c, c->token.line, c->token.column, "expected a whole number for %s", what);
+    if (c->token.wide) fail_at(c, c->token.line, c->token.column, "the number is past an i64's range");
+    int64_t value = take(c).integer;
+    return negative ? -value : value;
 }
 
 /* A plain string with no {expressions}: a text state or field default. */
@@ -1259,18 +1298,21 @@ static void record_declaration(Compiler *c) {
         ++c->record_fields;
         if (is(c, ":")) {
             take(c);
-            Token type = expect_name(c, "text");
-            if (strcmp(type.text, "text"))
-                fail_at(c, type.line, type.column, "a field is a number (field = 0), a bool (field = false) or text (field: text)");
-            r->field_text[index] = true;
+            Token type = expect_name(c, "text or i64");
+            if (strcmp(type.text, "text") && strcmp(type.text, "i64"))
+                fail_at(c, type.line, type.column,
+                        "a field is a number (field = 0), a bool (field = false), text (field: text) or an i64 (field: i64)");
+            r->field_kinds[index] = type.text[0] == 't' ? TEXT : I64;
             if (is(c, "=")) {
                 take(c);
-                r->field_string[index] = plain_string(c, "a text field");
+                if (r->field_kinds[index] == TEXT) r->field_string[index] = plain_string(c, "a text field");
+                else r->field_integer[index] = signed_integer(c, "an i64 field's default");
             }
         } else {
-            expect(c, "=", "'=' and a number or a bool, or ': text'");
+            expect(c, "=", "'=' and a number or a bool, or ': text' or ': i64'");
+            r->field_kinds[index] = NUM;
             if (word(c, "true") || word(c, "false")) {
-                r->field_bool[index] = true;
+                r->field_kinds[index] = BOOL;
                 r->field_number[index] = take(c).text[0] == 't';
             } else r->field_number[index] = signed_number(c, "field default");
         }
@@ -1300,8 +1342,14 @@ static void state_declaration(Compiler *c) {
     c->state_column[index] = name.column;
     if (is(c, ":")) {
         take(c);
-        Token type = expect_name(c, "text, cursor, mark, list or index");
-        if (!strcmp(type.text, "text")) {
+        Token type = expect_name(c, "text, i64, cursor, mark, list or index");
+        if (!strcmp(type.text, "i64")) { /* state n: i64 = 0: exact, whole */
+            c->state_types[index] = STATE_I64;
+            if (is(c, "=")) {
+                take(c);
+                c->state_integer[index] = signed_integer(c, "an i64 state");
+            }
+        } else if (!strcmp(type.text, "text")) {
             c->state_types[index] = STATE_TEXT;
             if (is(c, "=")) {
                 take(c);
@@ -1327,8 +1375,8 @@ static void state_declaration(Compiler *c) {
                 c->state_key_column[index] = key.column;
             }
         } else fail_at(c, type.line, type.column,
-                       "state types are numbers, text, cursor or mark in a text, list of a record, index of a list, "
-                       "and bytes by key");
+                       "state types are numbers, bools, i64, text, cursor or mark in a text, list of a record, index of "
+                       "a list, and bytes by key");
         ++c->states;
         return;
     }
@@ -1499,13 +1547,14 @@ static void view_arguments(Compiler *c, unsigned view, const Token *name) {
             if (!strcmp(in->field_names[f], argument.text))
                 fail_at(c, argument.line, argument.column, "duplicate argument '%s'", argument.text);
         expect(c, ":", "':'");
-        Token type = expect_name(c, "u32, number, bool, bytes or text");
+        Token type = expect_name(c, "u32, i64, number, bool, bytes or text");
         static const struct { const char *name; int type; } types[] = {
-            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bool", FIELD_BOOL}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
+            {"u32", FIELD_U32}, {"i64", FIELD_I64}, {"number", FIELD_NUMBER}, {"bool", FIELD_BOOL}, {"bytes", FIELD_BYTES},
+            {"text", FIELD_TEXT}};
         int field_type = 0;
         for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
             if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
-        if (!field_type) fail_at(c, type.line, type.column, "an argument is a u32, number, bool, bytes or text");
+        if (!field_type) fail_at(c, type.line, type.column, "an argument is a u32, i64, number, bool, bytes or text");
         if (c->field_count == FIELDS) fail_at(c, argument.line, argument.column, "at most %d message fields are allowed", FIELDS);
         memcpy(in->field_names[in->fields], argument.text, NAME);
         in->field_line[in->fields] = argument.line;
@@ -1644,8 +1693,14 @@ static void emit(Compiler *c, int line, int column, uint8_t op, uint32_t arg, do
     c->code[c->code_count++].value = value;
 }
 
+/* An i64 constant: CONST with argument 2, its value the integer's 8 bytes. */
+static void emit_integer(Compiler *c, int line, int column, int64_t value) {
+    emit(c, line, column, CONST, 2, 0);
+    c->code[c->code_count - 1].integer = value;
+}
+
 static const char *type_name(Type type) {
-    static const char *const names[] = {"", "a number", "bytes", "text", "a cursor", "a distance", "an index", "a bool"};
+    static const char *const names[] = {"", "a number", "bytes", "text", "a cursor", "a distance", "an index", "a bool", "an i64"};
     return names[type];
 }
 
@@ -1715,12 +1770,12 @@ static unsigned record_field(Compiler *c, const Record *r, const char *field, in
 
 /* A record field's kind: text, a bool or a number. */
 static Type field_kind(const Record *r, unsigned field) {
-    return r->field_text[field] ? TEXT : r->field_bool[field] ? BOOL : NUM;
+    return r->field_kinds[field];
 }
 
 /* The kind of a message field's value (a u32 is a number). */
 static Type message_kind(int type) {
-    return type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : type == FIELD_BOOL ? BOOL : NUM;
+    return type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : type == FIELD_BOOL ? BOOL : type == FIELD_I64 ? I64 : NUM;
 }
 
 static Kind value(Compiler *c, const Expr *e, bool handler, int height);
@@ -1743,6 +1798,111 @@ static void truth(Compiler *c, const Expr *e, bool handler, int height, const ch
     expect_kind(c, e, kind, BOOL);
 }
 
+/* An integer literal (digits alone, or negated ones): a number, or an i64
+ * where one is wanted. */
+static bool loose(const Expr *e) { return e->kind == E_NUMBER && e->whole; }
+
+/* The literal e, emitted at code[at] as a number, made the i64 wanted beside it. */
+static void made_i64(Compiler *c, const Expr *e, unsigned at) {
+    if (e->wide) fail_at(c, e->line, e->column, "the number is past an i64's range");
+    c->code[at].arg = 2;
+    c->code[at].integer = e->integer;
+}
+
+/* e where a value of type want goes (0: any): an integer literal is an i64
+ * where an i64 is wanted, and so are the literals of an arithmetic or a
+ * conditional expression that gives one. */
+static Kind wanted(Compiler *c, const Expr *e, bool handler, int height, Type want) {
+    if (want == I64 && loose(e)) {
+        if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
+        emit(c, e->line, e->column, CONST, 2, 0);
+        made_i64(c, e, c->code_count - 1);
+        return (Kind){I64, -1};
+    }
+    c->want = want;
+    return value(c, e, handler, height);
+}
+
+/* e where an i64 goes: a number is refused, and the message says how to convert it. */
+static void integer(Compiler *c, const Expr *e, bool handler, int height) {
+    Kind kind = wanted(c, e, handler, height, I64);
+    if (kind.type == NUM)
+        fail_at(c, e->line, e->column, e->kind == E_NUMBER ? "an i64 is a whole number; this one is not" :
+                "expected an i64, not a number: convert it, as in i64(x)");
+    expect_kind(c, e, kind, I64);
+}
+
+/* Integer literals alone, with arithmetic, negation, min, max and
+ * conditional expressions of them: a number, or an i64 where one is wanted. */
+static bool literal_only(const Expr *e) {
+    if (loose(e)) return true;
+    if (e->kind == E_IF) return literal_only(e->args[1]) && literal_only(e->args[2]); /* whatever its condition */
+    bool arithmetic = (e->kind == E_BINARY && (e->op == ADD || e->op == SUB || e->op == MUL || e->op == DIV || e->op == MOD) &&
+                       e->args[1]->kind != E_UNIT) ||
+                      (e->kind == E_CALL && (e->op == MIN || e->op == MAX)) || (e->kind == E_UNARY && e->op == NEG);
+    for (unsigned i = 0; arithmetic && i < e->count; ++i) arithmetic = literal_only(e->args[i]);
+    return arithmetic;
+}
+
+/* The type e has, compiled and taken back: what literals beside it take. */
+static Type probe(Compiler *c, const Expr *e, bool handler, int height) {
+    unsigned code = c->code_count, constants = c->constants, joins = c->joins;
+    size_t used = c->constant_used;
+    Type type = value(c, e, handler, height).type;
+    c->code_count = code, c->constants = constants, c->constant_used = used, c->joins = joins;
+    return type;
+}
+
+/* What an arithmetic operation's or a comparison's operands are wanted as,
+ * before the left one is emitted: a number or an i64 when that is wanted of
+ * the operation (want), else when the left one is literals alone the right
+ * one's type (probed once: the right one is then compiled as wanted, so no
+ * probe below it runs again). */
+static Type left_hint(Compiler *c, const Expr *e, bool handler, int height, Type want) {
+    if (want == I64 || want == NUM) return want;
+    if (!literal_only(e->args[0]) || literal_only(e->args[1])) return 0;
+    Type right = probe(c, e->args[1], handler, height + 1);
+    return right == I64 || right == NUM ? right : 0;
+}
+
+/* The right operand of an arithmetic operation or a comparison whose left
+ * one, of kind left, was emitted: both numbers or both i64s. Their type. */
+static Type second(Compiler *c, const Expr *e, Kind left, bool handler, int height) {
+    const Expr *a = e->args[0], *b = e->args[1];
+    if (left.type == I64) {
+        integer(c, b, handler, height + 1);
+        return I64;
+    }
+    expect_kind(c, a, left, NUM);
+    Kind right = wanted(c, b, handler, height + 1, NUM);
+    if (right.type == I64)
+        fail_at(c, b->line, b->column, "an i64 and a number do not mix: convert one, as in i64(x) or number(n)");
+    expect_kind(c, b, right, NUM);
+    return NUM;
+}
+
+static uint8_t i64_op(int op) {
+    switch (op) {
+    case ADD: return I64_ADD;
+    case SUB: return I64_SUB;
+    case MUL: return I64_MUL;
+    case DIV: return I64_DIV;
+    case MOD: return I64_MOD;
+    case MIN: return I64_MIN;
+    default: return I64_MAX;
+    }
+}
+
+/* A conditional expression's branch, of the other branches' type (kind, once the first gives it). */
+static void if_branch(Compiler *c, const Expr *e, bool handler, int height, Type hint, Kind *kind) {
+    Kind got = wanted(c, e, handler, height, hint);
+    if (kind->type && (got.type != kind->type || got.owner != kind->owner))
+        fail_at(c, e->line, e->column, got.type != kind->type ? "the branches of if give %s and %s" : kind->type == CURSOR ?
+                "the branches of if give cursors of different texts" : "the branches of if give indices of different lists",
+                type_name(kind->type), type_name(got.type));
+    *kind = got;
+}
+
 /* A cursor of the named text state. */
 static void cursor_of(Compiler *c, const Expr *e, bool handler, int height, int text, const char *name) {
     Kind kind = value(c, e, handler, height);
@@ -1763,11 +1923,16 @@ static void index_of(Compiler *c, const Expr *e, bool handler, int height, int l
 /* The item name[e] names: e is an index of the list, or for a keyed list a
  * key, found by LIST_FIND. */
 static void item_of(Compiler *c, const Expr *e, bool handler, int height, int list) {
+    unsigned at = c->code_count;
     Kind kind = value(c, e, handler, height);
     int key = c->list_key[list] - 1;
     if (kind.type != INDEX && key >= 0) {
         const Record *r = record_of(c, list);
         Type type = field_kind(r, (unsigned)key);
+        if (type == I64 && kind.type == NUM && loose(e)) { /* xs[5] by an i64 key */
+            made_i64(c, e, at);
+            kind.type = I64;
+        }
         if (kind.type != type)
             fail_at(c, e->line, e->column, "'%s' is keyed by %s, %s: expected %s or an index, not %s", c->state_names[list],
                     r->field_names[key], type_name(type), type_name(type), type_name(kind.type));
@@ -1878,11 +2043,13 @@ static int local_named(const Compiler *c, const char *name) {
 static uint32_t local_arg(const Compiler *c, int local) {
     const Kind *kind = &c->locals[local].kind;
     return c->locals[local].slot | (kind->type == INDEX ? 1u << 8 | (uint32_t)kind->owner << 16 :
-                                    kind->type == BOOL ? (uint32_t)LOCAL_BOOL << 8 : 0);
+                                    kind->type == BOOL ? (uint32_t)LOCAL_BOOL << 8 : kind->type == I64 ? (uint32_t)LOCAL_I64 << 8 : 0);
 }
 
 /* Emit an expression; height is the stack height before it. */
 static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
+    Type want = c->want; /* set by wanted() for this expression alone */
+    c->want = 0;
     if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
     switch (e->kind) {
     case E_NUMBER: emit(c, e->line, e->column, CONST, 0, e->number); return (Kind){NUM, -1};
@@ -1901,9 +2068,10 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         int pieces = 0;
         for (const Expr *part = e->args[0]; part; part = part->next) {
             Kind kind = value(c, part, handler, height + (pieces > 0));
-            if (kind.type == NUM || kind.type == BOOL) emit(c, part->line, part->column, NUM_TEXT, kind.type == BOOL, 0);
+            if (kind.type == NUM || kind.type == BOOL || kind.type == I64)
+                emit(c, part->line, part->column, NUM_TEXT, kind.type == BOOL ? 1 : kind.type == I64 ? 2 : 0, 0);
             else if (kind.type != TEXT)
-                fail_at(c, part->line, part->column, "a string shows numbers, bools and text, not %s", type_name(kind.type));
+                fail_at(c, part->line, part->column, "a string shows numbers, bools, i64s and text, not %s", type_name(kind.type));
             if (pieces++) emit(c, part->line, part->column, CONCAT, 0, 0);
         }
         return (Kind){TEXT, -1};
@@ -1954,8 +2122,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             if (type == STATE_LIST)
                 fail_at(c, e->line, e->column, "'%s' is a list; read %s.count or a field, as in %s[index].field",
                         e->name, e->name, e->name);
-            static const uint8_t loads[] = {LOAD, TEXT_LOAD, CUR_LOAD, 0, INDEX_LOAD, LOAD};
-            static const Type types[] = {NUM, TEXT, CURSOR, 0, INDEX, BOOL};
+            static const uint8_t loads[] = {LOAD, TEXT_LOAD, CUR_LOAD, 0, INDEX_LOAD, LOAD, LOAD};
+            static const Type types[] = {NUM, TEXT, CURSOR, 0, INDEX, BOOL, I64};
             emit(c, e->line, e->column, loads[type], (uint32_t)index, 0);
             return (Kind){types[type], type == STATE_CURSOR || type == STATE_INDEX ? cursor_owner(c, index) : -1};
         }
@@ -2058,7 +2226,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                               e->member, record_of(c, list)->name);
             if (e->count != 1) fail_at(c, e->line, e->column, "%s.has takes one key", e->member);
             Type type = field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1);
-            Kind given = value(c, e->args[0], handler, height);
+            Kind given = wanted(c, e->args[0], handler, height, type);
             if (given.type != type)
                 fail_at(c, e->args[0]->line, e->args[0]->column, "'%s' is keyed by %s, %s: expected %s, not %s", e->member, key,
                         type_name(type), type_name(type), type_name(given.type));
@@ -2112,21 +2280,24 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     }
     case E_IF: {
         /* Arms of an else-if chain share one end; a value crosses it, so the
-         * branches ahead that carry one are counted against Pure's limit. */
+         * branches ahead that carry one are counted against Pure's limit. An
+         * integer literal branch takes the other branches' type. */
         unsigned ends[DEPTH], arms = 0, saved = c->joins;
         Kind kind = {0, -1};
+        /* Literal branches take the type of the first that is no literal (an i64's, then). */
+        Type hint = want == I64 ? I64 : 0;
+        for (const Expr *at = e; !hint; at = at->args[2]) {
+            if (!literal_only(at->args[1])) hint = probe(c, at->args[1], handler, height) == I64 ? I64 : NUM;
+            else if (at->args[2]->kind != E_IF) hint = literal_only(at->args[2]) ? NUM : probe(c, at->args[2], handler, height) == I64 ? I64 : NUM;
+            else continue;
+        }
         const Expr *arm = e;
         for (;;) {
             truth(c, arm->args[0], handler, height, "if");
             unsigned jump = c->code_count;
             emit(c, arm->line, arm->column, JZ, 0, 0);
             if (height && ++c->joins > JOINS) fail_at(c, arm->line, arm->column, "conditional expressions nest too deeply");
-            Kind then = value(c, arm->args[1], handler, height);
-            if (arms && (then.type != kind.type || then.owner != kind.owner))
-                fail_at(c, arm->args[1]->line, arm->args[1]->column, then.type != kind.type ?
-                        "the branches of if give %s and %s" : "the branches of if point into different texts or lists",
-                        type_name(kind.type), type_name(then.type));
-            kind = then;
+            if_branch(c, arm->args[1], handler, height, hint, &kind);
             ends[arms++] = c->code_count;
             emit(c, arm->line, arm->column, JMP, 0, 0);
             if (arms == 1 && ++c->joins > JOINS) fail_at(c, arm->line, arm->column, "conditional expressions nest too deeply");
@@ -2135,12 +2306,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             if (arm->args[2]->kind != E_IF) break;
             arm = arm->args[2];
         }
-        Kind otherwise = value(c, arm->args[2], handler, height);
-        if (otherwise.type != kind.type || otherwise.owner != kind.owner)
-            fail_at(c, arm->args[2]->line, arm->args[2]->column, otherwise.type != kind.type ?
-                    "the branches of if give %s and %s" : kind.type == CURSOR ?
-                    "the branches of if give cursors of different texts" : "the branches of if give indices of different lists",
-                    type_name(kind.type), type_name(otherwise.type));
+        if_branch(c, arm->args[2], handler, height, hint, &kind);
         for (unsigned i = 0; i < arms; ++i) c->code[ends[i]].arg = c->code_count;
         c->joins = saved;
         return kind;
@@ -2156,10 +2322,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (c->filtering) fail_at(c, e->line, e->column, "a table's where cannot hold a count, sum, max or min");
         bool sliced = e->args[2] != NULL;
         if (sliced) { /* the keys from low up to before high, found by key */
-            if (!keyed_by(c, list) || field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1) != NUM)
-                fail_at(c, e->line, e->column, "'%s' is not keyed by a number: a slice takes one", e->member);
-            number(c, e->args[2], handler, height);
-            number(c, e->args[3], handler, height + 1);
+            Type key = keyed_by(c, list) ? field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1) : TEXT;
+            if (key != NUM && key != I64)
+                fail_at(c, e->line, e->column, "'%s' is not keyed by a number or an i64: a slice takes one", e->member);
+            expect_kind(c, e->args[2], wanted(c, e->args[2], handler, height, key), key);
+            expect_kind(c, e->args[3], wanted(c, e->args[3], handler, height + 1, key), key);
         }
         unsigned at = c->code_count, joins = c->joins;
         emit(c, e->line, e->column, FOLD, 0, 0);
@@ -2169,19 +2336,23 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         memcpy(c->fold_name, e->name, NAME);
         c->joins = 0;
         bool itemwise = e->op == FOLD_COUNT || e->op == FOLD_FIRST;
+        Type values = NUM;
         if (!itemwise) {
             Kind kind = value(c, e->args[1], false, 0);
-            if (kind.type != NUM)
-                fail_at(c, e->args[1]->line, e->args[1]->column, "sum, max, min and distinct take numbers, not %s",
+            if (kind.type != NUM && kind.type != I64)
+                fail_at(c, e->args[1]->line, e->args[1]->column, "sum, max, min and distinct take numbers or i64s, not %s",
                         type_name(kind.type));
+            values = kind.type;
         }
         if (e->args[0]) truth(c, e->args[0], false, !itemwise, "where");
         else emit(c, e->line, e->column, CONST, 1, 1); /* every item */
         c->folding = false;
         c->fold_list = -1;
         c->joins = joins;
-        c->code[at].arg = (uint32_t)e->op | (sliced ? 0x80u : 0) | (uint32_t)list << 8 | (uint32_t)(c->code_count - at - 1) << 16;
-        return e->op == FOLD_FIRST ? (Kind){INDEX, list} : (Kind){NUM, -1};
+        c->code[at].arg = (uint32_t)e->op | (values == I64 ? FOLD_INTEGER : 0) | (sliced ? 0x80u : 0) | (uint32_t)list << 8 |
+                          (uint32_t)(c->code_count - at - 1) << 16;
+        return e->op == FOLD_FIRST ? (Kind){INDEX, list} :
+               (Kind){values == I64 && e->op != FOLD_DISTINCT ? I64 : NUM, -1}; /* an i64's sum, most or least */
     }
     case E_RECORD: case E_FIELD:
         fail_at(c, e->line, e->column, "a record value goes into a list, as in list.append(%s { ... })", e->name);
@@ -2191,20 +2362,23 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (e->op == ADD || e->op == SUB) {
             /* at + 1 char moves a cursor, at + 1 an index; both stop at the ends. */
             bool distance = e->args[1]->kind == E_UNIT;
-            Kind left = value(c, e->args[0], handler, height);
+            Kind left = wanted(c, e->args[0], handler, height, distance ? 0 : left_hint(c, e, handler, height, want));
             if (distance && left.type != CURSOR)
                 fail_at(c, e->line, e->column, "only a cursor moves by a distance, not %s", type_name(left.type));
-            if (!distance && left.type != INDEX) expect_kind(c, e->args[0], left, NUM);
-            number(c, distance ? e->args[1]->args[0] : e->args[1], handler, height + 1);
-            if (left.type == NUM) { emit(c, e->line, e->column, (uint8_t)e->op, 0, 0); return left; }
-            if (e->op == SUB) emit(c, e->line, e->column, NEG, 0, 0);
-            if (distance) emit(c, e->line, e->column, CUR_MOVE, (uint32_t)e->args[1]->op, 0);
-            else emit(c, e->line, e->column, INDEX_MOVE, 0, 0);
-            return left;
+            if (distance || left.type == INDEX) {
+                number(c, distance ? e->args[1]->args[0] : e->args[1], handler, height + 1);
+                if (e->op == SUB) emit(c, e->line, e->column, NEG, 0, 0);
+                if (distance) emit(c, e->line, e->column, CUR_MOVE, (uint32_t)e->args[1]->op, 0);
+                else emit(c, e->line, e->column, INDEX_MOVE, 0, 0);
+                return left;
+            }
+            Type type = second(c, e, left, handler, height);
+            emit(c, e->line, e->column, type == I64 ? i64_op(e->op) : (uint8_t)e->op, 0, 0);
+            return (Kind){type, -1};
         }
         if (e->op >= LT && e->op <= NE) {
-            /* Texts compare by their bytes, numbers as numbers; bools are equal or not. */
-            Kind left = value(c, e->args[0], handler, height);
+            /* Texts compare by their bytes, numbers and i64s as numbers; bools are equal or not. */
+            Kind left = wanted(c, e->args[0], handler, height, left_hint(c, e, handler, height, 0));
             if (left.type == TEXT) {
                 expect_kind(c, e->args[1], value(c, e->args[1], handler, height + 1), TEXT);
                 emit(c, e->line, e->column, TEXT_COMPARE, (uint32_t)(e->op - LT), 0);
@@ -2216,21 +2390,54 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
                 return (Kind){BOOL, -1};
             }
-            expect_kind(c, e->args[0], left, NUM);
-            number(c, e->args[1], handler, height + 1);
-            emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
+            if (second(c, e, left, handler, height) == I64) emit(c, e->line, e->column, I64_COMPARE, (uint32_t)(e->op - LT), 0);
+            else emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
             return (Kind){BOOL, -1};
         }
         /* fall through */
     default: {
-        /* !, && and || take bools (both sides are computed); the rest numbers. */
+        /* !, && and || take bools (both sides are computed); *, /, %, min and
+         * max numbers or i64s; clamp and floor numbers. */
         bool logic = e->op == AND || e->op == OR || e->op == NOT;
-        for (unsigned i = 0; i < e->count; ++i) {
-            if (logic) truth(c, e->args[i], handler, height + (int)i, e->op == NOT ? "!" : e->op == AND ? "&&" : "||");
-            else number(c, e->args[i], handler, height + (int)i);
+        if (logic) {
+            for (unsigned i = 0; i < e->count; ++i)
+                truth(c, e->args[i], handler, height + (int)i, e->op == NOT ? "!" : e->op == AND ? "&&" : "||");
+            emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
+            return (Kind){BOOL, -1};
         }
+        if (e->op == I64_FROM) { /* i64(x): a whole number in range; a literal is one exactly */
+            if (loose(e->args[0])) integer(c, e->args[0], handler, height);
+            else {
+                number(c, e->args[0], handler, height);
+                emit(c, e->line, e->column, I64_FROM, 0, 0);
+            }
+            return (Kind){I64, -1};
+        }
+        if (e->op == NUM_FROM) { /* number(i): exact within 2^53 */
+            if (loose(e->args[0])) return value(c, e->args[0], handler, height);
+            integer(c, e->args[0], handler, height);
+            emit(c, e->line, e->column, NUM_FROM, 0, 0);
+            return (Kind){NUM, -1};
+        }
+        if (e->op == NEG) {
+            Kind operand = wanted(c, e->args[0], handler, height, want);
+            if (operand.type == I64) {
+                emit(c, e->line, e->column, I64_NEG, 0, 0);
+                return operand;
+            }
+            expect_kind(c, e->args[0], operand, NUM);
+            emit(c, e->line, e->column, NEG, 0, 0);
+            return (Kind){NUM, -1};
+        }
+        if (e->count == 2 && (e->op == MUL || e->op == DIV || e->op == MOD || e->op == MIN || e->op == MAX)) {
+            Kind left = wanted(c, e->args[0], handler, height, left_hint(c, e, handler, height, want));
+            Type type = second(c, e, left, handler, height);
+            emit(c, e->line, e->column, type == I64 ? i64_op(e->op) : (uint8_t)e->op, 0, 0);
+            return (Kind){type, -1};
+        }
+        for (unsigned i = 0; i < e->count; ++i) number(c, e->args[i], handler, height + (int)i);
         emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
-        return (Kind){logic ? BOOL : NUM, -1};
+        return (Kind){NUM, -1};
     }
     }
 }
@@ -2332,10 +2539,11 @@ static void record_fields(Compiler *c, const Expr *e, int list, int height) {
     record_values(c, e, list, values);
     for (unsigned k = 0; k < r->fields; ++k) {
         int at = height + (int)k;
-        if (values[k]) expect_kind(c, values[k], value(c, values[k], true, at), field_kind(r, k));
+        if (values[k]) expect_kind(c, values[k], wanted(c, values[k], true, at, field_kind(r, k)), field_kind(r, k));
         else if (at + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
-        else if (r->field_text[k]) emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
-        else emit(c, e->line, e->column, CONST, r->field_bool[k], r->field_number[k]);
+        else if (r->field_kinds[k] == TEXT) emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
+        else if (r->field_kinds[k] == I64) emit_integer(c, e->line, e->column, r->field_integer[k]);
+        else emit(c, e->line, e->column, CONST, r->field_kinds[k] == BOOL, r->field_number[k]);
     }
 }
 
@@ -2380,8 +2588,8 @@ static void statements(Compiler *c, const Stmt *s) {
                 fail_at(c, s->line, s->column, "'%s' is the item this for walks", s->name);
             if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
             Kind held = value(c, s->value, true, 0);
-            if (held.type != NUM && held.type != BOOL && held.type != INDEX)
-                fail_at(c, s->value->line, s->value->column, "a let holds a number, a bool or an index, not %s",
+            if (held.type != NUM && held.type != BOOL && held.type != I64 && held.type != INDEX)
+                fail_at(c, s->value->line, s->value->column, "a let holds a number, a bool, an i64 or an index, not %s",
                         type_name(held.type));
             unsigned local = c->local_count++;
             memcpy(c->locals[local].name, s->name, NAME);
@@ -2393,7 +2601,7 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_ASSIGN: {
             int local = local_named(c, s->name);
             if (local >= 0) { /* a let takes a new value of its kind */
-                Kind kind = value(c, s->value, true, 0);
+                Kind kind = wanted(c, s->value, true, 0, c->locals[local].kind.type);
                 if (kind.type != c->locals[local].kind.type || (kind.type == INDEX && kind.owner != c->locals[local].kind.owner))
                     fail_at(c, s->value->line, s->value->column, "'%s' holds %s", s->name,
                             c->locals[local].kind.type == INDEX ? "an index of its list" : type_name(c->locals[local].kind.type));
@@ -2406,7 +2614,10 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (kind) fail_at(c, s->line, s->column, "cannot assign to %s '%s'", kind, s->name);
                 fail_at(c, s->line, s->column, "unknown state '%s'", s->name);
             }
-            if (c->state_types[index] == STATE_NUM || c->state_types[index] == STATE_BOOL) {
+            if (c->state_types[index] == STATE_I64) {
+                integer(c, s->value, true, 0);
+                emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
+            } else if (c->state_types[index] == STATE_NUM || c->state_types[index] == STATE_BOOL) {
                 expect_kind(c, s->value, value(c, s->value, true, 0), c->state_types[index] == STATE_BOOL ? BOOL : NUM);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_LIST) {
@@ -2493,7 +2704,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 for (unsigned k = 0; k < r->fields; ++k) {
                     if ((int)k == key) continue;
                     item_of(c, s->first, true, 0, list);
-                    expect_kind(c, values[k], value(c, values[k], true, 1), field_kind(r, k));
+                    expect_kind(c, values[k], wanted(c, values[k], true, 1, field_kind(r, k)), field_kind(r, k));
                     emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | k << 16, 0);
                 }
                 break;
@@ -2508,7 +2719,7 @@ static void statements(Compiler *c, const Stmt *s) {
             if (c->list_key[list] == (int)field + 1)
                 fail_at(c, s->line, s->column, "the key of '%s' does not change; remove the item and add it again", c->state_names[list]);
             if (*s->name) item_of(c, s->first, true, 0, list);
-            expect_kind(c, s->value, value(c, s->value, true, 1), field_kind(r, field));
+            expect_kind(c, s->value, wanted(c, s->value, true, 1, field_kind(r, field)), field_kind(r, field));
             emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
         }
@@ -2538,7 +2749,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (!given[f]) fail_at(c, s->line, s->column, "send %s needs '%s'", s->name, out->field_names[f]);
                 int type = out->field_types[f];
                 if (type == FIELD_BYTES) bytes_value(c, given[f], (int)f, "a bytes field");
-                else expect_kind(c, given[f], value(c, given[f], true, (int)f), message_kind(type));
+                else expect_kind(c, given[f], wanted(c, given[f], true, (int)f, message_kind(type)), message_kind(type));
             }
             emit(c, s->line, s->column, SEND, (uint32_t)output, 0);
             break;
@@ -2561,10 +2772,12 @@ static void statements(Compiler *c, const Stmt *s) {
             const char *kind = declared_kind(c, s->name);
             if (kind) fail_at(c, s->last->line, s->last->column, "'%s' is already declared as %s", s->name, kind);
             if (s->low) { /* a slice: the keys from low up to before high */
-                if (!keyed_by(c, list) || field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1) != NUM)
-                    fail_at(c, s->first->line, s->first->column, "'%s' is not keyed by a number: a slice takes one", s->member);
-                number(c, s->low, true, 0);
-                number(c, s->high, true, 1);
+                Type key = keyed_by(c, list) ? field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1) : TEXT;
+                if (key != NUM && key != I64)
+                    fail_at(c, s->first->line, s->first->column, "'%s' is not keyed by a number or an i64: a slice takes one",
+                            s->member);
+                expect_kind(c, s->low, wanted(c, s->low, true, 0, key), key);
+                expect_kind(c, s->high, wanted(c, s->high, true, 1, key), key);
             }
             unsigned at = c->code_count, jump = 0;
             emit(c, s->line, s->column, EACH, 0, 0);
@@ -2619,6 +2832,11 @@ static unsigned char *put16(unsigned char *p, uint32_t v) {
 static unsigned char *put32(unsigned char *p, uint32_t v) {
     for (unsigned i = 0; i < 4; ++i) p[i] = (unsigned char)(v >> (8 * i));
     return p + 4;
+}
+
+static unsigned char *put64(unsigned char *p, uint64_t v) {
+    p = put32(p, (uint32_t)v);
+    return put32(p, (uint32_t)(v >> 32));
 }
 
 static unsigned char *put_double(unsigned char *p, double value) {
@@ -2688,7 +2906,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (*c->state_key[i]) {
                 const Record *r = &c->records[record];
                 c->list_key[i] = 1 + (int)record_field(c, r, c->state_key[i], c->state_key_line[i], c->state_key_column[i]);
-                if (r->field_bool[c->list_key[i] - 1])
+                if (r->field_kinds[c->list_key[i] - 1] == BOOL)
                     fail_at(c, c->state_key_line[i], c->state_key_column[i], "a list is keyed by a number or text; '%s' is a bool",
                             c->state_key[i]);
             }
@@ -2698,7 +2916,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         Record *r = &c->records[i];
         for (unsigned k = 0; k < r->fields; ++k) {
             Expr empty = {.kind = E_TEXT, .line = r->line, .column = r->column};
-            if (r->field_text[k]) r->field_constant[k] = constant(c, r->field_string[k] ? r->field_string[k] : &empty);
+            if (r->field_kinds[k] == TEXT) r->field_constant[k] = constant(c, r->field_string[k] ? r->field_string[k] : &empty);
         }
     }
     for (unsigned i = 0; i < c->handler_count; ++i) {
@@ -2764,10 +2982,10 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         c->arguments = c->view_arguments[c->row >= 0 ? (unsigned)c->row : i] - 1;
         c->view_code[i][0] = c->code_count;
         Kind kind = value(c, c->view_value[i], false, 0);
-        if (kind.type != NUM && kind.type != BOOL && kind.type != TEXT)
-            fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a %s is a number, a bool or text, not %s",
+        if (kind.type != NUM && kind.type != BOOL && kind.type != I64 && kind.type != TEXT)
+            fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a %s is a number, a bool, an i64 or text, not %s",
                     c->row >= 0 ? "column" : "view", type_name(kind.type));
-        c->view_types[i] = kind.type == TEXT ? VIEW_TEXT : kind.type == BOOL ? VIEW_BOOL : VIEW_NUM;
+        c->view_types[i] = kind.type == TEXT ? VIEW_TEXT : kind.type == BOOL ? VIEW_BOOL : kind.type == I64 ? VIEW_I64 : VIEW_NUM;
         c->view_code[i][1] = c->code_count - c->view_code[i][0];
     }
     c->row = -1;
@@ -2822,6 +3040,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         p = put32(p, state_name[i]);
         p = put32(p, (uint32_t)c->state_types[i]);
         if (c->state_types[i] == STATE_NUM || c->state_types[i] == STATE_BOOL) p = put_double(p, c->initial[i]);
+        else if (c->state_types[i] == STATE_I64) p = put64(p, (uint64_t)c->state_integer[i]);
         else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */
             p = put32(p, state_ref[i]);
             p = put32(p, c->state_types[i] == STATE_LIST ? (c->state_rows[i] ? LIST_ROWS : (uint32_t)c->list_key[i]) :
@@ -2861,8 +3080,10 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         for (unsigned k = 0; k < c->records[i].fields; ++k) {
             const Record *r = &c->records[i];
             p = put32(p, record_field_name[i][k]);
-            p = put32(p, r->field_text[k] ? 1 : r->field_bool[k] ? FIELD_RECORD_BOOL : 0);
-            if (r->field_text[k]) { p = put32(p, r->field_constant[k]); p = put32(p, 0); }
+            static const uint32_t types[] = {[NUM] = 0, [TEXT] = 1, [BOOL] = 2, [I64] = 3}; /* Pure's record field types */
+            p = put32(p, types[r->field_kinds[k]]);
+            if (r->field_kinds[k] == TEXT) { p = put32(p, r->field_constant[k]); p = put32(p, 0); }
+            else if (r->field_kinds[k] == I64) p = put64(p, (uint64_t)r->field_integer[k]);
             else p = put_double(p, r->field_number[k]);
         }
     for (unsigned i = 0; i < c->views; ++i) {
@@ -2881,7 +3102,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->code_count; ++i) {
         *p++ = c->code[i].op; *p++ = 0; *p++ = 0; *p++ = 0;
         p = put32(p, c->code[i].arg);
-        p = put_double(p, c->code[i].value);
+        p = put64(p, (uint64_t)c->code[i].integer); /* a number's bits, or an i64's */
     }
     memcpy(p, strings, used);
     if (c->constant_used) memcpy(p + used, c->constant_data, c->constant_used);

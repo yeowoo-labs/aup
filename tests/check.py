@@ -91,7 +91,7 @@ DIAGNOSTICS = [
     # v0b: messages, keyed documents and types
     ('state d: bytes by key\ninput m = message\non m {\n  reply d[key]\n}\n', '4:9', 'd[key] needs the handler of a message by key'),
     ('input m = message by key { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'reply takes bytes or text, not a number'),
-    ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, number, bool, bytes, text and list of a record'),
+    ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, i64, number, bool, bytes, text and list of a record'),
     ('input m = message by key\non m.down {\n}\n', '2:4', "'m' is a message; write on m { }"),
     ('input k = key Space\non k {\n}\n', '2:4', "'k' is a key input; write on k.down or on k.up"),
     ('state d: bytes by key\ninput m = message by key { a: bytes }\non m {\n  d[1].replace(0 .. 0, m.a)\n}\n', '4:5',
@@ -129,8 +129,8 @@ DIAGNOSTICS = [
      '6:12', "a cursor of 'a' cannot point into 'b'"),
     ('state a: text\nstate at: cursor in a\ninput k = key KeyK\non k.down {\n  at = 3\n}\n', '5:8',
      'expected a cursor, not a number'),
-    ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number, a bool or text, not a cursor'),
-    ('state a: text\nstate at: cursor in a\nview v = "{at}"\n', '3:12', 'a string shows numbers, bools and text, not a cursor'),
+    ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number, a bool, an i64 or text, not a cursor'),
+    ('state a: text\nstate at: cursor in a\nview v = "{at}"\n', '3:12', 'a string shows numbers, bools, i64s and text, not a cursor'),
     ('state x = 1\nstate t: text = "{x}"\n', '2:17', 'a text state starts from a plain string'),
     ('view v = "a\\qb"\n', '1:12', 'unknown escape'),
     ('view v = "\\u{D800}"\n', '1:11', 'Unicode scalar'),
@@ -145,7 +145,7 @@ DIAGNOSTICS = [
     # records, lists and indices
     ('record T {\n  a = 0\n  a = 1\n}\n', '3:3', "duplicate field 'a'"),
     ('record T {\n}\n', '1:8', 'a record needs at least one field'),
-    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0), a bool (field = false) or text (field: text)'),
+    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0), a bool (field = false), text (field: text) or an i64 (field: i64)'),
     ('record T {\n  a = 0\n}\nstate T = 0\n', '4:7', "'T' is already declared as a record"),
     ('state xs: list of Missing\n', '1:7', "a list holds a record; 'Missing' is not one"),
     ('state x = 0\nstate at: index of x\n', '2:7', "an index points into a list state; 'x' is not one"),
@@ -156,7 +156,7 @@ DIAGNOSTICS = [
     (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at]\n', '6:10', 'read a field of the item'),
     (RECORD + 'state xs: list of T\nview v = xs\n', '5:10', "'xs' is a list; read xs.count"),
     (RECORD + 'state xs: list of T\nview v = xs.size\n', '5:10', "a list has count, first and last, not 'size'"),
-    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number, a bool or text, not an index'),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number, a bool, an i64 or text, not an index'),
     (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  at = 3\n}\n', '8:8', 'expected an index, not a number'),
     (RECORD + 'state xs: list of T\n' + ON_K + '  xs = 1\n}\n', '7:3', 'a list changes by append, insert, remove'),
     (RECORD + 'record U {\n  a = 0\n}\nstate xs: list of T\n' + ON_K + '  xs.append(U { a: 1 })\n}\n', '10:13',
@@ -191,7 +191,7 @@ DIAGNOSTICS = [
     (LIST + 'view t = each x in xs {\n  a = 1\n  a = 2\n}\n', '8:3', "duplicate column 'a'"),
     (LIST + 'view t = each x in xs {\n  a = x.a\n}\nview v = x.a\n', '9:10', "unknown state 'x'"),
     (LIST + 'view t = each at in xs {\n  a = 1\n}\n', '6:15', "'at' is already declared as a list index"),
-    (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number, a bool or text, not an index'),
+    (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number, a bool, an i64 or text, not an index'),
     ('view each = 1\n', '1:6', "'each' is reserved"),
     # fns
     ('fn f(x) = x\nview v = f(1, 2)\n', '2:10', 'f expects 1 argument'),
@@ -207,13 +207,13 @@ DIAGNOSTICS = [
     (LIST + 'view v = count(x in xs where count(y in xs) > 0)\n', '6:30', 'a count, sum, max or min cannot hold another'),
     (LIST + 'view v = count(x in at)\n', '6:10', "'at' is not a list"),
     ('record T {\n  t: text\n}\nstate xs: list of T\nview v = sum(x.t for x in xs)\n', '5:14',
-     'sum, max, min and distinct take numbers, not text'),
+     'sum, max, min and distinct take numbers or i64s, not text'),
     (LIST + 'fn f(n) = count(x in xs where x.a == n)\nview v = f(1)\n', '6:38',
      "'n' is a parameter outside this count, sum, max or min"),
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
     (LIST + 'view v = sum(x.a for x xs)\n', '6:24', "expected 'in' and a list, as in sum(x in tasks)"),
     (LIST + 'view w = each r in xs where r {\n  n = r.a\n}\n', '6:29', 'expected a bool, not an index'),
-    (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number, a bool or text, not an index'),
+    (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number, a bool, an i64 or text, not an index'),
     (LIST + 'view w = each r in xs where count(y in xs) > 0 {\n  n = r.a\n}\n', '6:29',
      "a table's where cannot hold a count, sum, max or min"),
     # Keyed lists: a key field of the record, placed by add, found by key, never changed.
@@ -276,7 +276,7 @@ DIAGNOSTICS = [
     (ARGS + 'view v(k: u32, k: u32) = k\n', '6:16', "duplicate argument 'k'"),
     (ARGS + 'view v(n: u32) = n\n', '6:8', "'n' is already declared as a state"),
     (ARGS + 'view t(r: u32) = each r in xs {\n  a = r.a\n}\n', '6:8', "'r' names the table's row"),
-    (ARGS + 'view v(k: list) = 1\n', '6:11', 'an argument is a u32, number, bool, bytes or text'),
+    (ARGS + 'view v(k: list) = 1\n', '6:11', 'an argument is a u32, i64, number, bool, bytes or text'),
     (ARGS + 'view v() = 1\n', '6:6', "'v()' takes no argument: write view v = ..."),
     (ARGS + 'view averylongviewnamethatistoolong(k: u32) = k\n', '6:6',
      'a view with arguments has a name of at most 26 characters'),
@@ -284,7 +284,7 @@ DIAGNOSTICS = [
     # A let holds a number or an index for the rest of its block, in its handler.
     (LETS + 'on k.down {\n  let n = 1\n}\n', '10:7', "'n' is already declared as a state"),
     (LETS + 'on k.down {\n  let x = 1\n  let x = 2\n}\n', '11:7', "'x' is already a let here"),
-    (LETS + 'on k.down {\n  let x = t\n}\n', '10:11', 'a let holds a number, a bool or an index, not text'),
+    (LETS + 'on k.down {\n  let x = t\n}\n', '10:11', 'a let holds a number, a bool, an i64 or an index, not text'),
     (LETS + 'on k.down {\n  let x = 1\n  x = xs.first\n}\n', '11:7', "'x' holds a number"),
     (LETS + 'on k.down {\n  let i = xs.first\n  i = ys.first\n}\n', '11:7', "'i' holds an index of its list"),
     (LETS + 'on k.down {\n  if n > 0 {\n    let x = 1\n  }\n  n = x\n}\n', '13:7', "unknown state 'x'"),
@@ -292,8 +292,8 @@ DIAGNOSTICS = [
     (LETS + 'view v = x\non k.down {\n  let x = 1\n}\n', '9:10', "unknown state 'x'"),
     (LETS + 'on k.down {\n  let let = 1\n}\n', '10:7', "'let' is reserved"),
     # A slice takes a list keyed by a number.
-    (LETS + 'view v = count(x in xs[0 .. 3])\n', '9:10', "'xs' is not keyed by a number: a slice takes one"),
-    (LETS + 'on k.down {\n  for x in xs[0 .. 1] {\n    n = 1\n  }\n}\n', '10:12', "'xs' is not keyed by a number: a slice takes one"),
+    (LETS + 'view v = count(x in xs[0 .. 3])\n', '9:10', "'xs' is not keyed by a number or an i64: a slice takes one"),
+    (LETS + 'on k.down {\n  for x in xs[0 .. 1] {\n    n = 1\n  }\n}\n', '10:12', "'xs' is not keyed by a number or an i64: a slice takes one"),
     # A bool is not a number: conditions take bools, and a number says how to become one.
     ('state n = 0\non frame {\n  if n {\n    n = 1\n  }\n}\n', '3:6', 'if takes a bool, not a number: compare it, as in n != 0'),
     ('view v = if 1 { 2 } else { 3 }\n', '1:13', 'if takes a bool, not a number'),
@@ -310,14 +310,50 @@ DIAGNOSTICS = [
     ('state lit = true\nstate n = 0\non frame {\n  n = lit\n}\n', '4:7', 'expected a number, not a bool'),
     ('state lit = true\non frame {\n  lit = 1\n}\n', '3:9', 'expected a bool, not a number'),
     ('record T {\n  a = false\n}\nstate xs: list of T by a\n', '4:24', "a list is keyed by a number or text; 'a' is a bool"),
-    ('record T {\n  a = false\n}\nstate xs: list of T\nview v = sum(x.a for x in xs)\n', '5:', 'sum, max, min and distinct take numbers, not a bool'),
+    ('record T {\n  a = false\n}\nstate xs: list of T\nview v = sum(x.a for x in xs)\n', '5:', 'sum, max, min and distinct take numbers or i64s, not a bool'),
     ('record T {\n  a = false\n}\nstate xs: list of T\n' + ON_K + '  xs.append(T { a: 1 })\n}\n', '7:20', 'expected a bool, not a number'),
     ('input m = message {\n  ok: bool\n}\nstate n = 0\non m {\n  n = m.ok\n}\n', '6:7', 'expected a number, not a bool'),
     ('state lit = true\noutput o = message {\n  n: number\n}\n' + ON_K + '  send o { n: lit }\n}\n', '7:15', 'expected a number, not a bool'),
     ('state true = 1\n', '1:7', "'true' is reserved"),
+    # An i64 is exact and whole, and does not mix with numbers: a literal takes the type the other side has.
+    ('state n: i64 = 1.5\n', '1:16', "expected a whole number for an i64 state"),
+    ('state n: i64 = 9223372036854775808\n', '1:16', "the number is past an i64's range"),
+    ('state n: i64\nstate x = 0\nview v = n + x\n', '3:14', 'expected an i64, not a number: convert it, as in i64(x)'),
+    ('state n: i64\nstate x = 0\nview v = x + n\n', '3:14', 'an i64 and a number do not mix: convert one, as in i64(x) or number(n)'),
+    ('state n: i64\non frame {\n  n = 2.5\n}\n', '3:7', 'an i64 is a whole number; this one is not'),
+    ('state n: i64\nstate x = 0\non frame {\n  n = x\n}\n', '4:7', 'expected an i64, not a number: convert it, as in i64(x)'),
+    ('state n: i64\nstate x = 0\non frame {\n  x = n\n}\n', '4:7', 'expected a number, not an i64'),
+    ('state n: i64\nview v = clamp(n, 0, 1)\n', '2:16', 'expected a number, not an i64'),
+    ('state n: i64\nview v = floor(n)\n', '2:16', 'expected a number, not an i64'),
+    ('state n: i64\nview v = i64(n)\n', '2:14', 'expected a number, not an i64'),
+    ('state x = 0\nview v = number(x)\n', '2:17', 'expected an i64, not a number: convert it, as in i64(x)'),
+    ('record T {\n  id: i64 = 1.5\n}\n', '2:13', "expected a whole number for an i64 field's default"),
+    ('record T {\n  id: i64\n}\nstate xs: list of T by id\nview v = xs[1.5].id\n', '5:13',
+     "'xs' is keyed by id, an i64: expected an i64 or an index, not a number"),
+    ('state n: i64\nview v = if true { n } else { 1.5 }\n', '2:31', 'the branches of if give an i64 and a number'),
+    ('state n: i64\nview v = n < true\n', '2:14', 'expected an i64, not a bool'),
+    ('view v = 9223372036854775808 + i64(1)\n', '1:10', "the number is past an i64's range"),
+    ('input m = message {\n  id: i64\n}\nstate x = 0\non m {\n  x = m.id\n}\n', '6:7', 'expected a number, not an i64'),
+    ('record T {\n  a: i64\n}\nstate xs: list of T\nview v = sum(x.a for x in xs) + 1.5\n', '5:33',
+     'an i64 is a whole number; this one is not'),
 ]
 
 ACCEPTED = [
+    # Literals beside numbers and i64s, nested deep: each chain is typed in one probe (a probe per level would take 2^30).
+    'state x = 0\nstate y: i64\nview v = ' + '1 + (' * 30 + 'x' + ')' * 30 + '\nview w = ' + '1 + (' * 30 + 'y' + ')' * 30 + '\n',
+    # i64s: states, fields, keys, slices, messages, outputs, arguments, lets, arithmetic, conditionals, folds, text.
+    'record Order {\n  id: i64\n  total: i64 = -1\n  note: text\n}\nstate orders: list of Order by id\n'
+    'state next: i64 = 9007199254740993\nstate sum: i64\nstate seen = 0\ninput put = message {\n  id: i64\n  total: i64\n}\n'
+    'output told = message {\n  id: i64\n  big: bool\n}\ninput go = key KeyG\n'
+    'on put {\n  orders.add(Order { id: put.id, total: put.total * 2 + 1, note: "{put.id}" })\n'
+    '  send told { id: put.id, big: put.total > 1000 }\n}\n'
+    'on go.down {\n  let step: = 0\n}\n'.replace('  let step: = 0\n', '  let step = next / 3 % 7 - 1\n  next = next + step\n'
+    '  sum = sum + max(-step, 0) + min(1, next)\n  seen = number(step) + seen\n'
+    '  for o in orders[0 .. next] where o.total != 0 {\n    o.total = -o.total\n  }\n  if orders.has(5) { orders[5].total = 9 }\n')
+    + 'view count = count(o in orders[-5 .. 5])\nview most = max(o.total for o in orders)\nview kinds = distinct(o.total for o in orders)\n'
+    'view pick = if seen > 0 { next } else if seen < 0 { 0 } else { -1 }\nview line = "{next}/{sum}"\n'
+    'view from(low: i64) = sum(o.total for o in orders where o.id >= low)\nview back = i64(2.0) + i64(seen)\n'
+    'view board = each o in orders where o.id > 0 {\n  id = o.id\n  total = o.total\n}\n',
     # Bools: states, fields, message and output fields, arguments, lets, views, columns, interpolation, has.
     'state lit = false\nstate n = 0\nrecord T {\n  done = false\n  title: text\n}\nstate ts: list of T\n'
     'record K {\n  name: text\n  flag = true\n}\nstate ks: list of K by name\ninput flip = key Space\n'
@@ -508,9 +544,11 @@ KEYS = ['Space', 'Enter', 'ArrowLeft', 'ArrowRight', 'KeyA', 'KeyQ', 'Digit0', '
 
 
 def random_program(rng):
-    """A random well-formed program of numbers and bools: every one must compile and verify."""
-    states = [(f's{i}', rng.random() < 0.3) for i in range(rng.randint(1, 6))]
-    numbers, flags = [name for name, flag in states if not flag], [name for name, flag in states if flag]
+    """A random well-formed program of numbers, bools and i64s: every one must compile and verify."""
+    states = [(f's{i}', rng.choice(['number', 'number', 'bool', 'i64'])) for i in range(rng.randint(1, 6))]
+    numbers = [name for name, kind in states if kind == 'number']
+    flags = [name for name, kind in states if kind == 'bool']
+    integers = [name for name, kind in states if kind == 'i64']
     inputs = [f'i{i}' for i in range(rng.randint(0, 4))]
     keys = rng.sample(KEYS, len(inputs))
 
@@ -520,13 +558,32 @@ def random_program(rng):
             return rng.choice([str(rng.choice([0, 1, 2, 0.5, 1e-3, 1e300, 7.25]))] + numbers + (['dt'] if handler else []))
         if choice < 0.35:
             return '-' + number(depth - 1, handler)
-        if choice < 0.5:
+        if choice < 0.45:
             name, count = rng.choice([('min', 2), ('max', 2), ('clamp', 3)])
             return f'{name}(' + ', '.join(number(depth - 1, handler) for _ in range(count)) + ')'
+        if choice < 0.5:
+            return f'number({integer(depth - 1, handler)})'
         if choice < 0.6:
             return f'(if {truth(depth - 1, handler)} {{ {number(depth - 1, handler)} }} else {{ {number(depth - 1, handler)} }})'
         op = rng.choice(['+', '-', '*', '/'])
         return f'({number(depth - 1, handler)} {op} {number(depth - 1, handler)})'
+
+    def integer(depth, handler):
+        choice = rng.random()
+        if depth <= 0 or choice < 0.25:
+            literal = str(rng.choice([0, 1, 7, -3, 2**31, 2**53 + 1, 2**62, -2**62, 2**63 - 1]))
+            return rng.choice([f'i64({literal})' if not integers or rng.random() < 0.5 else literal] + integers)
+        if choice < 0.35:
+            return f'i64({number(depth - 1, handler)})'
+        if choice < 0.45:
+            return f'{rng.choice(["min", "max"])}({integer(depth - 1, handler)}, {integer(depth - 1, handler)})'
+        if choice < 0.55:
+            return f'(if {truth(depth - 1, handler)} {{ {integer(depth - 1, handler)} }} else {{ {rng.choice(["0", "-1"])} }})'
+        if choice < 0.6:
+            return '-' + integer(depth - 1, handler)
+        op = rng.choice(['+', '-', '*', '/', '%'])
+        right = str(rng.choice([1, 2, 10, -3])) if rng.random() < 0.3 else integer(depth - 1, handler)
+        return f'({integer(depth - 1, handler)} {op} {right})'
 
     def truth(depth, handler):
         choice = rng.random()
@@ -534,11 +591,16 @@ def random_program(rng):
             return rng.choice(['true', 'false'] + flags)
         if choice < 0.35:
             return '!' + truth(depth - 1, handler)
-        if choice < 0.7:
+        if choice < 0.55:
             op = rng.choice(['<', '<=', '>', '>=', '==', '!='])
             return f'({number(depth - 1, handler)} {op} {number(depth - 1, handler)})'
+        if choice < 0.7:
+            op = rng.choice(['<', '<=', '>', '>=', '==', '!='])
+            return f'({integer(depth - 1, handler)} {op} {integer(depth - 1, handler)})'
         op = rng.choice(['&&', '||', '==', '!='])
         return f'({truth(depth - 1, handler)} {op} {truth(depth - 1, handler)})'
+
+    make = {'number': number, 'bool': truth, 'i64': integer}
 
     def body(depth, indent):
         lines = []
@@ -551,13 +613,14 @@ def random_program(rng):
                     lines += body(depth - 1, indent + '  ')
                 lines.append(f'{indent}}}')
             else:
-                name, flag = rng.choice(states)
-                lines.append(f'{indent}{name} = {truth(3, True) if flag else number(3, True)}')
+                name, kind = rng.choice(states)
+                lines.append(f'{indent}{name} = {make[kind](3, True)}')
         return lines
 
-    lines = [f'state {name} = {rng.choice(["true", "false"] if flag else ["0", "-1", "3.5", "+2"])}' for name, flag in states]
+    starts = {'number': ['0', '-1', '3.5', '+2'], 'bool': ['true', 'false'], 'i64': ['0', '-9', '9007199254740993']}
+    lines = [f'state {name}{": i64" if kind == "i64" else ""} = {rng.choice(starts[kind])}' for name, kind in states]
     lines += [f'input {name} = key {key}' for name, key in zip(inputs, keys)]
-    lines += [f'view v{i} = {truth(3, False) if rng.random() < 0.3 else number(3, False)}' for i in range(rng.randint(0, 3))]
+    lines += [f'view v{i} = {rng.choice(list(make.values()))(3, False)}' for i in range(rng.randint(0, 3))]
     events = ['frame'] + [f'{name}.{edge}' for name in inputs for edge in ('down', 'up')]
     for _ in range(rng.randint(0, 5)):
         lines.append(f'on {rng.choice(events)} {{')
@@ -1348,6 +1411,60 @@ def bools(aup, pure_run, work):
     return len(shown)
 
 
+I64_SOURCE = """record Row {
+  id: i64
+  n = 0
+}
+state rows: list of Row by id
+state next: i64 = 9007199254740990
+state n = 0
+input add = key KeyA
+input grow = key KeyG
+input half = key KeyH
+input far = key KeyF
+on add.down {
+  rows.add(Row { id: next, n: n })
+  next = next + 1
+  n = n + 1
+}
+on grow.down { next = next * 1024 }
+on half.down { next = -next / 2 }
+on far.down { n = number(next) }
+view total = sum(r.id for r in rows)
+view line = "{next} {i64(-7) / 2} {i64(-7) % 2} {i64(7) % -2} {-7 / 2}"
+view least = min(r.id for r in rows)
+"""
+
+
+def integers(aup, pure_run, work):
+    """i64s are exact past 2^53 in every output (states, items, views, text),
+    arithmetic past their range fails as overflow and changes nothing,
+    division and remainders floor, a conversion to a number fails where
+    the value does not fit, and a module replaced keeps what fits."""
+    (work / 'integers.aup').write_text(I64_SOURCE)
+    (work / 'integers2.aup').write_text('record Row {\n  id = 0\n  n: i64\n}\nstate rows: list of Row\nstate next = 0\nstate n: i64\n')
+    compile_module(aup, work / 'integers.aup', work / 'integers.pmod')
+    compile_module(aup, work / 'integers2.aup', work / 'integers2.pmod')
+    commands = ['show', 'down add', 'down add', 'down add', 'down add', 'down far', 'down grow', 'down half',
+                f'replace {work / "integers2.pmod"}']
+    shown = [json.loads(line) for line in run(pure_run, work / 'integers.pmod', stdin='\n'.join(commands) + '\n',
+                                                 check=False).stdout.splitlines()]
+    start = 2**53 - 2  # four rows: the last past 2^53
+    rows = [{'id': start + k, 'n': k} for k in range(4)]
+    assert strict(shown[0]['states'], {'rows': [], 'next': start, 'n': 0}), shown[0]
+    assert shown[0]['views']['line'] == f'{start} -4 1 -1 -3.5', shown[0]  # i64s floored; literals alone are numbers
+    assert strict(shown[4]['states'], {'rows': rows, 'next': start + 4, 'n': 4}), shown[4]
+    assert strict(shown[4]['views'], {'total': 4 * start + 6, 'line': f'{start + 4} -4 1 -1 -3.5', 'least': start}), shown[4]
+    assert shown[5]['fault'] == 'limit' and shown[5]['states']['n'] == 4, shown[5]  # 2^53 + 2 is no number
+    assert shown[6]['fault'] == 'overflow' and shown[6]['states']['next'] == start + 4, shown[6]
+    assert shown[7]['states']['next'] == -(start + 4) // 2, shown[7]  # floored, as Python's //
+    # Replaced: next, within 2^53 now, a number; n an i64; ids past 2^53 no number (the default), the rest kept.
+    final = shown[8]
+    assert strict(final['states'], {'rows': [{'id': start + k if k < 3 else 0, 'n': k} for k in range(4)],
+                                    'next': -(start + 4) // 2, 'n': 4}), final
+    return len(shown)
+
+
 def text_parity(aup, pure_run, work, seeds, steps=400):
     module = work / 'notes.pmod'
     compile_module(aup, ROOT / 'examples/notes.aup', module)
@@ -1500,6 +1617,7 @@ def main():
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
         report['bool_snapshots'] = bools(aup, pure_run, work)
+        report['i64_snapshots'] = integers(aup, pure_run, work)
         report['time_snapshots'] = timing(aup, pure_run, work, range(args.seeds))
         report['watched_builds'] = watching(aup, pure_run, work)
         report['fold_snapshots'] = folds(aup, pure_run, work, range(args.seeds if hasattr(args, 'seeds') else 8))
