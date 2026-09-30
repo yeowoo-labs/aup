@@ -119,8 +119,8 @@ view status = "{at.position + 1}/{tasks.count}"
 - **변경은 되돌릴 수 있다.** 리스트 변경은 이벤트마다 기록되고, 이벤트가 실패하면 모두 되돌린다.
 - **레코드를 바꿔도 데이터가 남는다.** 모듈을 교체할 때 리스트는 이름으로 남고, 레코드가 바뀌었으면 항목마다
   이름과 타입이 같은 필드를 옮기고 새 필드는 기본값을 쓴다. 마이그레이션 스크립트가 필요 없다.
-- 레코드 값(`Task { ... }`)은 아직 `append`/`insert`/`add`의 인자로만 쓴다. 레코드 상태와 항목 전체 읽기는 없다.
-  찾기는 `first(...)`(조건)와 키 있는 리스트의 `xs[키]`(키)로 한다.
+- 레코드 값(`Task { ... }`)은 `append`/`insert`/`add`의 인자와 항목 전체 대입(아래 "펼치기와 항목 전체")에 쓴다. 레코드
+  상태는 없다. 찾기는 `first(...)`(조건)와 키 있는 리스트의 `xs[키]`(키)로 한다.
 
 한도: 레코드 16개, 레코드당 필드 16개, 전체 필드 128개, 리스트당 항목 1,600만 개(2^24).
 
@@ -382,3 +382,36 @@ view branch(b: u32, over: number) = each a in accounts where a.bid == b && a.bal
 보기들을 쓴 앱. HTTP는 Pure의 `server_arguments`가 모델과 대조한다.
 
 구현은 C로 손수 쓴 재귀 하강 파서를 유지한다. 문법은 EBNF로 문서화하고, 이후 `aup fmt`와 언어 서버를 붙인다.
+
+### 펼치기와 항목 전체
+
+```text
+record Card { title: text, lane = 0, note: text }
+state cards: list of Card by title
+output changed = message { title: text, lane: u32, note: text }
+input remote = message like changed
+
+on move.down {
+  at.lane = at.lane + 1
+  send changed { ..at }                  # 항목의 필드를 이름으로
+}
+on remote {
+  if !cards.has(remote.title) { cards.add(Card { ..remote }) }
+  else { cards[remote.title] = Card { ..remote } }   # 항목 전체: 모든 필드, 키는 그대로
+}
+```
+
+- **`..source`** 는 레코드 값과 `send`의 중괄호 끝에 한 번 쓴다. 적지 않은 필드는 source의 같은 이름 필드에서 온다. source는
+  항목(인덱스, `let`, `for`가 걷는 항목, `xs[키]`)이나 그 핸들러의 메시지다(그룹 안의 필드는 경로 이름으로 맞춘다). 레코드
+  값에서 source에 없는 필드는 기본값이고, `send`에서는 지금처럼 모든 필드가 채워져야 한다(`send changed needs 'x'`). 적은
+  필드가 먼저다: `send changed { note: "moved", ..at }`.
+- **`xs[i] = Record { ... }`** 는 그 항목의 모든 필드를 바꾼다. 필드는 모두 주어야 한다(펼치기로 줘도 된다. 기본값으로 되돌리는
+  일은 없다). 키 있는 리스트의 키는 바뀌지 않으므로, 값의 키가 항목의 키와 다르면 이벤트가 `limit`으로 실패하고 아무것도 바뀌지
+  않는다.
+- 둘 다 필드를 하나하나 적은 것과 같은 모듈을 낸다(검사가 바이트로 대조한다). 실행 비용이 따로 없다.
+- 두 노드가 함께 쓰는 보드(Pure `docs/research/105-growing-a-shared-board.md`)에서 필드 하나를 더할 때 고칠 곳이 다섯에서 둘(레코드와
+  출력)로 줄었다. 보내기와 적용은 필드를 이름으로 따라간다.
+
+검증: 진단 7건(펼치기가 끝이 아님, 펼칠 수 없는 source, 핸들러 밖의 메시지, 그룹 안의 펼치기, 채워지지 않은 send 필드, 필드가
+빠진 항목 전체, 레코드가 아닌 값). 펼치기와 항목 전체를 쓴 모듈과 필드를 적은 모듈이 바이트로 같다. `pure-run`에서 키가 다른 항목
+전체 대입은 `limit`으로 실패하고 값을 바꾸지 않으며, 키가 같은 것은 바꾼다.

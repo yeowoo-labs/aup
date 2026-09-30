@@ -58,6 +58,10 @@ ARGS = 'record T {\n  a = 0\n}\nstate xs: list of T\nstate n = 0\n'
 # A message with rows (a list of a record) beside a list state.
 ROWS = 'record L {\n  item = 0\n  qty = 1\n}\nstate xs: list of L\nstate n = 0\ninput o = message {\n  rows: list of L\n}\n'
 # An app with an output: bought items go out as orders.
+# A keyed list, an index into it, a message and an output of the same fields: spreads and whole items.
+CARDS = ('record Card {\n  title: text\n  lane = 0\n  note: text\n}\nstate cards: list of Card by title\n'
+         'state at: index of cards\ninput m = message {\n  title: text\n  lane: u32\n  note: text\n}\n'
+         'output o = message {\n  title: text\n  lane: u32\n  note: text\n}\n')
 SENDS = ('state n = 0\ninput buy = message {\n  item: text\n  count: u32\n}\noutput ordered = message {\n'
          '  item: text\n  count: u32\n  to: {\n    city: text\n  }\n}\n')
 DIAGNOSTICS = [
@@ -245,6 +249,17 @@ DIAGNOSTICS = [
     ('record L {\n  item = 0\n}\noutput o = message {\n  rows: list of L\n}\n', '5:9',
      'an output sends no rows: send one message a row'),
     ('input a = message like nothing\n', '1:24', "'nothing' is no message input or output declared before"),
+    (CARDS + 'on m {\n  cards.add(Card { ..m, title: "x" })\n}\n', '19:25', 'a spread goes last'),
+    (CARDS + 'on m {\n  cards.add(Card { ..1 })\n}\n', '19:22',
+     "a spread takes an item (an index, or list[key]) or this handler's message"),
+    (CARDS + 'record Other {\n  title: text\n}\nstate others: list of Other\nstate it: index of others\n'
+     'on m {\n  send o { ..it }\n}\n', '24:3', "send o needs 'lane'"),
+    (CARDS + 'on m {\n  cards[m.title] = Card { title: m.title }\n}\n', '19:20', "cards[...] = Card { ... } needs 'lane'"),
+    (CARDS + 'on m {\n  cards[m.title] = 1\n}\n', '19:20', "'cards' holds Card records"),
+    (CARDS + 'output g = message {\n  to: {\n    city: text\n  }\n}\non m {\n  send g { to: { ..m } }\n}\n', '24:18',
+     "a spread goes in the send's own braces, not a group's"),
+    (CARDS + 'input k = key Space\non k.down {\n  cards.add(Card { ..m })\n}\n', '20:22',
+     "a spread takes an item (an index, or list[key]) or this handler's message"),
     ('input k = key Space\ninput a = message like k\n', '2:24', "'k' is no message input or output declared before"),
     ('input a = message like a\n', '1:24', "'a' is no message input or output declared before"),
     ('record L {\n  item = 0\n}\ninput i = message {\n  rows: list of L\n}\noutput o = message like i\n', '7:25',
@@ -1296,6 +1311,33 @@ def main():
         assert compile_module(aup, work / 'written.aup', work / 'written.pmod') == \
             compile_module(aup, work / 'liked.aup', work / 'liked.pmod'), 'message like differs from its fields written'
         report['message_like'] = True
+
+        # A spread (..source) and a whole item (list[k] = Record { ... }) are their fields written out: the same module.
+        spreads = (CARDS + 'on m {\n  if !cards.has(m.title) {\n    cards.add(Card { lane: 1, ..m })\n  } else {\n'
+                   '    cards[m.title] = Card { ..m }\n  }\n  at = cards[m.title]\n  send o { note: "x", ..at }\n'
+                   '  send o { ..cards[m.title] }\n}\n')
+        written = (CARDS + 'on m {\n  if !cards.has(m.title) {\n    cards.add(Card { title: m.title, lane: 1, note: m.note })\n'
+                   '  } else {\n    require cards[m.title].title == m.title\n    cards[m.title].lane = m.lane\n'
+                   '    cards[m.title].note = m.note\n  }\n  at = cards[m.title]\n'
+                   '  send o { title: at.title, lane: at.lane, note: "x" }\n'
+                   '  send o { title: cards[m.title].title, lane: cards[m.title].lane, note: cards[m.title].note }\n}\n')
+        (work / 'spreads.aup').write_text(spreads)
+        (work / 'spreads-written.aup').write_text(written)
+        assert compile_module(aup, work / 'spreads.aup', work / 'spreads.pmod') == \
+            compile_module(aup, work / 'spreads-written.aup', work / 'spreads-written.pmod'), 'a spread differs from its fields'
+        # A whole item keeps its key: one that names another fails its event, and changes nothing.
+        (work / 'whole.aup').write_text('record T {\n  name: text\n  n = 0\n}\nstate ts: list of T by name\n'
+                                        'input make = key KeyM\ninput right = key KeyR\ninput wrong = key KeyW\n'
+                                        'on make.down { ts.add(T { name: "a", n: 1 }) }\n'
+                                        'on right.down { ts["a"] = T { name: "a", n: 5 } }\n'
+                                        'on wrong.down { ts["a"] = T { name: "b", n: 7 } }\n'
+                                        'view total = sum(t.n for t in ts)\nview count = ts.count\n')
+        compile_module(aup, work / 'whole.aup', work / 'whole.pmod')
+        shown = [json.loads(line) for line in run(pure_run, work / 'whole.pmod', stdin='down make\ndown wrong\ndown right\n',
+                                                  check=False).stdout.splitlines()]
+        assert [(v['views']['total'], v['fault'], v['error']) for v in shown] == \
+            [(1, 'none', None), (1, 'limit', 'event failed'), (5, 'none', None)], shown
+        report['spreads'] = True
 
         # Replacing a running module keeps states by name.
         compile_module(aup, ROOT / 'examples/counter.aup', work / 'counter.pmod')

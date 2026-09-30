@@ -796,6 +796,22 @@ parsed:
 }
 
 /* Record { field: value, ... }: fields end at a comma, semicolon or line end. */
+/* ..source, last in a record's or a send's braces: an E_FIELD with no
+ * member, its value the source (an item, or the handler's message) whose
+ * fields of the same names give those not written. */
+static bool spread(Compiler *c, Expr ***tail) {
+    if (!is(c, "..")) return false;
+    Token dots = take(c);
+    Expr *f = node(c, E_FIELD, dots.line, dots.column);
+    f->args[0] = expression(c, 0, false);
+    f->count = 1;
+    **tail = f;
+    *tail = &f->next;
+    while (is(c, ",") || is(c, ";") || c->token.kind == T_NL) take(c);
+    if (!is(c, "}")) fail_at(c, c->token.line, c->token.column, "a spread goes last, as in { field: value, ..source }");
+    return true;
+}
+
 static Expr *record_value(Compiler *c) {
     Token name = take(c);
     take(c); /* { */
@@ -803,6 +819,7 @@ static Expr *record_value(Compiler *c) {
     memcpy(r->name, name.text, NAME);
     separators(c);
     while (!is(c, "}")) {
+        if (spread(c, &tail)) break;
         Token field = expect_name(c, "a field name");
         expect(c, ":", "':'");
         Expr *f = node(c, E_FIELD, field.line, field.column);
@@ -826,6 +843,7 @@ static Expr *send_fields(Compiler *c) {
     Expr *r = node(c, E_RECORD, open.line, open.column), **tail = &r->args[0];
     separators(c);
     while (!is(c, "}")) {
+        if (spread(c, &tail)) break;
         Token field = expect_name(c, "a field name");
         expect(c, ":", "':'");
         Expr *f = node(c, E_FIELD, field.line, field.column);
@@ -943,8 +961,13 @@ static Stmt *statement(Compiler *c, unsigned depth) {
             if (is(c, "("))
                 fail_at(c, s->first->line, s->first->column, "a collection is indexed by the message key, as in name[key]");
             memcpy(s->member, field.text, NAME);
-        } else fail_at(c, c->token.line, c->token.column, "expected '.' and the field to change, as in %s[at].field = value",
-                       s->name);
+        } else if (is(c, "=")) { /* tasks[at] = Task { ... }: every field of the item (no member) */
+            take(c);
+            s->value = inserted(c);
+            return s;
+        } else
+            fail_at(c, c->token.line, c->token.column,
+                    "expected '.' and the field to change, as in %s[at].field = value, or '=' and a record", s->name);
         expect(c, "=", "'='");
         s->value = expression(c, 0, false);
         return s;
@@ -2162,22 +2185,97 @@ static void bytes_value(Compiler *c, const Expr *e, int height, const char *what
     else if (kind.type != BYTES) fail_at(c, e->line, e->column, "%s takes bytes or text, not %s", what, type_name(kind.type));
 }
 
-/* A record's fields in order, onto the stack from height; missing fields take their default. */
-static void record_fields(Compiler *c, const Expr *e, int list, int height) {
+/* The spread among a record's or a send's fields (..source), or NULL. */
+static const Expr *spread_of(const Expr *e) {
+    for (const Expr *f = e->args[0]; f; f = f->next)
+        if (!f->member[0]) return f;
+    return NULL;
+}
+
+/* What a spread's source reads name from: source.name, as written out (an
+ * item's field, or a field of the handler's message by its path), or NULL
+ * when the source has no field of that name. A source is an item (an
+ * index, a let or the item a for walks, or list[key]) or the handler's
+ * message. */
+static Expr *spread_field(Compiler *c, const Expr *spread, const char *name) {
+    const Expr *source = spread->args[0];
+    int line = spread->line, column = spread->column, list = -1;
+    if (source->kind == E_NAME && c->message >= 0 && !strcmp(source->name, c->inputs[c->message].name)) {
+        const Input *in = &c->inputs[c->message];
+        bool has = false;
+        for (unsigned i = 0; i < in->fields && !has; ++i) has = !strcmp(in->field_names[i], name);
+        if (!has) return NULL;
+        Expr *read = node(c, E_NAME, line, column);
+        memcpy(read->name, source->name, NAME);
+        for (const char *part = name; *part;) { /* to.city: message.to.city */
+            size_t length = strcspn(part, ".");
+            Expr *access = node(c, E_MEMBER, line, column);
+            access->args[0] = read;
+            access->count = 1;
+            memcpy(access->member, part, length);
+            read = access;
+            part += length + (part[length] == '.');
+        }
+        return read;
+    }
+    if (source->kind == E_NAME) {
+        int local = local_named(c, source->name), state = state_index(c, source->name);
+        if (c->walking && !strcmp(source->name, c->walk_name)) list = c->walk_list;
+        else if (local >= 0 && c->locals[local].kind.type == INDEX) list = c->locals[local].kind.owner;
+        else if (local < 0 && state >= 0 && c->state_types[state] == STATE_INDEX) list = cursor_owner(c, state);
+    } else if (source->kind == E_ITEM && !source->member[0])
+        list = list_state(c, source->name, source->line, source->column, source->args[0]);
+    if (list < 0)
+        fail_at(c, source->line, source->column, "a spread takes an item (an index, or list[key]) or this handler's message");
+    const Record *r = record_of(c, list);
+    bool has = false;
+    for (unsigned i = 0; i < r->fields && !has; ++i) has = !strcmp(r->field_names[i], name);
+    if (!has) return NULL;
+    Expr *read;
+    if (source->kind == E_ITEM) {
+        read = node(c, E_ITEM, line, column);
+        memcpy(read->name, source->name, NAME);
+        read->args[0] = source->args[0];
+        read->count = 1;
+    } else {
+        Expr *item = node(c, E_NAME, line, column);
+        memcpy(item->name, source->name, NAME);
+        read = node(c, E_MEMBER, line, column);
+        read->args[0] = item;
+        read->count = 1;
+    }
+    memcpy(read->member, name, NAME);
+    return read;
+}
+
+/* A record value's fields in the record's order (values, NULL when not
+ * given): those written, and the rest its spread's source has by name. */
+static void record_values(Compiler *c, const Expr *e, int list, const Expr **values) {
     const Record *r = record_of(c, list);
     if (e->kind != E_RECORD)
         fail_at(c, e->line, e->column, "'%s' holds %s records, as in %s.append(%s { %s: ... })", c->state_names[list],
                 r->name, c->state_names[list], r->name, r->field_names[0]);
     if (strcmp(e->name, r->name)) fail_at(c, e->line, e->column, "'%s' holds %s, not %s", c->state_names[list], r->name, e->name);
-    const Expr *given[FIELDS_PER_RECORD] = {0};
+    for (unsigned k = 0; k < r->fields; ++k) values[k] = NULL;
     for (const Expr *f = e->args[0]; f; f = f->next) {
+        if (!f->member[0]) continue; /* the spread, below */
         unsigned field = record_field(c, r, f->member, f->line, f->column);
-        if (given[field]) fail_at(c, f->line, f->column, "field '%s' is given twice", f->member);
-        given[field] = f;
+        if (values[field]) fail_at(c, f->line, f->column, "field '%s' is given twice", f->member);
+        values[field] = f->args[0];
     }
+    const Expr *spreading = spread_of(e);
+    for (unsigned k = 0; spreading && k < r->fields; ++k)
+        if (!values[k]) values[k] = spread_field(c, spreading, r->field_names[k]);
+}
+
+/* A record's fields in order, onto the stack from height; missing fields take their default. */
+static void record_fields(Compiler *c, const Expr *e, int list, int height) {
+    const Record *r = record_of(c, list);
+    const Expr *values[FIELDS_PER_RECORD];
+    record_values(c, e, list, values);
     for (unsigned k = 0; k < r->fields; ++k) {
         int at = height + (int)k;
-        if (given[k]) expect_kind(c, given[k]->args[0], value(c, given[k]->args[0], true, at), r->field_text[k] ? TEXT : NUM);
+        if (values[k]) expect_kind(c, values[k], value(c, values[k], true, at), r->field_text[k] ? TEXT : NUM);
         else if (at + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
         else if (r->field_text[k]) emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
         else emit(c, e->line, e->column, CONST, 0, r->field_number[k]);
@@ -2187,6 +2285,10 @@ static void record_fields(Compiler *c, const Expr *e, int list, int height) {
 /* send's values by the output's fields, groups by their paths. */
 static void send_values(Compiler *c, const Input *out, const Expr *group, const char *path, const Expr **given) {
     for (const Expr *f = group->args[0]; f; f = f->next) {
+        if (!f->member[0]) { /* the spread: the send's own braces only */
+            if (*path) fail_at(c, f->line, f->column, "a spread goes in the send's own braces, not a group's");
+            continue;
+        }
         char name[NAME];
         int length = snprintf(name, sizeof(name), "%s%s%s", path, *path ? "." : "", f->member);
         if (length < 0 || length >= NAME) fail_at(c, f->line, f->column, "output '%s' has no field '%s.%s'", out->name, path, f->member);
@@ -2309,6 +2411,35 @@ static void statements(Compiler *c, const Stmt *s) {
         }
         case S_SET: {
             int list = *s->name ? list_state(c, s->name, s->line, s->column, s->first) : -1;
+            if (!s->member[0]) { /* tasks[at] = Task { ... }: each field set, the key the same */
+                const Record *r = record_of(c, list);
+                const Expr *values[FIELDS_PER_RECORD];
+                record_values(c, s->value, list, values);
+                int key = c->list_key[list] - 1;
+                for (unsigned k = 0; k < r->fields; ++k)
+                    if (!values[k]) fail_at(c, s->value->line, s->value->column, "%s[...] = %s { ... } needs '%s'", s->name,
+                                            r->name, r->field_names[k]);
+                if (key >= 0) { /* require tasks[at].key == the value's key */
+                    Expr *item = node(c, E_ITEM, s->line, s->column), *same = node(c, E_BINARY, s->line, s->column);
+                    memcpy(item->name, s->name, NAME);
+                    memcpy(item->member, r->field_names[key], NAME);
+                    item->args[0] = s->first;
+                    item->count = 1;
+                    same->op = EQ;
+                    same->args[0] = item;
+                    same->args[1] = (Expr *)values[key];
+                    same->count = 2;
+                    number(c, same, true, 0);
+                    emit(c, s->line, s->column, REQUIRE, 0, 0);
+                }
+                for (unsigned k = 0; k < r->fields; ++k) {
+                    if ((int)k == key) continue;
+                    item_of(c, s->first, true, 0, list);
+                    expect_kind(c, values[k], value(c, values[k], true, 1), r->field_text[k] ? TEXT : NUM);
+                    emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | k << 16, 0);
+                }
+                break;
+            }
             if (list < 0) {
                 Kind index = value(c, s->first, true, 0);
                 expect_kind(c, s->first, index, INDEX);
@@ -2341,6 +2472,9 @@ static void statements(Compiler *c, const Stmt *s) {
             const Input *out = &c->inputs[output];
             const Expr *given[FIELDS] = {0};
             send_values(c, out, s->value, "", given);
+            const Expr *spreading = spread_of(s->value);
+            for (unsigned f = 0; spreading && f < out->fields; ++f)
+                if (!given[f]) given[f] = spread_field(c, spreading, out->field_names[f]);
             if (out->fields > STACK) fail_at(c, s->line, s->column, "an output of more than %d fields cannot be sent", STACK);
             for (unsigned f = 0; f < out->fields; ++f) {
                 if (!given[f]) fail_at(c, s->line, s->column, "send %s needs '%s'", s->name, out->field_names[f]);
