@@ -91,7 +91,7 @@ DIAGNOSTICS = [
     # v0b: messages, keyed documents and types
     ('state d: bytes by key\ninput m = message\non m {\n  reply d[key]\n}\n', '4:9', 'd[key] needs the handler of a message by key'),
     ('input m = message by key { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'reply takes bytes or text, not a number'),
-    ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, number, bytes, text and list of a record'),
+    ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, number, bool, bytes, text and list of a record'),
     ('input m = message by key\non m.down {\n}\n', '2:4', "'m' is a message; write on m { }"),
     ('input k = key Space\non k {\n}\n', '2:4', "'k' is a key input; write on k.down or on k.up"),
     ('state d: bytes by key\ninput m = message by key { a: bytes }\non m {\n  d[1].replace(0 .. 0, m.a)\n}\n', '4:5',
@@ -129,8 +129,8 @@ DIAGNOSTICS = [
      '6:12', "a cursor of 'a' cannot point into 'b'"),
     ('state a: text\nstate at: cursor in a\ninput k = key KeyK\non k.down {\n  at = 3\n}\n', '5:8',
      'expected a cursor, not a number'),
-    ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number or text, not a cursor'),
-    ('state a: text\nstate at: cursor in a\nview v = "{at}"\n', '3:12', 'a string shows numbers and text, not a cursor'),
+    ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number, a bool or text, not a cursor'),
+    ('state a: text\nstate at: cursor in a\nview v = "{at}"\n', '3:12', 'a string shows numbers, bools and text, not a cursor'),
     ('state x = 1\nstate t: text = "{x}"\n', '2:17', 'a text state starts from a plain string'),
     ('view v = "a\\qb"\n', '1:12', 'unknown escape'),
     ('view v = "\\u{D800}"\n', '1:11', 'Unicode scalar'),
@@ -145,7 +145,7 @@ DIAGNOSTICS = [
     # records, lists and indices
     ('record T {\n  a = 0\n  a = 1\n}\n', '3:3', "duplicate field 'a'"),
     ('record T {\n}\n', '1:8', 'a record needs at least one field'),
-    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0) or text (field: text)'),
+    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0), a bool (field = false) or text (field: text)'),
     ('record T {\n  a = 0\n}\nstate T = 0\n', '4:7', "'T' is already declared as a record"),
     ('state xs: list of Missing\n', '1:7', "a list holds a record; 'Missing' is not one"),
     ('state x = 0\nstate at: index of x\n', '2:7', "an index points into a list state; 'x' is not one"),
@@ -156,7 +156,7 @@ DIAGNOSTICS = [
     (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at]\n', '6:10', 'read a field of the item'),
     (RECORD + 'state xs: list of T\nview v = xs\n', '5:10', "'xs' is a list; read xs.count"),
     (RECORD + 'state xs: list of T\nview v = xs.size\n', '5:10', "a list has count, first and last, not 'size'"),
-    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number or text, not an index'),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number, a bool or text, not an index'),
     (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  at = 3\n}\n', '8:8', 'expected an index, not a number'),
     (RECORD + 'state xs: list of T\n' + ON_K + '  xs = 1\n}\n', '7:3', 'a list changes by append, insert, remove'),
     (RECORD + 'record U {\n  a = 0\n}\nstate xs: list of T\n' + ON_K + '  xs.append(U { a: 1 })\n}\n', '10:13',
@@ -181,17 +181,17 @@ DIAGNOSTICS = [
     # conditional expressions
     ('view v = if 1 { 2 }\n', '1:20', 'an if expression needs else'),
     ('view v = if 1 { 2 } else if 0 { 3 }\n', '1:36', 'an if expression needs else'),
-    ('view v = if 1 { 2 } else { "x" }\n', '1:28', 'the branches of if give a number and text'),
-    ('state a: text\nstate b: text\nstate x: cursor in a\nstate y: cursor in b\n' + ON_K + '  x = if 1 { x } else { y }\n}\n',
-     '7:25', 'the branches of if give cursors of different texts'),
-    ('view v = ' + '1 + (if 1 { ' * 9 + '1' + ' } else { 0 })' * 9 + '\n', '1:111', 'conditional expressions nest too deeply'),
+    ('view v = if true { 2 } else { "x" }\n', '1:31', 'the branches of if give a number and text'),
+    ('state a: text\nstate b: text\nstate x: cursor in a\nstate y: cursor in b\n' + ON_K + '  x = if true { x } else { y }\n}\n',
+     '7:28', 'the branches of if give cursors of different texts'),
+    ('view v = ' + '1 + (if true { ' * 9 + '1' + ' } else { 0 })' * 9 + '\n', '1:135', 'conditional expressions nest too deeply'),
     # tables
     ('view t = each x in missing {\n  a = 1\n}\n', '1:20', "unknown list 'missing'"),
     (LIST + 'view t = each x in xs {\n}\n', '7:1', 'a table needs at least one column'),
     (LIST + 'view t = each x in xs {\n  a = 1\n  a = 2\n}\n', '8:3', "duplicate column 'a'"),
     (LIST + 'view t = each x in xs {\n  a = x.a\n}\nview v = x.a\n', '9:10', "unknown state 'x'"),
     (LIST + 'view t = each at in xs {\n  a = 1\n}\n', '6:15', "'at' is already declared as a list index"),
-    (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number or text, not an index'),
+    (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number, a bool or text, not an index'),
     ('view each = 1\n', '1:6', "'each' is reserved"),
     # fns
     ('fn f(x) = x\nview v = f(1, 2)\n', '2:10', 'f expects 1 argument'),
@@ -212,8 +212,8 @@ DIAGNOSTICS = [
      "'n' is a parameter outside this count, sum, max or min"),
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
     (LIST + 'view v = sum(x.a for x xs)\n', '6:24', "expected 'in' and a list, as in sum(x in tasks)"),
-    (LIST + 'view w = each r in xs where r {\n  n = r.a\n}\n', '6:29', 'expected a number, not an index'),
-    (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number or text, not an index'),
+    (LIST + 'view w = each r in xs where r {\n  n = r.a\n}\n', '6:29', 'expected a bool, not an index'),
+    (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number, a bool or text, not an index'),
     (LIST + 'view w = each r in xs where count(y in xs) > 0 {\n  n = r.a\n}\n', '6:29',
      "a table's where cannot hold a count, sum, max or min"),
     # Keyed lists: a key field of the record, placed by add, found by key, never changed.
@@ -276,7 +276,7 @@ DIAGNOSTICS = [
     (ARGS + 'view v(k: u32, k: u32) = k\n', '6:16', "duplicate argument 'k'"),
     (ARGS + 'view v(n: u32) = n\n', '6:8', "'n' is already declared as a state"),
     (ARGS + 'view t(r: u32) = each r in xs {\n  a = r.a\n}\n', '6:8', "'r' names the table's row"),
-    (ARGS + 'view v(k: list) = 1\n', '6:11', 'an argument is a u32, number, bytes or text'),
+    (ARGS + 'view v(k: list) = 1\n', '6:11', 'an argument is a u32, number, bool, bytes or text'),
     (ARGS + 'view v() = 1\n', '6:6', "'v()' takes no argument: write view v = ..."),
     (ARGS + 'view averylongviewnamethatistoolong(k: u32) = k\n', '6:6',
      'a view with arguments has a name of at most 26 characters'),
@@ -284,7 +284,7 @@ DIAGNOSTICS = [
     # A let holds a number or an index for the rest of its block, in its handler.
     (LETS + 'on k.down {\n  let n = 1\n}\n', '10:7', "'n' is already declared as a state"),
     (LETS + 'on k.down {\n  let x = 1\n  let x = 2\n}\n', '11:7', "'x' is already a let here"),
-    (LETS + 'on k.down {\n  let x = t\n}\n', '10:11', 'a let holds a number or an index, not text'),
+    (LETS + 'on k.down {\n  let x = t\n}\n', '10:11', 'a let holds a number, a bool or an index, not text'),
     (LETS + 'on k.down {\n  let x = 1\n  x = xs.first\n}\n', '11:7', "'x' holds a number"),
     (LETS + 'on k.down {\n  let i = xs.first\n  i = ys.first\n}\n', '11:7', "'i' holds an index of its list"),
     (LETS + 'on k.down {\n  if n > 0 {\n    let x = 1\n  }\n  n = x\n}\n', '13:7', "unknown state 'x'"),
@@ -294,9 +294,41 @@ DIAGNOSTICS = [
     # A slice takes a list keyed by a number.
     (LETS + 'view v = count(x in xs[0 .. 3])\n', '9:10', "'xs' is not keyed by a number: a slice takes one"),
     (LETS + 'on k.down {\n  for x in xs[0 .. 1] {\n    n = 1\n  }\n}\n', '10:12', "'xs' is not keyed by a number: a slice takes one"),
+    # A bool is not a number: conditions take bools, and a number says how to become one.
+    ('state n = 0\non frame {\n  if n {\n    n = 1\n  }\n}\n', '3:6', 'if takes a bool, not a number: compare it, as in n != 0'),
+    ('view v = if 1 { 2 } else { 3 }\n', '1:13', 'if takes a bool, not a number'),
+    ('state n = 0\non frame {\n  require n\n}\n', '3:11', 'require takes a bool, not a number'),
+    (LIST + 'view v = count(x in xs where x.a)\n', '6:30', 'where takes a bool, not a number'),
+    (LIST + 'view t = each x in xs where x.a {\n  a = x.a\n}\n', '6:29', 'where takes a bool, not a number'),
+    (LIST + ON_K + '  for x in xs where x.a {\n  }\n}\n', '8:21', 'where takes a bool, not a number'),
+    ('state n = 0\nview v = !n\n', '2:11', '! takes a bool, not a number'),
+    ('state n = 0\nview v = n > 0 && n\n', '2:19', '&& takes a bool, not a number'),
+    ('state lit = false\nview v = lit + 1\n', '2:10', 'expected a number, not a bool'),
+    ('state lit = false\nview v = -lit\n', '2:11', 'expected a number, not a bool'),
+    ('state lit = false\nview v = lit < true\n', '2:14', 'bools are equal or not (== and !=); they have no order'),
+    ('state lit = false\nview v = lit == 1\n', '2:17', 'expected a bool, not a number'),
+    ('state lit = true\nstate n = 0\non frame {\n  n = lit\n}\n', '4:7', 'expected a number, not a bool'),
+    ('state lit = true\non frame {\n  lit = 1\n}\n', '3:9', 'expected a bool, not a number'),
+    ('record T {\n  a = false\n}\nstate xs: list of T by a\n', '4:24', "a list is keyed by a number or text; 'a' is a bool"),
+    ('record T {\n  a = false\n}\nstate xs: list of T\nview v = sum(x.a for x in xs)\n', '5:', 'sum, max, min and distinct take numbers, not a bool'),
+    ('record T {\n  a = false\n}\nstate xs: list of T\n' + ON_K + '  xs.append(T { a: 1 })\n}\n', '7:20', 'expected a bool, not a number'),
+    ('input m = message {\n  ok: bool\n}\nstate n = 0\non m {\n  n = m.ok\n}\n', '6:7', 'expected a number, not a bool'),
+    ('state lit = true\noutput o = message {\n  n: number\n}\n' + ON_K + '  send o { n: lit }\n}\n', '7:15', 'expected a number, not a bool'),
+    ('state true = 1\n', '1:7', "'true' is reserved"),
 ]
 
 ACCEPTED = [
+    # Bools: states, fields, message and output fields, arguments, lets, views, columns, interpolation, has.
+    'state lit = false\nstate n = 0\nrecord T {\n  done = false\n  title: text\n}\nstate ts: list of T\n'
+    'record K {\n  name: text\n  flag = true\n}\nstate ks: list of K by name\ninput flip = key Space\n'
+    'input m = message {\n  ok: bool\n  n: number\n  at: {\n    ok: bool\n  }\n}\noutput o = message {\n  ok: bool\n  n: number\n}\n'
+    'on flip.down {\n  lit = !lit\n  let big = n > 2\n  if big == lit || !ks.has("a") { n = n + 1 }\n'
+    '  ts.append(T { title: "{lit}" })\n  send o { ok: lit && big, n: n }\n}\n'
+    'on m {\n  lit = m.ok != m.at.ok\n  ts.append(T { done: m.ok, title: "x" })\n  for t in ts where t.done {\n    t.done = false\n  }\n}\n'
+    'view shown = lit\nview label = "{lit} {n > 1} {ts.count > 0 && lit}"\nview open = count(t in ts where !t.done)\n'
+    'view first_done = first(t in ts where t.done).position\nview pick = if lit { "on" } else { "off" }\n'
+    'view board = each t in ts where t.done != lit {\n  done = t.done\n  title = t.title\n  here = t.position == 0\n}\n'
+    'view some(want: bool) = count(t in ts where t.done == want)\n',
     # Declared fields apart by commas, as a value's are (a message's, a group's, a record's, one after the last too).
     'record P { x = 0, y = 0, name: text }\nstate ps: list of P by x\n'
     'input add = message { x: u32, y: number, name: text }\n'
@@ -371,7 +403,7 @@ ACCEPTED = [
     'on k.down {\n  x = 1 + if x > 1 { 10 } else if x > 0 { 20 }\n  else { 30 }\n'
     '  at = if x > 5 { n.end } else { n.start }\n}\n'
     'view size = if x > 1 {\n  "big"\n} else {\n  "small"\n}\n'
-    'view deep = ' + '1 + (if 1 { ' * 7 + '1' + ' } else { 0 })' * 7 + '\n',
+    'view deep = ' + '1 + (if true { ' * 7 + '1' + ' } else { 0 })' * 7 + '\n',
     # a table whose columns read their row, other states and the row's position
     'record Cell {\n  label: text = "-"\n  weight = 1\n}\nstate cells: list of Cell\nstate at: index of cells\n'
     'input add = key KeyA\non add.down {\n  cells.append(Cell { weight: cells.count })\n  at.label = "#{at.weight}"\n}\n'
@@ -433,6 +465,17 @@ def same(a, b):
     return a == b and (a is None) == (b is None)
 
 
+def strict(a, b):
+    """Equal, and a bool is never a number (in Python True == 1)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(strict(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(strict(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def parity(aup, pure_run, workbench, pair, work, seeds):
     source, reference, inputs, views = pair
     module = work / (Path(source).stem + '.pmod')
@@ -465,41 +508,56 @@ KEYS = ['Space', 'Enter', 'ArrowLeft', 'ArrowRight', 'KeyA', 'KeyQ', 'Digit0', '
 
 
 def random_program(rng):
-    """A random well-formed v0a program: every one must compile and verify."""
-    states = [f's{i}' for i in range(rng.randint(1, 6))]
+    """A random well-formed program of numbers and bools: every one must compile and verify."""
+    states = [(f's{i}', rng.random() < 0.3) for i in range(rng.randint(1, 6))]
+    numbers, flags = [name for name, flag in states if not flag], [name for name, flag in states if flag]
     inputs = [f'i{i}' for i in range(rng.randint(0, 4))]
     keys = rng.sample(KEYS, len(inputs))
 
-    def expr(depth, handler):
+    def number(depth, handler):
         choice = rng.random()
         if depth <= 0 or choice < 0.25:
-            return rng.choice([str(rng.choice([0, 1, 2, 0.5, 1e-3, 1e300, 7.25])), rng.choice(states)]
-                              + (['dt'] if handler else []))
-        if choice < 0.4:
-            return rng.choice(['-', '!']) + expr(depth - 1, handler)
-        if choice < 0.55:
+            return rng.choice([str(rng.choice([0, 1, 2, 0.5, 1e-3, 1e300, 7.25]))] + numbers + (['dt'] if handler else []))
+        if choice < 0.35:
+            return '-' + number(depth - 1, handler)
+        if choice < 0.5:
             name, count = rng.choice([('min', 2), ('max', 2), ('clamp', 3)])
-            return f'{name}(' + ', '.join(expr(depth - 1, handler) for _ in range(count)) + ')'
-        op = rng.choice(['+', '-', '*', '/', '<', '<=', '>', '>=', '==', '!=', '&&', '||'])
-        return f'({expr(depth - 1, handler)} {op} {expr(depth - 1, handler)})'
+            return f'{name}(' + ', '.join(number(depth - 1, handler) for _ in range(count)) + ')'
+        if choice < 0.6:
+            return f'(if {truth(depth - 1, handler)} {{ {number(depth - 1, handler)} }} else {{ {number(depth - 1, handler)} }})'
+        op = rng.choice(['+', '-', '*', '/'])
+        return f'({number(depth - 1, handler)} {op} {number(depth - 1, handler)})'
+
+    def truth(depth, handler):
+        choice = rng.random()
+        if depth <= 0 or choice < 0.2:
+            return rng.choice(['true', 'false'] + flags)
+        if choice < 0.35:
+            return '!' + truth(depth - 1, handler)
+        if choice < 0.7:
+            op = rng.choice(['<', '<=', '>', '>=', '==', '!='])
+            return f'({number(depth - 1, handler)} {op} {number(depth - 1, handler)})'
+        op = rng.choice(['&&', '||', '==', '!='])
+        return f'({truth(depth - 1, handler)} {op} {truth(depth - 1, handler)})'
 
     def body(depth, indent):
         lines = []
         for _ in range(rng.randint(0, 3)):
             if depth > 0 and rng.random() < 0.3:
-                lines.append(f'{indent}if {expr(3, True)} {{')
+                lines.append(f'{indent}if {truth(3, True)} {{')
                 lines += body(depth - 1, indent + '  ')
                 if rng.random() < 0.5:
                     lines.append(f'{indent}}} else {{')
                     lines += body(depth - 1, indent + '  ')
                 lines.append(f'{indent}}}')
             else:
-                lines.append(f'{indent}{rng.choice(states)} = {expr(3, True)}')
+                name, flag = rng.choice(states)
+                lines.append(f'{indent}{name} = {truth(3, True) if flag else number(3, True)}')
         return lines
 
-    lines = [f'state {name} = {rng.choice(["0", "-1", "3.5", "+2"])}' for name in states]
+    lines = [f'state {name} = {rng.choice(["true", "false"] if flag else ["0", "-1", "3.5", "+2"])}' for name, flag in states]
     lines += [f'input {name} = key {key}' for name, key in zip(inputs, keys)]
-    lines += [f'view v{i} = {expr(3, False)}' for i in range(rng.randint(0, 3))]
+    lines += [f'view v{i} = {truth(3, False) if rng.random() < 0.3 else number(3, False)}' for i in range(rng.randint(0, 3))]
     events = ['frame'] + [f'{name}.{edge}' for name in inputs for edge in ('down', 'up')]
     for _ in range(rng.randint(0, 5)):
         lines.append(f'on {rng.choice(events)} {{')
@@ -683,7 +741,7 @@ class TasksModel:
         return max(len(self.tasks) - 1, 0)
 
     def typed(self, word):
-        self.tasks.append({'title': word, 'done': 0})
+        self.tasks.append({'title': word, 'done': False})
         self.at, self.made = self.last(), self.made + 1
         return 'none'
 
@@ -692,7 +750,7 @@ class TasksModel:
             return 'not_found'
         if name == 'up': self.at = max(self.at - 1, 0)
         elif name == 'down': self.at = min(self.at + 1, self.last())
-        elif name == 'toggle': self.tasks[self.at]['done'] = int(self.tasks[self.at]['done'] == 0)
+        elif name == 'toggle': self.tasks[self.at]['done'] = not self.tasks[self.at]['done']
         elif name == 'drop':
             del self.tasks[self.at]
             self.at = min(self.at, self.last())
@@ -706,7 +764,7 @@ class TasksModel:
 
     def expected(self):
         item = self.tasks[self.at] if self.tasks else None
-        board = [{'title': task['title'], 'mark': 'x' if task['done'] else ' ', 'here': int(i == self.at)}
+        board = [{'title': task['title'], 'mark': 'x' if task['done'] else ' ', 'here': i == self.at}
                  for i, task in enumerate(self.tasks)]
         return ({'tasks': [dict(task) for task in self.tasks], 'at': self.at, 'made': self.made},
                 {'count': len(self.tasks), 'position': self.at,
@@ -742,19 +800,20 @@ def tasks_parity(aup, pure_run, work, seeds, steps=400):
             snapshot = json.loads(line)
             where = (seed, command)
             assert snapshot['fault'] == fault and (snapshot['error'] is None) == (fault == 'none'), (where, snapshot)
-            assert snapshot['states'] == states, (where, snapshot['states'], states)
-            assert snapshot['views'] == views, (where, snapshot['views'], views)
+            assert strict(snapshot['states'], states), (where, snapshot['states'], states)
+            assert strict(snapshot['views'], views), (where, snapshot['views'], views)
             compared += 1
             failed += fault != 'none'
-    # A replacement whose record gained and reordered fields keeps every item.
+    # A replacement whose record gained and reordered fields keeps every item; done, a bool there, is a
+    # number here (false and true are 0 and 1).
     (work / 'tasks2.aup').write_text('record Task {\n  urgent = 1\n  done = 0\n  title: text = "-"\n}\n'
                                      'state tasks: list of Task\nstate at: index of tasks\n')
     compile_module(aup, work / 'tasks2.aup', work / 'tasks2.pmod')
     lines = run(pure_run, module, stdin='type typed 6d696c6b\ntype typed 62\ndown toggle\ndown up\n'
                                         f'replace {work / "tasks2.pmod"}\n').stdout.splitlines()
     final = json.loads(lines[-1])
-    assert final['states'] == {'tasks': [{'urgent': 1, 'done': 0, 'title': 'milk'},
-                                         {'urgent': 1, 'done': 1, 'title': 'b'}], 'at': 0}, final
+    assert strict(final['states'], {'tasks': [{'urgent': 1, 'done': 0, 'title': 'milk'},
+                                              {'urgent': 1, 'done': 1, 'title': 'b'}], 'at': 0}), final
     return compared, failed
 
 
@@ -857,14 +916,14 @@ def stored_runs(aup, pure_run, work, seeds, steps=240):
                 snapshot = json.loads(line)
                 where = (source, seed, command)
                 assert snapshot['fault'] == fault, (where, snapshot)
-                assert snapshot['states'] == states and snapshot['views'] == views, (where, snapshot, states, views)
+                assert strict(snapshot['states'], states) and strict(snapshot['views'], views), (where, snapshot, states, views)
                 compared += 1
     return compared, restarts
 
 
 FOLDS_SOURCE = """record Task {
   title: text
-  done = 0
+  done = false
   points = 0
 }
 state tasks: list of Task
@@ -912,7 +971,7 @@ record Score {
 }
 state people: list of Person by name
 state at: index of people
-state known = 0
+state known = false
 state n = 0
 state scores: list of Score by value
 input join = text
@@ -965,7 +1024,7 @@ def keyed(aup, pure_run, work, seeds, steps=300):
     words = ['m', 'b', 'zed', 'a', 'ab', '', '가', 'Z', 'm2', '😀', 'b\n']
     compared = failures = 0
     for seed in seeds:
-        rng, people, at, known, n, scores = random.Random(seed + 7700), [], 0, 0, 0, []
+        rng, people, at, known, n, scores = random.Random(seed + 7700), [], 0, False, 0, []
         commands, expected, faults = [], [], []
         key = lambda name: name.encode()
 
@@ -990,7 +1049,7 @@ def keyed(aup, pure_run, work, seeds, steps=300):
                     if word not in names: place(word)
                     at = [p['name'] for p in people].index(word)
                     people[at]['visits'] += 1
-                else: known = int(word in names)
+                else: known = word in names
             else:
                 name = rng.choice(['drop', 'up', 'more', 'less', 'keep', 'forget'])
                 commands.append(f'down {name}')
@@ -1018,8 +1077,8 @@ def keyed(aup, pure_run, work, seeds, steps=300):
                               'board': [{'label': f"{p['name']} ({p['visits']})"} for p in people if p['visits'] > 0]}))
         lines = run(pure_run, work / 'keyed.pmod', stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()
         shown = [json.loads(line) for line in lines]
-        assert [(s['states'], s['views']) for s in shown] == expected, \
-            (seed, next(i for i, (s, e) in enumerate(zip(shown, expected)) if (s['states'], s['views']) != e))
+        assert strict([[s['states'], s['views']] for s in shown], [list(e) for e in expected]), \
+            (seed, next(i for i, (s, e) in enumerate(zip(shown, expected)) if not strict([s['states'], s['views']], list(e))))
         # A failed event leaves the last fault; a later success does not clear it, so compare where it is set.
         got = [s['fault'] if s['error'] else 'none' for s in shown]
         assert got == faults, (seed, [(i, a, b) for i, (a, b) in enumerate(zip(got, faults)) if a != b][:3])
@@ -1045,7 +1104,7 @@ def folds(aup, pure_run, work, seeds, steps=300):
             if roll < 0.35:
                 word = rng.choice(words)
                 commands.append('type add ' + (word.encode().hex() or '-'))
-                tasks.append({'title': word, 'done': 0, 'points': len(word)})
+                tasks.append({'title': word, 'done': False, 'points': len(word)})
                 at = len(tasks) - 1
             else:
                 name = rng.choice(['toggle', 'up', 'down', 'drop', 'jump'])
@@ -1054,7 +1113,7 @@ def folds(aup, pure_run, work, seeds, steps=300):
                 if name == 'jump' and open_now: at = open_now[0]  # none open: the event fails
                 elif name == 'up': at = max(at - 1, 0)
                 elif name == 'down': at = min(at + 1, max(len(tasks) - 1, 0))
-                elif tasks and name == 'toggle': tasks[at]['done'] = int(not tasks[at]['done'])
+                elif tasks and name == 'toggle': tasks[at]['done'] = not tasks[at]['done']
                 elif tasks and name == 'drop':
                     del tasks[at]
                     at = min(at, max(len(tasks) - 1, 0))
@@ -1069,7 +1128,7 @@ def folds(aup, pure_run, work, seeds, steps=300):
         # Toggling or removing in an empty list fails; pure-run then exits 1 but shows every event.
         lines = run(pure_run, work / 'folds.pmod', stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()
         shown = [json.loads(line)['views'] for line in lines]
-        assert shown == expected, (seed, [(a, b) for a, b in zip(shown, expected) if a != b][:2])
+        assert strict(shown, expected), (seed, [(a, b) for a, b in zip(shown, expected) if not strict(a, b)][:2])
         compared += len(shown)
     return compared
 
@@ -1231,6 +1290,64 @@ def conditionals(aup, pure_run, work):
     return len(expected)
 
 
+BOOLS_SOURCE = """record Task {
+  title: text
+  done = false
+}
+state lit = false
+state n = 0
+state tasks: list of Task
+input flip = key Space
+input add = text
+input bump = key KeyB
+on flip.down { lit = !lit }
+on add { tasks.append(Task { title: add, done: lit }) }
+on bump.down {
+  let big = n > 1
+  if lit && !big { n = n + 1 }
+}
+view shown = lit
+view label = "{lit}/{n > 1}"
+view open = count(t in tasks where !t.done)
+view board = each t in tasks {
+  title = t.title
+  done = t.done
+}
+"""
+
+
+def bools(aup, pure_run, work):
+    """Bools are true and false in every output (states, list items, views,
+    columns, interpolation), never 1 and 0; a module replaced keeps a number
+    that becomes a bool when it is 0 or 1 (else the new default) and makes a
+    bool a number, 0 or 1."""
+    (work / 'bools.aup').write_text(BOOLS_SOURCE)
+    (work / 'bools2.aup').write_text('state lit = 7\nstate n = false\n')
+    compile_module(aup, work / 'bools.aup', work / 'bools.pmod')
+    compile_module(aup, work / 'bools2.aup', work / 'bools2.pmod')
+    commands = ['show', 'down flip', 'type add 61', 'down bump', 'down bump', 'down bump', 'down flip', 'type add 62',
+                f'replace {work / "bools2.pmod"}']
+    lines = run(pure_run, work / 'bools.pmod', stdin='\n'.join(commands) + '\n').stdout.splitlines()
+    shown = [json.loads(line) for line in lines]
+    a, b = {'title': 'a', 'done': True}, {'title': 'b', 'done': False}
+    expected = [
+        ({'lit': False, 'n': 0, 'tasks': []}, {'shown': False, 'label': 'false/false', 'open': 0, 'board': []}),
+        ({'lit': True, 'n': 0, 'tasks': []}, {'shown': True, 'label': 'true/false', 'open': 0, 'board': []}),
+        ({'lit': True, 'n': 0, 'tasks': [a]}, {'shown': True, 'label': 'true/false', 'open': 0, 'board': [a]}),
+        ({'lit': True, 'n': 1, 'tasks': [a]}, {'shown': True, 'label': 'true/false', 'open': 0, 'board': [a]}),
+        ({'lit': True, 'n': 2, 'tasks': [a]}, {'shown': True, 'label': 'true/true', 'open': 0, 'board': [a]}),
+        ({'lit': True, 'n': 2, 'tasks': [a]}, {'shown': True, 'label': 'true/true', 'open': 0, 'board': [a]}),
+        ({'lit': False, 'n': 2, 'tasks': [a]}, {'shown': False, 'label': 'false/true', 'open': 0, 'board': [a]}),
+        ({'lit': False, 'n': 2, 'tasks': [a, b]}, {'shown': False, 'label': 'false/true', 'open': 1, 'board': [a, b]}),
+        ({'lit': 0, 'n': False}, {}),  # lit, false, is 0; n, 2, is no bool: bools2's default
+    ]
+    assert len(shown) == len(expected), lines
+    for snapshot, command, (states, views) in zip(shown, commands, expected):
+        assert snapshot['error'] is None, (command, snapshot)
+        assert strict(snapshot['states'], states) and strict(snapshot['views'], views), (command, snapshot, states, views)
+    return len(shown)
+
+
 def text_parity(aup, pure_run, work, seeds, steps=400):
     module = work / 'notes.pmod'
     compile_module(aup, ROOT / 'examples/notes.aup', module)
@@ -1382,6 +1499,7 @@ def main():
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
         report['conditional_snapshots'] = conditionals(aup, pure_run, work)
+        report['bool_snapshots'] = bools(aup, pure_run, work)
         report['time_snapshots'] = timing(aup, pure_run, work, range(args.seeds))
         report['watched_builds'] = watching(aup, pure_run, work)
         report['fold_snapshots'] = folds(aup, pure_run, work, range(args.seeds if hasattr(args, 'seeds') else 8))

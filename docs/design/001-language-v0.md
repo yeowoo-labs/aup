@@ -1,6 +1,6 @@
 # aup v0 — 한 언어, 한 모듈 형식
 
-2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use) 구현.
+2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use·`bool`) 구현.
 text와 리스트 문법은 [002](002-dsl-direction.md).
 
 착수 기준:
@@ -48,19 +48,20 @@ on frame {                       # 1/60초 진행. 핸들러 안에서 dt를 쓸
 ```
 
 - 선언과 문장은 줄바꿈이나 `;`로 끝난다. 이름은 ASCII `[A-Za-z_][A-Za-z_0-9]*`, 31바이트 이하다.
-- 예약어: `state input view on if else key frame dt min max clamp message by bytes u32 reply require record each fn use`.
+- 예약어: `state input view on if else key frame dt min max clamp message by bytes u32 reply require record each fn use now
+  every floor output send for let true false`.
 - 키: `Space Enter ArrowLeft ArrowRight ArrowUp ArrowDown KeyA..KeyZ Digit0..Digit9`. 입력 이름과
   키는 각각 한 번만 쓴다. 상태·입력·보기의 이름공간은 서로 겹칠 수 없다.
-- 식: 숫자, 상태 이름, `dt`(핸들러 안에서만), 괄호, 단항 `- !`, 이항 `* /`, `+ -`,
+- 식: 숫자, `true`·`false`, 상태 이름, `dt`(핸들러 안에서만), 괄호, 단항 `- !`, 이항 `* /`, `+ -`,
   `< <= > >=`, `== !=`, `&&`, `||`(뒤로 갈수록 우선순위가 낮다), `min(a,b) max(a,b) clamp(x,lo,hi)`.
 - 문장: `이름 = 식`, `if 식 { … }`, `if 식 { … } else { … }`.
 - 같은 이벤트의 핸들러가 여럿이면 소스 순서로 하나의 이벤트 안에서 실행한다.
 
 ## 의미 (워크벤치 엔진과 같음)
 
-- 값은 IEEE binary64다. 연산 결과나 읽은 값이 유한하지 않으면, 0으로 나누면, `clamp`의 `lo > hi`이면
+- 수는 IEEE binary64다. 연산 결과나 읽은 값이 유한하지 않으면, 0으로 나누면, `clamp`의 `lo > hi`이면
   이벤트 전체가 실패하고 상태는 이벤트 전과 같다.
-- 비교와 논리 연산은 0 또는 1을 낸다. `&& ||`는 양쪽을 모두 계산한다. 0이 아니면 참이다.
+- 비교는 `bool`을 낸다. 논리(`! && ||`)는 bool을 받아 bool을 낸다. `&& ||`는 양쪽을 모두 계산한다. 아래 `bool`을 본다.
 - `if`의 조건은 한 번 계산한다. 문장은 순서대로 실행한다.
 - `frame`의 `dt`는 1/60이고 키 이벤트의 `dt`는 0이다.
 - 한도: 상태 32, 입력 32, 보기 64, 핸들러 64, 명령 512, 스택 64, 소스 32 KiB.
@@ -112,7 +113,7 @@ on edit {
 ```
 
 - `on 메시지 { }`는 메시지가 도착할 때 한 번 실행된다. 필드는 `메시지.필드`, 키는 `key`로만 쓴다.
-- 필드 타입은 `u32`, `number`(유한한 수), `bytes`, `text`(UTF-8)이고 가변 필드(bytes, text)는 몇 개든 어디에나 둘 수 있다.
+- 필드 타입은 `u32`, `number`(유한한 수), `bool`, `bytes`, `text`(UTF-8)이고 가변 필드(bytes, text)는 몇 개든 어디에나 둘 수 있다.
   필드는 쉼표나 줄바꿈(또는 세미콜론)으로 나눈다. 메시지와 그룹과 레코드의 선언에서도, 값(`Kept { id: 1, t: "a" }`)에서와 같다.
   `input add = message { title: text, points: number }`. HTTP 호스트(`pure-serve`)는 JSON 본문의 객체를 이 필드들로
   옮긴다. 도착한 메시지의 text가 UTF-8이 아니거나 수가 유한하지 않으면 그 이벤트는 실패한다.
@@ -140,3 +141,27 @@ on edit {
 검증: Pure의 `pure-edit-module`로 실행한 `examples/editor.aup`·`bounded-editor.aup`가, 기존 `pure-edit`로 실행한
 `editor.pure`·`bounded-editor.pure`와 무작위 show·edit·apply 1,280회(성공·충돌·범위·없음·예산·잘못된 키 포함)에서
 stdout·stderr·종료 코드가 바이트 단위로 같고, 서로의 저장소를 같게 읽는다(`make check`).
+
+## bool (구현)
+
+참·거짓은 수가 아니다. 위치가 정수가 아닌 것과 같다(Pure [016](/srv/git/pure.git): `docs/design/016-bool-and-i64.md`).
+
+```text
+state on = false                     # 초기값이 true나 false면 bool 상태
+record Task { title: text, done = false }
+input set = message { ok: bool }     # JSON과 쿼리에서 true·false
+
+on toggle.down { on = !on }
+on set { on = set.ok }
+view open = count(t in tasks where !t.done)
+view status = "{on}"                 # true 또는 false
+```
+
+- `true`와 `false`는 bool이다. 비교(`< <= > >= == !=`, text 비교), `has`, 논리(`! && ||`)가 bool을 낸다.
+- 조건 자리(`if`, 조건식, `require`, `where`, `count`와 `first`의 조건, 걸러진 표)는 bool만 받는다. 수를 주면 진단이 고치는
+  법을 말한다(`if takes a bool, not a number: compare it, as in n != 0`).
+- bool끼리는 `==`와 `!=`만 된다. 크기 비교, 산술, `sum`·`max`·`min`·`distinct`에 쓰지 않는다. 키 있는 리스트의 키가 될 수 없다.
+- bool은 상태, 레코드 필드, 메시지와 출력의 필드, 보기의 인자, `let`, 보기와 표의 열이 될 수 있다. 보간은 `true`·`false`를 쓴다.
+- 모듈을 바꾸면 수였던 상태나 필드가 bool이 될 때 0과 1은 `false`와 `true`가 되고, 다른 수는 새 기본값이 된다. bool이 수가 되면
+  0과 1이다.
+

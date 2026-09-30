@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Limits and opcodes of Pure module format v5. */
+/* Limits and opcodes of Pure module format v6. */
 enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK = 64, NAME = 32, JOINS = 8,
        DEPTH = 64, FIELDS = 64, COLLECTIONS = 1, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
        RECORDS = 16, RECORD_FIELDS = 128, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9 };
@@ -23,11 +23,14 @@ enum { LOCALS = 64 }; /* an event's locals (Pure's) */
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6,
        FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
-       FIELD_ROWS = 5 };
+       FIELD_ROWS = 5, FIELD_BOOL = 6 };
 /* A list of a message's rows: filled as the message arrives, emptied when its event ends (Pure's flag). */
 enum { LIST_ROWS = 256 };
-enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, UNIT_CHAR = 0, UNIT_LINE = 1 };
-typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX } Type;
+enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, STATE_BOOL = 5,
+       UNIT_CHAR = 0, UNIT_LINE = 1 };
+/* Pure's view types; a bool record field is type 2 and a bool local holds 2. */
+enum { VIEW_NUM = 0, VIEW_TEXT = 1, VIEW_TABLE = 2, VIEW_BOOL = 3, FIELD_RECORD_BOOL = 2, LOCAL_BOOL = 2 };
+typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX, BOOL } Type;
 typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
 
 typedef enum { T_EOF, T_NL, T_NUMBER, T_NAME, T_PUNCT, T_STRING } TokenKind;
@@ -40,7 +43,7 @@ typedef struct {
 } Token;
 
 typedef enum {
-    E_NUMBER, E_NAME, E_DT, E_NOW, E_UNARY, E_BINARY, E_CALL,
+    E_NUMBER, E_BOOL, E_NAME, E_DT, E_NOW, E_UNARY, E_BINARY, E_CALL,
     E_MEMBER,  /* args[0].member */
     E_DOC,     /* name[key] */
     E_SIZE,    /* name[key].bytes */
@@ -94,12 +97,12 @@ typedef struct {
     unsigned view; /* arguments: the view they are for */
 } Input;
 
-/* A record: fields in order, each a number or text with its default. */
+/* A record: fields in order, each a number, a bool or text with its default. */
 typedef struct {
     char name[NAME];
     int line, column;
     char field_names[FIELDS_PER_RECORD][NAME];
-    bool field_text[FIELDS_PER_RECORD];
+    bool field_text[FIELDS_PER_RECORD], field_bool[FIELDS_PER_RECORD];
     double field_number[FIELDS_PER_RECORD];
     Expr *field_string[FIELDS_PER_RECORD]; /* a text default, or NULL for "" */
     uint32_t field_constant[FIELDS_PER_RECORD];
@@ -201,7 +204,7 @@ typedef struct {
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
-                                       "floor", "output", "send", "for", "let"};
+                                       "floor", "output", "send", "for", "let", "true", "false"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -703,6 +706,9 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
         left = expression(c, 0, true);
         newlines(c);
         expect(c, ")", "')'");
+    } else if (token.kind == T_NAME && (!strcmp(token.text, "true") || !strcmp(token.text, "false"))) {
+        left = node(c, E_BOOL, token.line, token.column);
+        left->number = token.text[0] == 't';
     } else if (token.kind == T_NAME) {
         static const struct { const char *name; unsigned count; int op; } calls[] =
             {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM},
@@ -1091,7 +1097,7 @@ static int used_library(const Compiler *c, int module, const char *name) {
 }
 
 static const char *declared_kind(const Compiler *c, const char *name) {
-    static const char *const states[] = {"a state", "a text state", "a cursor", "a list", "a list index"};
+    static const char *const states[] = {"a state", "a text state", "a cursor", "a list", "a list index", "a state"};
     if (fn_index(c, c->module, name) >= 0) return "a fn";
     if (used_library(c, c->module, name) >= 0) return "a library";
     if (c->module) return NULL; /* a library has only fns and uses */
@@ -1182,9 +1188,9 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
             continue;
         }
         if (c->field_count == FIELDS) fail_at(c, name.line, name.column, "at most %d message fields are allowed", FIELDS);
-        Token type = expect_name(c, "u32, number, bytes, text or list of a record");
+        Token type = expect_name(c, "u32, number, bool, bytes, text or list of a record");
         static const struct { const char *name; int type; } types[] = {
-            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
+            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bool", FIELD_BOOL}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
         int field_type = 0;
         for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
             if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
@@ -1198,7 +1204,7 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
             in->field_column[in->fields] = record.column;
             field_type = FIELD_ROWS;
         }
-        if (!field_type) fail_at(c, type.line, type.column, "field types are u32, number, bytes, text and list of a record");
+        if (!field_type) fail_at(c, type.line, type.column, "field types are u32, number, bool, bytes, text and list of a record");
         memcpy(in->field_names[in->fields], path, NAME);
         in->field_types[in->fields++] = field_type;
         ++c->field_count;
@@ -1227,7 +1233,7 @@ static Expr *plain_string(Compiler *c, const char *what) {
     return value->args[0];
 }
 
-/* record Name { field = number, field: text = "..." } */
+/* record Name { field = number, field = false, field: text = "..." } */
 static void record_declaration(Compiler *c) {
     Token name = expect_name(c, "record name");
     declare(c, &name);
@@ -1255,15 +1261,18 @@ static void record_declaration(Compiler *c) {
             take(c);
             Token type = expect_name(c, "text");
             if (strcmp(type.text, "text"))
-                fail_at(c, type.line, type.column, "a field is a number (field = 0) or text (field: text)");
+                fail_at(c, type.line, type.column, "a field is a number (field = 0), a bool (field = false) or text (field: text)");
             r->field_text[index] = true;
             if (is(c, "=")) {
                 take(c);
                 r->field_string[index] = plain_string(c, "a text field");
             }
         } else {
-            expect(c, "=", "'=' and a number, or ': text'");
-            r->field_number[index] = signed_number(c, "field default");
+            expect(c, "=", "'=' and a number or a bool, or ': text'");
+            if (word(c, "true") || word(c, "false")) {
+                r->field_bool[index] = true;
+                r->field_number[index] = take(c).text[0] == 't';
+            } else r->field_number[index] = signed_number(c, "field default");
         }
         end_field(c);
     }
@@ -1324,8 +1333,13 @@ static void state_declaration(Compiler *c) {
         return;
     }
     expect(c, "=", "'='");
-    c->state_types[index] = STATE_NUM;
-    c->initial[index] = signed_number(c, "state initializer");
+    if (word(c, "true") || word(c, "false")) { /* state on = false: a bool */
+        c->state_types[index] = STATE_BOOL;
+        c->initial[index] = take(c).text[0] == 't';
+    } else {
+        c->state_types[index] = STATE_NUM;
+        c->initial[index] = signed_number(c, "state initializer");
+    }
     ++c->states;
 }
 
@@ -1485,13 +1499,13 @@ static void view_arguments(Compiler *c, unsigned view, const Token *name) {
             if (!strcmp(in->field_names[f], argument.text))
                 fail_at(c, argument.line, argument.column, "duplicate argument '%s'", argument.text);
         expect(c, ":", "':'");
-        Token type = expect_name(c, "u32, number, bytes or text");
+        Token type = expect_name(c, "u32, number, bool, bytes or text");
         static const struct { const char *name; int type; } types[] = {
-            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
+            {"u32", FIELD_U32}, {"number", FIELD_NUMBER}, {"bool", FIELD_BOOL}, {"bytes", FIELD_BYTES}, {"text", FIELD_TEXT}};
         int field_type = 0;
         for (size_t t = 0; t < sizeof(types) / sizeof(*types); ++t)
             if (!strcmp(type.text, types[t].name)) field_type = types[t].type;
-        if (!field_type) fail_at(c, type.line, type.column, "an argument is a u32, number, bytes or text");
+        if (!field_type) fail_at(c, type.line, type.column, "an argument is a u32, number, bool, bytes or text");
         if (c->field_count == FIELDS) fail_at(c, argument.line, argument.column, "at most %d message fields are allowed", FIELDS);
         memcpy(in->field_names[in->fields], argument.text, NAME);
         in->field_line[in->fields] = argument.line;
@@ -1631,7 +1645,7 @@ static void emit(Compiler *c, int line, int column, uint8_t op, uint32_t arg, do
 }
 
 static const char *type_name(Type type) {
-    static const char *const names[] = {"", "a number", "bytes", "text", "a cursor", "a distance", "an index"};
+    static const char *const names[] = {"", "a number", "bytes", "text", "a cursor", "a distance", "an index", "a bool"};
     return names[type];
 }
 
@@ -1699,6 +1713,16 @@ static unsigned record_field(Compiler *c, const Record *r, const char *field, in
     fail_at(c, line, column, "record '%s' has no field '%s'", r->name, field);
 }
 
+/* A record field's kind: text, a bool or a number. */
+static Type field_kind(const Record *r, unsigned field) {
+    return r->field_text[field] ? TEXT : r->field_bool[field] ? BOOL : NUM;
+}
+
+/* The kind of a message field's value (a u32 is a number). */
+static Type message_kind(int type) {
+    return type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : type == FIELD_BOOL ? BOOL : NUM;
+}
+
 static Kind value(Compiler *c, const Expr *e, bool handler, int height);
 
 static void expect_kind(Compiler *c, const Expr *e, Kind actual, Type type) {
@@ -1709,6 +1733,14 @@ static Kind number(Compiler *c, const Expr *e, bool handler, int height) {
     Kind kind = value(c, e, handler, height);
     expect_kind(c, e, kind, NUM);
     return kind;
+}
+
+/* A bool, where what (if, where, require, !, && or ||) takes one: a number
+ * is not one, and the message says how to make one of it. */
+static void truth(Compiler *c, const Expr *e, bool handler, int height, const char *what) {
+    Kind kind = value(c, e, handler, height);
+    if (kind.type == NUM) fail_at(c, e->line, e->column, "%s takes a bool, not a number: compare it, as in n != 0", what);
+    expect_kind(c, e, kind, BOOL);
 }
 
 /* A cursor of the named text state. */
@@ -1735,7 +1767,7 @@ static void item_of(Compiler *c, const Expr *e, bool handler, int height, int li
     int key = c->list_key[list] - 1;
     if (kind.type != INDEX && key >= 0) {
         const Record *r = record_of(c, list);
-        Type type = r->field_text[key] ? TEXT : NUM;
+        Type type = field_kind(r, (unsigned)key);
         if (kind.type != type)
             fail_at(c, e->line, e->column, "'%s' is keyed by %s, %s: expected %s or an index, not %s", c->state_names[list],
                     r->field_names[key], type_name(type), type_name(type), type_name(kind.type));
@@ -1845,7 +1877,8 @@ static int local_named(const Compiler *c, const char *name) {
 
 static uint32_t local_arg(const Compiler *c, int local) {
     const Kind *kind = &c->locals[local].kind;
-    return c->locals[local].slot | (kind->type == INDEX ? 1u << 8 | (uint32_t)kind->owner << 16 : 0);
+    return c->locals[local].slot | (kind->type == INDEX ? 1u << 8 | (uint32_t)kind->owner << 16 :
+                                    kind->type == BOOL ? (uint32_t)LOCAL_BOOL << 8 : 0);
 }
 
 /* Emit an expression; height is the stack height before it. */
@@ -1853,6 +1886,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
     switch (e->kind) {
     case E_NUMBER: emit(c, e->line, e->column, CONST, 0, e->number); return (Kind){NUM, -1};
+    case E_BOOL: emit(c, e->line, e->column, CONST, 1, e->number); return (Kind){BOOL, -1};
     case E_DT: case E_NOW: {
         const char *name = e->kind == E_DT ? "dt" : "now";
         if (c->folding) fail_at(c, e->line, e->column, "%s is not available in count, sum, max or min", name);
@@ -1867,9 +1901,9 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         int pieces = 0;
         for (const Expr *part = e->args[0]; part; part = part->next) {
             Kind kind = value(c, part, handler, height + (pieces > 0));
-            if (kind.type == NUM) emit(c, part->line, part->column, NUM_TEXT, 0, 0);
+            if (kind.type == NUM || kind.type == BOOL) emit(c, part->line, part->column, NUM_TEXT, kind.type == BOOL, 0);
             else if (kind.type != TEXT)
-                fail_at(c, part->line, part->column, "a string shows numbers and text, not %s", type_name(kind.type));
+                fail_at(c, part->line, part->column, "a string shows numbers, bools and text, not %s", type_name(kind.type));
             if (pieces++) emit(c, part->line, part->column, CONCAT, 0, 0);
         }
         return (Kind){TEXT, -1};
@@ -1904,8 +1938,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             for (unsigned f = 0; f < in->fields; ++f)
                 if (!strcmp(in->field_names[f], e->name)) {
                     emit(c, e->line, e->column, FIELD, f, 0);
-                    int type = in->field_types[f];
-                    return (Kind){type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : NUM, -1};
+                    return (Kind){message_kind(in->field_types[f]), -1};
                 }
         }
         if (!c->scope && c->row >= 0 && !strcmp(e->name, c->view_row[c->row])) {
@@ -1921,8 +1954,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             if (type == STATE_LIST)
                 fail_at(c, e->line, e->column, "'%s' is a list; read %s.count or a field, as in %s[index].field",
                         e->name, e->name, e->name);
-            static const uint8_t loads[] = {LOAD, TEXT_LOAD, CUR_LOAD, 0, INDEX_LOAD};
-            static const Type types[] = {NUM, TEXT, CURSOR, 0, INDEX};
+            static const uint8_t loads[] = {LOAD, TEXT_LOAD, CUR_LOAD, 0, INDEX_LOAD, LOAD};
+            static const Type types[] = {NUM, TEXT, CURSOR, 0, INDEX, BOOL};
             emit(c, e->line, e->column, loads[type], (uint32_t)index, 0);
             return (Kind){types[type], type == STATE_CURSOR || type == STATE_INDEX ? cursor_owner(c, index) : -1};
         }
@@ -1953,8 +1986,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             for (unsigned i = 0; i < in->fields; ++i)
                 if (!strcmp(in->field_names[i], path)) {
                     emit(c, e->line, e->column, FIELD, i, 0);
-                    int type = in->field_types[i];
-                    return (Kind){type == FIELD_TEXT ? TEXT : type == FIELD_BYTES ? BYTES : NUM, -1};
+                    return (Kind){message_kind(in->field_types[i]), -1};
                 }
             for (unsigned i = 0; i < in->fields; ++i)
                 if (!strncmp(in->field_names[i], path, length) && in->field_names[i][length] == '.')
@@ -2009,7 +2041,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             const Record *r = record_of(c, inner.owner);
             unsigned field = record_field(c, r, m, e->line, e->column);
             emit(c, e->line, e->column, ITEM_GET, (uint32_t)inner.owner | field << 16, 0);
-            return (Kind){r->field_text[field] ? TEXT : NUM, -1};
+            return (Kind){field_kind(r, field), -1};
         }
         fail_at(c, e->line, e->column, "%s has no '%s'", type_name(inner.type), m);
     }
@@ -2025,13 +2057,13 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             if (!key) fail_at(c, e->line, e->column, "'%s' has no key; declare it as list of %s by a field to ask has",
                               e->member, record_of(c, list)->name);
             if (e->count != 1) fail_at(c, e->line, e->column, "%s.has takes one key", e->member);
-            Type type = record_of(c, list)->field_text[c->list_key[list] - 1] ? TEXT : NUM;
+            Type type = field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1);
             Kind given = value(c, e->args[0], handler, height);
             if (given.type != type)
                 fail_at(c, e->args[0]->line, e->args[0]->column, "'%s' is keyed by %s, %s: expected %s, not %s", e->member, key,
                         type_name(type), type_name(type), type_name(given.type));
             emit(c, e->line, e->column, LIST_HAS, (uint32_t)list, 0);
-            return (Kind){NUM, -1};
+            return (Kind){BOOL, -1};
         }
         if (strcmp(e->name, "line")) fail_at(c, e->line, e->column, "unknown library '%s'; write use %s first", e->member, e->member);
         /* note.line(at): the line a cursor is on. */
@@ -2076,7 +2108,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         unsigned field = record_field(c, r, e->member, e->line, e->column);
         item_of(c, e->args[0], handler, height, list);
         emit(c, e->line, e->column, ITEM_GET, (uint32_t)list | field << 16, 0);
-        return (Kind){r->field_text[field] ? TEXT : NUM, -1};
+        return (Kind){field_kind(r, field), -1};
     }
     case E_IF: {
         /* Arms of an else-if chain share one end; a value crosses it, so the
@@ -2085,7 +2117,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         Kind kind = {0, -1};
         const Expr *arm = e;
         for (;;) {
-            number(c, arm->args[0], handler, height);
+            truth(c, arm->args[0], handler, height, "if");
             unsigned jump = c->code_count;
             emit(c, arm->line, arm->column, JZ, 0, 0);
             if (height && ++c->joins > JOINS) fail_at(c, arm->line, arm->column, "conditional expressions nest too deeply");
@@ -2124,7 +2156,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (c->filtering) fail_at(c, e->line, e->column, "a table's where cannot hold a count, sum, max or min");
         bool sliced = e->args[2] != NULL;
         if (sliced) { /* the keys from low up to before high, found by key */
-            if (!keyed_by(c, list) || record_of(c, list)->field_text[c->list_key[list] - 1])
+            if (!keyed_by(c, list) || field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1) != NUM)
                 fail_at(c, e->line, e->column, "'%s' is not keyed by a number: a slice takes one", e->member);
             number(c, e->args[2], handler, height);
             number(c, e->args[3], handler, height + 1);
@@ -2143,8 +2175,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 fail_at(c, e->args[1]->line, e->args[1]->column, "sum, max, min and distinct take numbers, not %s",
                         type_name(kind.type));
         }
-        if (e->args[0]) number(c, e->args[0], false, !itemwise);
-        else emit(c, e->line, e->column, CONST, 0, 1);
+        if (e->args[0]) truth(c, e->args[0], false, !itemwise, "where");
+        else emit(c, e->line, e->column, CONST, 1, 1); /* every item */
         c->folding = false;
         c->fold_list = -1;
         c->joins = joins;
@@ -2171,23 +2203,35 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             return left;
         }
         if (e->op >= LT && e->op <= NE) {
-            /* Texts compare by their bytes; numbers as numbers. */
+            /* Texts compare by their bytes, numbers as numbers; bools are equal or not. */
             Kind left = value(c, e->args[0], handler, height);
             if (left.type == TEXT) {
                 expect_kind(c, e->args[1], value(c, e->args[1], handler, height + 1), TEXT);
                 emit(c, e->line, e->column, TEXT_COMPARE, (uint32_t)(e->op - LT), 0);
-                return (Kind){NUM, -1};
+                return (Kind){BOOL, -1};
+            }
+            if (left.type == BOOL) {
+                if (e->op != EQ && e->op != NE) fail_at(c, e->line, e->column, "bools are equal or not (== and !=); they have no order");
+                expect_kind(c, e->args[1], value(c, e->args[1], handler, height + 1), BOOL);
+                emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
+                return (Kind){BOOL, -1};
             }
             expect_kind(c, e->args[0], left, NUM);
             number(c, e->args[1], handler, height + 1);
             emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
-            return (Kind){NUM, -1};
+            return (Kind){BOOL, -1};
         }
         /* fall through */
-    default:
-        for (unsigned i = 0; i < e->count; ++i) number(c, e->args[i], handler, height + (int)i);
+    default: {
+        /* !, && and || take bools (both sides are computed); the rest numbers. */
+        bool logic = e->op == AND || e->op == OR || e->op == NOT;
+        for (unsigned i = 0; i < e->count; ++i) {
+            if (logic) truth(c, e->args[i], handler, height + (int)i, e->op == NOT ? "!" : e->op == AND ? "&&" : "||");
+            else number(c, e->args[i], handler, height + (int)i);
+        }
         emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
-        return (Kind){NUM, -1};
+        return (Kind){logic ? BOOL : NUM, -1};
+    }
     }
 }
 
@@ -2288,10 +2332,10 @@ static void record_fields(Compiler *c, const Expr *e, int list, int height) {
     record_values(c, e, list, values);
     for (unsigned k = 0; k < r->fields; ++k) {
         int at = height + (int)k;
-        if (values[k]) expect_kind(c, values[k], value(c, values[k], true, at), r->field_text[k] ? TEXT : NUM);
+        if (values[k]) expect_kind(c, values[k], value(c, values[k], true, at), field_kind(r, k));
         else if (at + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
         else if (r->field_text[k]) emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
-        else emit(c, e->line, e->column, CONST, 0, r->field_number[k]);
+        else emit(c, e->line, e->column, CONST, r->field_bool[k], r->field_number[k]);
     }
 }
 
@@ -2336,8 +2380,9 @@ static void statements(Compiler *c, const Stmt *s) {
                 fail_at(c, s->line, s->column, "'%s' is the item this for walks", s->name);
             if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
             Kind held = value(c, s->value, true, 0);
-            if (held.type != NUM && held.type != INDEX)
-                fail_at(c, s->value->line, s->value->column, "a let holds a number or an index, not %s", type_name(held.type));
+            if (held.type != NUM && held.type != BOOL && held.type != INDEX)
+                fail_at(c, s->value->line, s->value->column, "a let holds a number, a bool or an index, not %s",
+                        type_name(held.type));
             unsigned local = c->local_count++;
             memcpy(c->locals[local].name, s->name, NAME);
             c->locals[local].slot = c->local_slots++;
@@ -2351,7 +2396,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 Kind kind = value(c, s->value, true, 0);
                 if (kind.type != c->locals[local].kind.type || (kind.type == INDEX && kind.owner != c->locals[local].kind.owner))
                     fail_at(c, s->value->line, s->value->column, "'%s' holds %s", s->name,
-                            c->locals[local].kind.type == INDEX ? "an index of its list" : "a number");
+                            c->locals[local].kind.type == INDEX ? "an index of its list" : type_name(c->locals[local].kind.type));
                 emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, local), 0);
                 break;
             }
@@ -2361,8 +2406,8 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (kind) fail_at(c, s->line, s->column, "cannot assign to %s '%s'", kind, s->name);
                 fail_at(c, s->line, s->column, "unknown state '%s'", s->name);
             }
-            if (c->state_types[index] == STATE_NUM) {
-                number(c, s->value, true, 0);
+            if (c->state_types[index] == STATE_NUM || c->state_types[index] == STATE_BOOL) {
+                expect_kind(c, s->value, value(c, s->value, true, 0), c->state_types[index] == STATE_BOOL ? BOOL : NUM);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_LIST) {
                 fail_at(c, s->line, s->column, "a list changes by append, insert, remove and %s[index].field = value", s->name);
@@ -2442,13 +2487,13 @@ static void statements(Compiler *c, const Stmt *s) {
                     same->args[0] = item;
                     same->args[1] = (Expr *)values[key];
                     same->count = 2;
-                    number(c, same, true, 0);
+                    truth(c, same, true, 0, "require");
                     emit(c, s->line, s->column, REQUIRE, 0, 0);
                 }
                 for (unsigned k = 0; k < r->fields; ++k) {
                     if ((int)k == key) continue;
                     item_of(c, s->first, true, 0, list);
-                    expect_kind(c, values[k], value(c, values[k], true, 1), r->field_text[k] ? TEXT : NUM);
+                    expect_kind(c, values[k], value(c, values[k], true, 1), field_kind(r, k));
                     emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | k << 16, 0);
                 }
                 break;
@@ -2463,7 +2508,7 @@ static void statements(Compiler *c, const Stmt *s) {
             if (c->list_key[list] == (int)field + 1)
                 fail_at(c, s->line, s->column, "the key of '%s' does not change; remove the item and add it again", c->state_names[list]);
             if (*s->name) item_of(c, s->first, true, 0, list);
-            expect_kind(c, s->value, value(c, s->value, true, 1), r->field_text[field] ? TEXT : NUM);
+            expect_kind(c, s->value, value(c, s->value, true, 1), field_kind(r, field));
             emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
         }
@@ -2493,7 +2538,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (!given[f]) fail_at(c, s->line, s->column, "send %s needs '%s'", s->name, out->field_names[f]);
                 int type = out->field_types[f];
                 if (type == FIELD_BYTES) bytes_value(c, given[f], (int)f, "a bytes field");
-                else expect_kind(c, given[f], value(c, given[f], true, (int)f), type == FIELD_TEXT ? TEXT : NUM);
+                else expect_kind(c, given[f], value(c, given[f], true, (int)f), message_kind(type));
             }
             emit(c, s->line, s->column, SEND, (uint32_t)output, 0);
             break;
@@ -2506,7 +2551,7 @@ static void statements(Compiler *c, const Stmt *s) {
             emit(c, s->line, s->column, REPLY, 0, 0);
             break;
         case S_REQUIRE:
-            number(c, s->value, true, 0);
+            truth(c, s->value, true, 0, "require");
             emit(c, s->line, s->column, REQUIRE, 0, 0);
             break;
         case S_FOR: {
@@ -2516,7 +2561,7 @@ static void statements(Compiler *c, const Stmt *s) {
             const char *kind = declared_kind(c, s->name);
             if (kind) fail_at(c, s->last->line, s->last->column, "'%s' is already declared as %s", s->name, kind);
             if (s->low) { /* a slice: the keys from low up to before high */
-                if (!keyed_by(c, list) || record_of(c, list)->field_text[c->list_key[list] - 1])
+                if (!keyed_by(c, list) || field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1) != NUM)
                     fail_at(c, s->first->line, s->first->column, "'%s' is not keyed by a number: a slice takes one", s->member);
                 number(c, s->low, true, 0);
                 number(c, s->high, true, 1);
@@ -2528,7 +2573,7 @@ static void statements(Compiler *c, const Stmt *s) {
             c->walk_scope = c->scope;
             memcpy(c->walk_name, s->name, NAME);
             if (s->value) {
-                number(c, s->value, true, 0);
+                truth(c, s->value, true, 0, "where");
                 jump = c->code_count;
                 emit(c, s->line, s->column, JZ, 0, 0);
             }
@@ -2539,7 +2584,7 @@ static void statements(Compiler *c, const Stmt *s) {
             if (empty && !s->low) c->code_count = at; /* nothing to do for any item */
             else {
                 if (empty) { /* a slice's keys were computed (they fault or not): a block that does nothing */
-                    emit(c, s->line, s->column, CONST, 0, 0);
+                    emit(c, s->line, s->column, CONST, 1, 0);
                     emit(c, s->line, s->column, JZ, c->code_count + 1, 0);
                 }
                 c->code[at].arg = (uint32_t)list << 8 | (s->low ? 1u : 0) | (c->code_count - at - 1) << 16;
@@ -2547,7 +2592,7 @@ static void statements(Compiler *c, const Stmt *s) {
             break;
         }
         case S_IF: {
-            number(c, s->value, true, 0);
+            truth(c, s->value, true, 0, "if");
             unsigned jump = c->code_count;
             emit(c, s->line, s->column, JZ, 0, 0);
             statements(c, s->then);
@@ -2640,9 +2685,13 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (record < 0)
                 fail_at(c, c->state_line[i], c->state_column[i], "a list holds a record; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)record;
-            if (*c->state_key[i])
-                c->list_key[i] = 1 + (int)record_field(c, &c->records[record], c->state_key[i], c->state_key_line[i],
-                                                       c->state_key_column[i]);
+            if (*c->state_key[i]) {
+                const Record *r = &c->records[record];
+                c->list_key[i] = 1 + (int)record_field(c, r, c->state_key[i], c->state_key_line[i], c->state_key_column[i]);
+                if (r->field_bool[c->list_key[i] - 1])
+                    fail_at(c, c->state_key_line[i], c->state_key_column[i], "a list is keyed by a number or text; '%s' is a bool",
+                            c->state_key[i]);
+            }
         }
     }
     for (unsigned i = 0; i < c->record_count; ++i) {
@@ -2695,7 +2744,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             const char *row = c->view_row[i], *kind = declared_kind(c, row);
             if (kind) fail_at(c, c->view_line[i][0], c->view_column[i][0], "'%s' is already declared as %s", row, kind);
             int list = list_state(c, c->view_list[i], c->view_line[i][1], c->view_column[i][1], NULL);
-            c->view_types[i] = 2;
+            c->view_types[i] = VIEW_TABLE;
             c->view_code[i][0] = (uint32_t)list;
             c->view_code[i][1] = 0;
             if (c->view_filter[i]) {
@@ -2704,7 +2753,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                 c->arguments = c->view_arguments[i] - 1;
                 c->filtering = true;
                 c->view_code[i][0] = c->code_count;
-                number(c, c->view_filter[i], false, 0);
+                truth(c, c->view_filter[i], false, 0, "where");
                 c->view_code[i][1] = c->code_count - c->view_code[i][0];
                 c->view_byte[i] = (unsigned char)(list + 1);
                 c->filtering = false;
@@ -2715,10 +2764,10 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         c->arguments = c->view_arguments[c->row >= 0 ? (unsigned)c->row : i] - 1;
         c->view_code[i][0] = c->code_count;
         Kind kind = value(c, c->view_value[i], false, 0);
-        if (kind.type != NUM && kind.type != TEXT)
-            fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a %s is a number or text, not %s",
+        if (kind.type != NUM && kind.type != BOOL && kind.type != TEXT)
+            fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a %s is a number, a bool or text, not %s",
                     c->row >= 0 ? "column" : "view", type_name(kind.type));
-        c->view_types[i] = kind.type == TEXT;
+        c->view_types[i] = kind.type == TEXT ? VIEW_TEXT : kind.type == BOOL ? VIEW_BOOL : VIEW_NUM;
         c->view_code[i][1] = c->code_count - c->view_code[i][0];
     }
     c->row = -1;
@@ -2755,7 +2804,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     *size = 40 + 16u * c->states + 12u * c->collections + 16u * c->input_count + 8u * fields + 8u * c->constants +
             8u * c->record_count + 16u * c->record_fields + 16u * c->views + 12u * c->handler_count + 16u * c->code_count + used + c->constant_used;
     unsigned char *p = *module = allocate(c, *size);
-    memcpy(p, "PUREMOD5", 8);
+    memcpy(p, "PUREMOD6", 8);
     put16(p + 8, c->states);
     put16(p + 10, c->input_count);
     put16(p + 12, c->views);
@@ -2772,7 +2821,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->states; ++i) {
         p = put32(p, state_name[i]);
         p = put32(p, (uint32_t)c->state_types[i]);
-        if (c->state_types[i] == STATE_NUM) p = put_double(p, c->initial[i]);
+        if (c->state_types[i] == STATE_NUM || c->state_types[i] == STATE_BOOL) p = put_double(p, c->initial[i]);
         else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */
             p = put32(p, state_ref[i]);
             p = put32(p, c->state_types[i] == STATE_LIST ? (c->state_rows[i] ? LIST_ROWS : (uint32_t)c->list_key[i]) :
@@ -2812,7 +2861,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         for (unsigned k = 0; k < c->records[i].fields; ++k) {
             const Record *r = &c->records[i];
             p = put32(p, record_field_name[i][k]);
-            p = put32(p, r->field_text[k]);
+            p = put32(p, r->field_text[k] ? 1 : r->field_bool[k] ? FIELD_RECORD_BOOL : 0);
             if (r->field_text[k]) { p = put32(p, r->field_constant[k]); p = put32(p, 0); }
             else p = put_double(p, r->field_number[k]);
         }

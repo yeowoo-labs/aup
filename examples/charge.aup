@@ -1,5 +1,5 @@
 # Hold Space to charge a jump; gravity and the floor are authored here.
-state holding = 0
+state holding = false
 state charge = 0
 state y = 240
 state velocity = 0
@@ -10,7 +10,7 @@ view amount = charge
 
 on jump.down {
   if y >= 240 {
-    holding = 1
+    holding = true
     charge = 0
   }
 }
@@ -18,7 +18,7 @@ on jump.down {
 on jump.up {
   if holding {
     velocity = -(160 + charge * 300)
-    holding = 0
+    holding = false
     charge = 0
   }
 }

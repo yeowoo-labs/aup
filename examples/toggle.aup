@@ -1,10 +1,10 @@
 # Space toggles visibility; Right arrow moves a position that wraps.
-state visible = 1
+state visible = true
 state position = 120
 input toggle = key Space
 input move = key ArrowRight
 view marker_x = position
-view marker_radius = visible * 24
+view marker_radius = if visible { 24 } else { 0 }
 view tile_x = position - 24
 view value = visible
 
