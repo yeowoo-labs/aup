@@ -113,6 +113,7 @@ on edit {
 
 - `on 메시지 { }`는 메시지가 도착할 때 한 번 실행된다. 필드는 `메시지.필드`, 키는 `key`로만 쓴다.
 - 필드 타입은 `u32`, `number`(유한한 수), `bytes`, `text`(UTF-8)이고 가변 필드(bytes, text)는 몇 개든 어디에나 둘 수 있다.
+  필드는 쉼표나 줄바꿈(또는 세미콜론)으로 나눈다. 메시지와 그룹과 레코드의 선언에서도, 값(`Kept { id: 1, t: "a" }`)에서와 같다.
   `input add = message { title: text, points: number }`. HTTP 호스트(`pure-serve`)는 JSON 본문의 객체를 이 필드들로
   옮긴다. 도착한 메시지의 text가 UTF-8이 아니거나 수가 유한하지 않으면 그 이벤트는 실패한다.
 - 필드를 그룹으로 묶을 수 있다: `to: { city: text, zip: u32 }`. 그룹 안의 필드는 `메시지.그룹.필드`(`ship.to.city`)로

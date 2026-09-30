@@ -372,6 +372,19 @@ static void end(Compiler *c) {
     separators(c);
 }
 
+/* After a declared field (a message's, a group's, a record's): a comma, as
+ * between a value's fields, or the end of a line or a semicolon. */
+static void end_field(Compiler *c) {
+    if (!is(c, ",")) {
+        if (c->token.kind != T_NL && !is(c, ";") && !is(c, "}"))
+            fail_at(c, c->token.line, c->token.column, "expected a comma, newline or semicolon");
+        separators(c);
+        return;
+    }
+    take(c);
+    separators(c);
+}
+
 static bool reserved_name(const char *name) {
     for (size_t i = 0; i < sizeof(reserved) / sizeof(*reserved); ++i)
         if (!strcmp(name, reserved[i])) return true;
@@ -1165,7 +1178,7 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
         expect(c, ":", "':'");
         if (is(c, "{")) {
             message_fields(c, in, path);
-            end(c);
+            end_field(c);
             continue;
         }
         if (c->field_count == FIELDS) fail_at(c, name.line, name.column, "at most %d message fields are allowed", FIELDS);
@@ -1189,7 +1202,7 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
         memcpy(in->field_names[in->fields], path, NAME);
         in->field_types[in->fields++] = field_type;
         ++c->field_count;
-        end(c);
+        end_field(c);
     }
     if (*group && in->fields == first) fail_at(c, c->token.line, c->token.column, "the group '%s' has no fields", group);
     take(c);
@@ -1214,7 +1227,7 @@ static Expr *plain_string(Compiler *c, const char *what) {
     return value->args[0];
 }
 
-/* record Name { field = number; field: text = "..." } */
+/* record Name { field = number, field: text = "..." } */
 static void record_declaration(Compiler *c) {
     Token name = expect_name(c, "record name");
     declare(c, &name);
@@ -1252,7 +1265,7 @@ static void record_declaration(Compiler *c) {
             expect(c, "=", "'=' and a number, or ': text'");
             r->field_number[index] = signed_number(c, "field default");
         }
-        end(c);
+        end_field(c);
     }
     take(c);
     if (!r->fields) fail_at(c, name.line, name.column, "a record needs at least one field");

@@ -81,6 +81,7 @@ DIAGNOSTICS = [
     ('state a = 1e400\n', '1:11', 'number must be finite'),
     ('view v = 1 +\n', '1:13', 'expected a number, state, or expression'),
     ('state a = 0\non frame {\n  a = 1 a\n}\n', '3:9', 'expected newline or semicolon'),
+    ('state a = 0\ninput m = message { x: u32 y: number }\n', '2:28', 'expected a comma, newline or semicolon'),
     ('state a = 0\non frame {\n  if a {\n    a = 1\n  } els {\n  }\n}\n', '5:5', 'expected newline or semicolon'),
     # Each fn doubles what it inlines: f14 is past Pure's 65,535 instructions.
     ('\n'.join(['fn f0(x) = x + 1'] + [f'fn f{i}(x) = f{i - 1}(f{i - 1}(x))' for i in range(1, 15)] + ['view v = f14(1)']) + '\n',
@@ -296,6 +297,12 @@ DIAGNOSTICS = [
 ]
 
 ACCEPTED = [
+    # Declared fields apart by commas, as a value's are (a message's, a group's, a record's, one after the last too).
+    'record P { x = 0, y = 0, name: text }\nstate ps: list of P by x\n'
+    'input add = message { x: u32, y: number, name: text }\n'
+    'input ship = message {\n  to: { city: text, zip: u32 },\n  note: text,\n}\n'
+    'on add {\n  ps.add(P { x: add.x, y: add.y, name: add.name })\n}\n'
+    'on ship {\n  ps.add(P { x: ship.to.zip, name: ship.to.city })\n}\n',
     # distinct, and tests bounding a keyed list's key: a range walk (Pure reads only the items in bounds) and a range view.
     'record Line {\n  id = 0\n  item = 0\n  qty = 0\n  done = 0\n}\nstate lines: list of Line by id\n'
     'input deliver = message {\n  order: u32\n}\non deliver {\n  let start = deliver.order * 16\n'
