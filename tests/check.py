@@ -249,8 +249,9 @@ DIAGNOSTICS = [
     ('view v = floor(1, 2)\n', '1:10', 'floor expects 1 argument'),
     ('state now = 1\n', '1:7', "'now' is reserved"),
     # A for walks a list once; a message's rows are a list its handler reads.
-    (ROWS + 'on o {\n  for a in xs {\n    for b in xs {\n      n = n + 1\n    }\n  }\n}\n', '12:5',
-     'a for cannot hold another for'),
+    # Fors nest (Pure 018): an inner for changes no list an outer one walks.
+    (ROWS + 'on o {\n  for a in xs {\n    for b in o.rows {\n      xs.append(L { item: 1 })\n    }\n  }\n}\n', '13:7',
+     'a for does not add to the list it walks; add to another list, or after the for'),
     (ROWS + 'on o {\n  for a in xs {\n    xs.append(L { item: 1 })\n  }\n}\n', '12:5',
      'a for does not add to the list it walks; add to another list, or after the for'),
     (ROWS + 'on o {\n  for a in o.rows {\n    reply "x"\n  }\n}\n', '12:5', 'a message replies once: reply after the for'),
@@ -296,6 +297,26 @@ DIAGNOSTICS = [
     (LETS + 'on k.down {\n  let i = xs.first\n  i = ys.first\n}\n', '11:7', "'i' holds an index of its list"),
     (LETS + 'on k.down {\n  if n > 0 {\n    let x = 1\n  }\n  n = x\n}\n', '13:7', "unknown state 'x'"),
     (LETS + 'on k.down {\n  for r in xs {\n    let r = 1\n  }\n}\n', '11:9', "'r' is the item this for walks"),
+    # Counting fors, break and a let's list (Pure 018).
+    (LETS + 'on k.down {\n  break\n}\n', '10:3', "break ends a for; this one is outside any"),
+    (LETS + 'on k.down {\n  if n > 0 {\n    let q: list of T\n  }\n}\n', '11:9',
+     "a let's list goes in the handler's own block, not in an if or a for"),
+    (LETS + 'on k.down {\n  for i in 0 .. 3 {\n    i = 1\n  }\n}\n', '11:5', "'i' is what this for counts; it is not assigned"),
+    (LETS + 'on k.down {\n  for a in xs {\n    for b in ys {\n      xs.remove(a)\n    }\n  }\n}\n', '12:7',
+     'a for removes from the list it walks, not from one an outer for walks'),
+    (LETS + 'on k.down {\n  for a in xs {\n    for i in 0 .. 2 {\n      xs.append(T { a: 1 })\n    }\n  }\n}\n', '12:7',
+     'a for does not add to the list it walks; add to another list, or after the for'),
+    (LETS + 'record U {\n  b = 0\n}\ninput j = key KeyJ\non k.down {\n  let q: list of T\n}\non j.down {\n'
+     '  let q: list of U\n}\n', '17:7', "'q' is a let's list of another record or key in another handler"),
+    (LETS + 'on k.down {\n  let q: list of T\n}\non k.down {\n  let q: list of T\n}\n', '13:7',
+     "another handler of this event has a list 'q'; name this one apart"),
+    (LETS + 'on k.down {\n' + ''.join('  ' * (d + 1) + f'for i{d} in 0 .. 2 {{\n' for d in range(9)) + '}\n' * 10, '18:19', 'fors nest at most 8 deep'),
+    (LETS + 'on k.down {\n  let x: text\n}\n', '10:10', "a let holds a list as let x: list of a record; others take '='"),
+    (LETS + 'on k.down {\n  let q: list of Nope\n}\n', '10:7', "a list holds a record; 'Nope' is not one"),
+    (LETS + 'on k.down {\n  let ' + 'q' * 28 + ': list of T\n}\n', '10:7', "a let's list has a name of 27 characters at most"),
+    (LETS + 'on k.down {\n  for i in t .. 3 {\n  }\n}\n', '10:12', 'expected a number'),
+    ('state break = 0\n', '1:7', "'break' is reserved"),
+    (LETS + 'on k.down {\n  let q: list of T\n  for i in 0 .. 3 {\n    let q = 1\n  }\n}\n', '12:9', "'q' is already a let here"),
     (LETS + 'view v = x\non k.down {\n  let x = 1\n}\n', '9:10', "unknown state 'x'"),
     (LETS + 'on k.down {\n  let let = 1\n}\n', '10:7', "'let' is reserved"),
     # A slice takes a list keyed by a number.
@@ -1093,6 +1114,99 @@ def transients(aup, pure_run, work):
     return {'store_files_compared': len(compared.common_files), 'type_words_differ': len(differ)}
 
 
+def computing(aup, pure_run, work, graphs=20):
+    """Computing in one event (Pure 018): examples/routes.aup's searches
+    over random graphs (breadth first, depth first, nearest by weight) and
+    examples/numbers.aup's square roots (bit for bit as Python works them out
+    in the same order) and knapsacks, each against a model. The searches'
+    lists are the event's own: none is left after it."""
+    import heapq
+    import random
+    import struct
+    routes, numbers = work / 'routes.pmod', work / 'numbers.pmod'
+    compile_module(aup, ROOT / 'examples' / 'routes.aup', routes)
+    compile_module(aup, ROOT / 'examples' / 'numbers.aup', numbers)
+
+    def message(name, layout, *values):
+        return f'message {name} {struct.pack(layout, *values).hex()}\n'
+
+    searched = 0
+    for seed in range(graphs):
+        rng = random.Random(seed)
+        n = rng.randint(5, 60)
+        edges = {}
+        for _ in range(rng.randint(n, 4 * n)):
+            a, b = rng.randrange(n), rng.randrange(n)
+            if a != b:
+                edges[(a, b)] = rng.randint(1, 9)
+        out = {v: sorted(b for (a, b) in edges if a == v) for v in range(n)}
+        commands = ''.join(message('link', '<III', a, b, w) for (a, b), w in edges.items())
+        queries = [(rng.randrange(n), rng.randrange(n)) for _ in range(10)]
+        for a, b in queries:
+            commands += message('route', '<II', a, b) + message('walk', '<I', a) + message('path', '<II', a, b)
+        lines = run(pure_run, routes, stdin=commands).stdout.splitlines()[len(edges):]
+        for k, (a, b) in enumerate(queries):
+            route, walk, path = (json.loads(line) for line in lines[3 * k:3 * k + 3])
+            assert all(r['error'] is None and r['fault'] == 'none' for r in (route, walk, path)), (seed, k)
+            assert all(not r['states'][name] for r in (route, walk, path)
+                       for name in ('let.seen', 'let.queue', 'let.stack', 'let.best', 'let.pending'))
+            depth, frontier = {a: 0}, [a]
+            for v in frontier:
+                for t in out[v]:
+                    if t not in depth:
+                        depth[t] = depth[v] + 1
+                        frontier.append(t)
+            assert route['states']['hops'] == depth.get(b, -1), (seed, a, b, route['states']['hops'], depth.get(b, -1))
+            seen, stack = {}, [a]
+            while stack:
+                v = stack.pop()
+                if v not in seen:
+                    seen[v] = len(seen)
+                    stack.extend(t for t in out[v] if t not in seen)
+            assert walk['states']['visited'] == len(seen), (seed, a)
+            assert walk['states']['order'] == sum(d * (v + 1) for v, d in seen.items()), (seed, a)
+            best, pending = {a: 0}, [(0, a)]
+            while pending:
+                d, v = heapq.heappop(pending)
+                if best[v] != d:
+                    continue
+                for t in out[v]:
+                    if d + edges[(v, t)] < best.get(t, float('inf')):
+                        best[t] = d + edges[(v, t)]
+                        heapq.heappush(pending, (best[t], t))
+            assert path['states']['shortest'] == best.get(b, -1), (seed, a, b, path['states']['shortest'], best.get(b, -1))
+            searched += 3
+
+    rng = random.Random(18)
+    xs = [1.0, 2.0, 4.0, 0.25, 1e-6, 1e12] + [10 ** rng.uniform(-6, 12) for _ in range(194)]
+    lines = run(pure_run, numbers, stdin=''.join(message('sqrt', '<d', x) for x in xs)).stdout.splitlines()
+    for x, line in zip(xs, lines):
+        r, steps = (x if x > 1 else 1.0), 0
+        for _ in range(200):
+            following = (r + x / r) / 2
+            if following >= r:
+                break
+            r, steps = following, steps + 1
+        states = json.loads(line)['states']
+        assert struct.pack('<d', states['root']) == struct.pack('<d', r) and states['steps'] == steps, (x, states, r, steps)
+    packs = 0
+    for seed in range(20):
+        rng = random.Random(seed)
+        items = [(rng.randint(1, 30), rng.randint(1, 50)) for _ in range(rng.randint(1, 20))]
+        capacities = [rng.randint(0, 100) for _ in range(5)]
+        commands = ''.join(message('stock', '<III', i, w, v) for i, (w, v) in enumerate(items))
+        commands += ''.join(message('pack', '<I', c) for c in capacities)
+        lines = run(pure_run, numbers, stdin=commands).stdout.splitlines()[len(items):]
+        for c, line in zip(capacities, lines):
+            table = [0] * (c + 1)
+            for w, v in items:
+                for at in range(c, w - 1, -1):
+                    table[at] = max(table[at], table[at - w] + v)
+            assert json.loads(line)['states']['packed'] == table[c], (seed, c)
+            packs += 1
+    return {'searches': searched, 'square_roots': len(xs), 'knapsacks': packs}
+
+
 def stored_runs(aup, pure_run, work, seeds, steps=240):
     """Declared state is stored state: the list app and the text editor run on
     a store, restarting (a new pure-run process) at random points, and keep
@@ -1793,6 +1907,7 @@ def main():
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['library_records'] = library_records(aup, pure_run, args.pure.resolve(), work)
         report['transients'] = transients(aup, pure_run, work)
+        report['computing'] = computing(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

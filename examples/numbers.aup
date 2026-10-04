@@ -1,0 +1,62 @@
+# Numbers worked out in one event (Pure 018): a square root by Newton's
+# steps, stopping when they stop shrinking, and the best a knapsack holds,
+# its table an event's list.
+record Item {
+  id = 0
+  weight = 0
+  worth = 0
+}
+record Cell {
+  at = 0
+  best = 0
+}
+state items: list of Item by id
+state root = 0
+state steps = 0
+state packed = 0
+input stock = message {
+  id: u32
+  weight: u32
+  worth: u32
+}
+input sqrt = message {
+  x: number
+}
+input pack = message {
+  capacity: u32
+}
+
+on stock {
+  items.add(Item { id: stock.id, weight: stock.weight, worth: stock.worth })
+}
+
+on sqrt {
+  let r = if sqrt.x > 1 { sqrt.x } else { 1 }
+  steps = 0
+  for i in 0 .. 200 {
+    let next = (r + sqrt.x / r) / 2
+    if next >= r { break }
+    r = next
+    steps = steps + 1
+  }
+  root = r
+}
+
+on pack {
+  let table: list of Cell by at
+  for c in 0 .. pack.capacity + 1 {
+    table.add(Cell { at: c })
+  }
+  for it in items {
+    for k in 0 .. pack.capacity + 1 {
+      let c = pack.capacity - k
+      if c >= it.weight {
+        let with = table[c - it.weight].best + it.worth
+        if with > table[c].best { table[c].best = with }
+      }
+    }
+  }
+  packed = table[pack.capacity].best
+}
+
+view answer = "root {root} in {steps} steps, packed {packed}"

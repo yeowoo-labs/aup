@@ -341,6 +341,52 @@ on tap.down {
 모듈을 바꿔 저장되던 것을 transient로, transient를 저장되는 것으로 바꾸면 다시 열었을 때 바뀐 대로다. `pure-serve`에서 transient만
 바꾸는 요청 100개가 저장소의 어떤 파일도 바꾸지 않고, `kill -9` 뒤에 다시 띄우면 transient는 초기값이다.
 
+### 메모리 안의 계산 (구현)
+
+Pure [018](/srv/git/pure.git)의 2단계이고, [외부 리뷰 005](/srv/git/pure.git)의 (1)에서 시작한다. 반복이 리스트의 항목을 도는
+걷기 하나뿐이고 걷기 안에 걷기가 없으며 이벤트 동안만 쓰는 리스트가 없어서, 그래프 탐색이나 수치 반복을 aup로 쓸 수 없었다.
+
+```text
+on route {
+  let seen: list of Seen by node         # 이벤트의 리스트: 비어서 시작하고, 이벤트가 끝나면 없다
+  let queue: list of Step
+  queue.append(Step { node: route.from })
+  seen.add(Seen { node: route.from })
+  for i in 0 .. nodes.count {            # 세는 반복: 0부터 nodes.count 앞까지
+    if i >= queue.count { break }        # 가장 안쪽 for를 끝낸다
+    let q = queue.first + i              # 자리로 읽는 큐
+    for e in edges[q.node * 1048576 .. q.node * 1048576 + 1048576] {   # for 안의 for
+      if !seen.has(e.to) {
+        seen.add(Seen { node: e.to, depth: seen[q.node].depth + 1 })
+        queue.append(Step { node: e.to })
+      }
+    }
+  }
+  hops = if seen.has(route.to) { seen[route.to].depth } else { -1 }
+}
+```
+
+- **`let 이름: list of 레코드 [by 필드]`** 는 이벤트의 리스트다. 핸들러의 맨 바깥 블록에 둔다. 상태 리스트가 하는 것을 모두 한다
+  (`add`, `append`, `insert`, `remove`, `[키]`, `has`, `count`, `first`, `last`, `+ n`, 집계, `for`). 이벤트가 시작할 때 비어 있고
+  끝나면 비워진다. 저장되지 않고 되돌리기를 기록하지 않는다. 모듈에서는 `let.이름`이라는 이벤트의 리스트 상태다(Pure 008의 행
+  목록과 같은 플래그). 같은 이름의 리스트를 쓰는 핸들러들은 그 상태 하나를 함께 쓰므로 레코드와 키가 같아야 하고, 한 이벤트의 두
+  핸들러가 같은 이름을 쓰지는 못한다. 상태 32개 안에 든다.
+- **`for 이름 in 낮음 .. 높음 { }`** 은 이름을 낮음부터 높음 앞까지 1씩 올리며 돈다. 둘 다 수(정수: 아니면 `limit`)이거나 하나라도
+  i64면 i64다. 이름은 읽기만 한다. `for x in 리스트`(걷기)와는 `in` 뒤가 리스트 이름이고 `{`·`[`·`where`가 따르는지로 가른다.
+- **`break`** 는 가장 안쪽 `for`(걷기든 세기든)를 끝낸다.
+- **중첩.** `for` 안에 `for`를 8겹까지 쓴다. 바깥 걷기의 항목은 안에서 읽는다(컴파일러가 안쪽 걷기 앞에서 인덱스 지역 칸에 담는다).
+  안쪽 `for`는 바깥 걷기가 도는 리스트에 넣거나 그 리스트에서 지우지 못한다(가장 안쪽 걷기는 지금처럼 자기 리스트에서 지울 수 있다).
+- **끝.** 모든 반복은 시작할 때 횟수의 상한이 정해진다. 끝을 모르는 계산은 상한을 적은 세기와 `break`로 쓴다(BFS는 노드 수,
+  DFS와 다익스트라는 간선 수 + 1). 그래도 이벤트마다 실행량 예산(정하지 않으면 2^28 명령)과 메모리 한도(2^28 바이트, 예산이
+  있으면 예산)가 있어서 고장 난 반복은 `work`나 `memory`로 끝나고 아무것도 바꾸지 않는다.
+- `break`는 예약어다.
+
+예제: `examples/routes.aup`(너비 우선, 깊이 우선, 무게로 가장 가까운 길), `examples/numbers.aup`(뉴턴의 제곱근, 배낭 문제).
+
+검증(`tests/check.py`의 `computing`과 진단 14건, Pure의 `test-module`의 `loops`와 `server_runaway`): 무작위 그래프 20개의 질의마다
+세 탐색이 Python 모델과 같다(600번). 뉴턴의 제곱근 200개가 같은 순서로 계산한 Python의 binary64와 비트까지, 단계 수까지 같다. 배낭
+문제 100개가 동적 계획법 모델과 같다. 이벤트가 끝난 뒤 이벤트의 리스트는 모두 비어 있다.
+
 ### 시간
 
 ```text

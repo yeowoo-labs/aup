@@ -1,0 +1,120 @@
+# Routes over a graph in one event each (Pure 018): breadth first, depth
+# first and the nearest by weight. A node's edges are a slice of the edges
+# list (keyed by from * 1048576 + to); the searches keep their queues and
+# what they have seen in the event's own lists, gone when it ends.
+record Node {
+  id = 0
+}
+record Edge {
+  link = 0
+  to = 0
+  w = 1
+}
+record Seen {
+  node = 0
+  depth = 0
+}
+record Step {
+  node = 0
+}
+record Pending {
+  rank = 0
+}
+state nodes: list of Node by id
+state edges: list of Edge by link
+state hops = -1
+state visited = 0
+state order = 0
+state shortest = -1
+input link = message {
+  from: u32
+  to: u32
+  w: u32
+}
+input route = message {
+  from: u32
+  to: u32
+}
+input walk = message {
+  from: u32
+}
+input path = message {
+  from: u32
+  to: u32
+}
+
+on link {
+  if !nodes.has(link.from) { nodes.add(Node { id: link.from }) }
+  if !nodes.has(link.to) { nodes.add(Node { id: link.to }) }
+  edges.add(Edge { link: link.from * 1048576 + link.to, to: link.to, w: link.w })
+}
+
+# Breadth first: the queue is read by position, every node enters it once.
+on route {
+  let seen: list of Seen by node
+  let queue: list of Step
+  queue.append(Step { node: route.from })
+  seen.add(Seen { node: route.from })
+  for i in 0 .. nodes.count {
+    if i >= queue.count { break }
+    let q = queue.first + i
+    for e in edges[q.node * 1048576 .. q.node * 1048576 + 1048576] {
+      if !seen.has(e.to) {
+        seen.add(Seen { node: e.to, depth: seen[q.node].depth + 1 })
+        queue.append(Step { node: e.to })
+      }
+    }
+  }
+  hops = if seen.has(route.to) { seen[route.to].depth } else { -1 }
+}
+
+# Depth first: a stack, each edge pushed once at most; depth is the order a node was reached in.
+on walk {
+  let seen: list of Seen by node
+  let stack: list of Step
+  stack.append(Step { node: walk.from })
+  let reached = 0
+  for i in 0 .. edges.count + 1 {
+    if stack.count == 0 { break }
+    let v = stack.last.node
+    stack.remove(stack.last)
+    if !seen.has(v) {
+      seen.add(Seen { node: v, depth: reached })
+      reached = reached + 1
+      for e in edges[v * 1048576 .. v * 1048576 + 1048576] {
+        if !seen.has(e.to) { stack.append(Step { node: e.to }) }
+      }
+    }
+  }
+  visited = seen.count
+  order = sum(s.depth * (s.node + 1) for s in seen)
+}
+
+# The nearest by weight (Dijkstra): pending ranks by dist * 1048576 + node, the nearest first.
+on path {
+  let best: list of Seen by node
+  let pending: list of Pending by rank
+  best.add(Seen { node: path.from })
+  pending.add(Pending { rank: path.from })
+  for i in 0 .. edges.count + 1 {
+    if pending.count == 0 { break }
+    let d = floor(pending.first.rank / 1048576)
+    let v = pending.first.rank - d * 1048576
+    pending.remove(pending.first)
+    if best[v].depth == d {
+      for e in edges[v * 1048576 .. v * 1048576 + 1048576] {
+        let far = d + e.w
+        if !best.has(e.to) {
+          best.add(Seen { node: e.to, depth: far })
+          pending.add(Pending { rank: far * 1048576 + e.to })
+        } else if far < best[e.to].depth {
+          best[e.to].depth = far
+          pending.add(Pending { rank: far * 1048576 + e.to })
+        }
+      }
+    }
+  }
+  shortest = if best.has(path.to) { best[path.to].depth } else { -1 }
+}
+
+view graph = "{nodes.count} nodes, {edges.count} edges"

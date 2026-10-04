@@ -1,6 +1,6 @@
 # aup v0 — 한 언어, 한 모듈 형식
 
-2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use·라이브러리의 레코드·`bool`·`i64`·`transient state`) 구현.
+2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use·라이브러리의 레코드·`bool`·`i64`·`transient state`·세는 `for`·`break`·중첩·이벤트의 리스트) 구현.
 text와 리스트 문법은 [002](002-dsl-direction.md).
 
 착수 기준:
@@ -23,7 +23,7 @@ text와 리스트 문법은 [002](002-dsl-direction.md).
 | 요청/응답 핸들러와 라우터 | 입력은 이름 있는 이벤트다. 키·CLI·HTTP는 호스트 어댑터가 입력으로 바꾼다 |
 | 화면용 모델을 따로 만든다 | `view`는 상태의 순수 함수다. 호스트와 나중의 Vega가 읽어 표시한다 |
 | 런타임이 소스를 해석한다 | 툴체인이 모듈로 컴파일하고, 런타임은 검증한 뒤 실행한다(JVM의 class 파일처럼) |
-| 이벤트 처리 시간에 상한이 없다 | 반복이 없고 분기는 앞으로만 한다. 이벤트당 실행량의 상한이 모듈에서 정해진다 |
+| 이벤트 처리 시간에 상한이 없다 | 분기는 앞으로만 하고 반복은 시작할 때 횟수가 정해진다(리스트의 항목, 세는 범위). 이벤트마다 실행량 예산이 있다(정하지 않으면 2^28 명령, Pure 018) |
 
 ## v0a 문법
 
@@ -49,7 +49,7 @@ on frame {                       # 1/60초 진행. 핸들러 안에서 dt를 쓸
 
 - 선언과 문장은 줄바꿈이나 `;`로 끝난다. 이름은 ASCII `[A-Za-z_][A-Za-z_0-9]*`, 31바이트 이하다.
 - 예약어: `state input view on if else key frame dt min max clamp message by bytes u32 reply require record each fn use now
-  every floor output send for let true false transient`.
+  every floor output send for let true false transient break`.
 - 키: `Space Enter ArrowLeft ArrowRight ArrowUp ArrowDown KeyA..KeyZ Digit0..Digit9`. 입력 이름과
   키는 각각 한 번만 쓴다. 상태·입력·보기의 이름공간은 서로 겹칠 수 없다.
 - 식: 숫자, `true`·`false`, 상태 이름, `dt`(핸들러 안에서만), 괄호, 단항 `- !`, 이항 `* /`, `+ -`,

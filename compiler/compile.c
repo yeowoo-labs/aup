@@ -20,13 +20,15 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
        LOCAL_LOAD, LOCAL_STORE, I64_ADD, I64_SUB, I64_MUL, I64_DIV, I64_MOD, I64_NEG, I64_COMPARE, I64_MIN, I64_MAX,
-       I64_FROM, NUM_FROM };
+       I64_FROM, NUM_FROM, LOOP, BREAK };
 enum { LOCALS = 64 }; /* an event's locals (Pure's) */
+enum { NESTING = 8, LOOP_INTEGER = 256 }; /* loops (for) nest 8 deep; an i64's count (Pure 018) */
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT, FOLD_INTEGER = 0x40 };
 enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6,
        FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
        FIELD_ROWS = 5, FIELD_BOOL = 6, FIELD_I64 = 7 };
-/* A list of a message's rows: filled as the message arrives, emptied when its event ends (Pure's flag). */
+/* An event's list: a message's rows, filled as the message arrives, or a
+ * let's list; emptied when its event ends (Pure's flag). */
 enum { LIST_ROWS = 256 };
 enum { STATE_TRANSIENT = 256 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, STATE_BOOL = 5, STATE_I64 = 6,
@@ -78,15 +80,19 @@ typedef struct Expr {
 } Expr;
 
 typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
-               S_LET } StmtKind;
+               S_LET, S_COUNT, S_BREAK } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
     char name[NAME], member[NAME]; /* member: the item field an S_SET changes; S_FOR: name is the item, member the list */
     Expr *value;          /* assigned value, condition, reply, requirement or insertion */
     Expr *first, *last;   /* a range, the insertion cursor or index, or the item index; last may be NULL */
-    Expr *low, *high;     /* S_FOR: a slice of the list's keys, or NULL */
+    Expr *low, *high;     /* S_FOR: a slice of the list's keys, or NULL; S_COUNT: its range */
                           /* S_SET: name is the list, or empty when first is an index naming the item */
+    /* S_LET of a list (listed): member is its record (of library), key the field it is keyed by or empty. */
+    bool listed;
+    int library, key_line, key_column;
+    char key[NAME];
     struct Stmt *then, *otherwise, *next;
 } Stmt;
 
@@ -154,6 +160,7 @@ typedef struct {
     bool state_stays[STATES]; /* a mark: a cursor that stays before text inserted at it */
     bool state_transient[STATES]; /* held while the app runs, never stored (Pure 018) */
     int state_rows[STATES];   /* a list of a message's rows: its input + 1, or 0 */
+    bool state_event[STATES]; /* a let's list (let.NAME): its handlers' alone, found only by its let */
     int state_library[STATES]; /* a list's record's library (LIBRARY.NAME), or 0: the app's */
     /* A keyed list: the field named after by, and once resolved, that field + 1. */
     char state_key[STATES][NAME];
@@ -191,14 +198,15 @@ typedef struct {
     char fold_name[NAME];
     int fold_list;
     Scope *fold_scope;
-    /* A handler's locals in scope (let), innermost last, and the slots it used. */
-    struct { char name[NAME]; unsigned slot; Kind kind; } locals[LOCALS];
+    /* A handler's locals in scope (let), innermost last, and the slots it used. A let's list (list: its
+     * state) has no slot; a for's count (counter) is read, never assigned. */
+    struct { char name[NAME]; unsigned slot; Kind kind; int list; bool counter; } locals[LOCALS];
     unsigned local_count, local_slots;
-    /* The for whose block is being generated: its item's name and list. */
-    bool walking;
-    char walk_name[NAME];
-    int walk_list;
-    Scope *walk_scope;
+    /* The fors whose blocks are being generated, innermost last: the item's or count's name, the list a walk
+     * walks (-1: a count), and the index local an outer walk's item is kept in for the fors inside it (-1: none). */
+    struct { char name[NAME]; int list, item; Scope *scope; } loops[NESTING];
+    unsigned loop_count;
+    unsigned nested;      /* blocks within the handler's own (an if's, a for's) */
     /* Libraries: module 0 is the main source; each module lists the libraries it uses. */
     struct { char name[NAME], path[AUP_PATH]; bool uses[MODULES], parsing; } modules[MODULES];
     unsigned module_count;
@@ -224,7 +232,7 @@ static const char *const reserved[] = {"state", "input", "view", "on", "if", "el
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
                                        "floor", "output", "send", "for", "let", "true", "false",
-                                       "transient"};
+                                       "transient", "break"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -993,8 +1001,29 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         memcpy(s->name, name.text, NAME);
         s->line = name.line;
         s->column = name.column;
+        if (is(c, ":")) { /* let name: list of R [by field]: the event's list, empty as it begins */
+            take(c);
+            Token type = expect_name(c, "list");
+            if (strcmp(type.text, "list"))
+                fail_at(c, type.line, type.column, "a let holds a list as let %s: list of a record; others take '='", s->name);
+            expect_word(c, "of");
+            held_record(c, s->member, &s->library);
+            if (word(c, "by")) {
+                take(c);
+                Token key = expect_name(c, "a field of the record");
+                memcpy(s->key, key.text, NAME);
+                s->key_line = key.line;
+                s->key_column = key.column;
+            }
+            s->listed = true;
+            return s;
+        }
         expect(c, "=", "'='");
         s->value = expression(c, 0, false);
+        return s;
+    }
+    if (!strcmp(token.text, "break")) { /* ends the innermost for */
+        s->kind = S_BREAK;
         return s;
     }
     if (!strcmp(token.text, "for")) {
@@ -1007,6 +1036,29 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         if (!word(c, "in")) fail_at(c, c->token.line, c->token.column, "expected 'in' and a list, as in for %s in tasks { }",
                                     item.text);
         take(c);
+        /* for i in low .. high counts; for x in list walks (a list's name, then '{', '[' or where: looked at, the
+         * scanner then put back when it counts) */
+        bool walks = false;
+        if (c->token.kind == T_NAME) {
+            size_t at = c->at;
+            int line = c->line, column = c->column;
+            Token token = c->token, ahead = c->ahead;
+            bool has_ahead = c->has_ahead;
+            char path[NAME];
+            list_path(c, path);
+            walks = is(c, "{") || is(c, "[") || word(c, "where");
+            c->at = at, c->line = line, c->column = column;
+            c->token = token, c->ahead = ahead, c->has_ahead = has_ahead;
+        }
+        if (!walks) {
+            s->kind = S_COUNT;
+            s->low = expression(c, 0, false);
+            if (!is(c, "..")) fail_at(c, c->token.line, c->token.column, "expected '..', as in for %s in 0 .. n { }", item.text);
+            take(c);
+            s->high = expression(c, 0, false);
+            s->then = block(c, depth + 1);
+            return s;
+        }
         s->first = node(c, E_NAME, c->token.line, c->token.column); /* where the list is named */
         list_path(c, s->member);
         if (is(c, "[")) slice(c, &s->low, &s->high);
@@ -1140,7 +1192,9 @@ static int input_index(const Compiler *c, const char *name) {
 }
 
 static int state_index(const Compiler *c, const char *name) {
-    for (unsigned i = 0; i < c->states; ++i) if (!strcmp(c->state_names[i], name)) return (int)i;
+    for (unsigned i = c->local_count; i-- > 0;) /* a let's list, by the let's name */
+        if (c->locals[i].list >= 0 && !strcmp(c->locals[i].name, name)) return c->locals[i].list;
+    for (unsigned i = 0; i < c->states; ++i) if (!c->state_event[i] && !strcmp(c->state_names[i], name)) return (int)i;
     return -1;
 }
 
@@ -2130,10 +2184,47 @@ static void app_name(Compiler *c, const Expr *e, const char *name) {
 }
 
 /* The local named name in scope, or -1. */
+/* A let of a value (or a for's count) in scope, by name, or -1; a let's list is a state (state_index). */
 static int local_named(const Compiler *c, const char *name) {
+    for (unsigned i = c->local_count; i-- > 0;)
+        if (c->locals[i].list < 0 && !strcmp(c->locals[i].name, name)) return (int)i;
+    return -1;
+}
+
+/* Any let in scope by name (a value's or a list's), or -1. */
+static int let_named(const Compiler *c, const char *name) {
     for (unsigned i = c->local_count; i-- > 0;)
         if (!strcmp(c->locals[i].name, name)) return (int)i;
     return -1;
+}
+
+/* The for (walk or count) in whose block a name is its item or count, innermost first, or -1. */
+static int loop_named(const Compiler *c, const char *name) {
+    for (unsigned i = c->loop_count; i-- > 0;)
+        if (!strcmp(c->loops[i].name, name)) return (int)i;
+    return -1;
+}
+
+/* The innermost walk among the fors around, or -1. */
+static int innermost_walk(const Compiler *c) {
+    for (unsigned i = c->loop_count; i-- > 0;)
+        if (c->loops[i].list >= 0) return (int)i;
+    return -1;
+}
+
+/* Whether a list is walked by a for around: the innermost walk's (1), an outer walk's (2), or none (0). */
+static int walked(const Compiler *c, int list) {
+    int inner = innermost_walk(c);
+    for (unsigned i = 0; inner >= 0 && i < c->loop_count; ++i)
+        if (c->loops[i].list == list) return (int)i == inner ? 1 : 2;
+    return 0;
+}
+
+/* Whether statements hold a walk (a for over a list), at any depth. */
+static bool holds_walk(const Stmt *s) {
+    for (; s; s = s->next)
+        if (s->kind == S_FOR || holds_walk(s->then) || holds_walk(s->otherwise)) return true;
+    return false;
 }
 
 static uint32_t local_arg(const Compiler *c, int local) {
@@ -2177,10 +2268,14 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             emit(c, e->line, e->column, ROW, (uint32_t)c->fold_list, 0); /* the item a fold's block runs for */
             return (Kind){INDEX, c->fold_list};
         }
-        if (c->walking && c->scope == c->walk_scope && !strcmp(e->name, c->walk_name)) {
-            /* the item a for's block runs for; in a count, sum, max or min inside it, still there */
-            emit(c, e->line, e->column, c->folding ? OUTER_ROW : ROW, (uint32_t)c->walk_list, 0);
-            return (Kind){INDEX, c->walk_list};
+        int loop = loop_named(c, e->name);
+        if (loop >= 0 && c->loops[loop].list >= 0 && c->scope == c->loops[loop].scope) {
+            /* the item a for's block runs for; in a count, sum, max or min inside it, still there; an outer
+             * walk's, inside the walks within it, kept in a local */
+            int list = c->loops[loop].list;
+            if (loop == innermost_walk(c)) emit(c, e->line, e->column, c->folding ? OUTER_ROW : ROW, (uint32_t)list, 0);
+            else emit(c, e->line, e->column, LOCAL_LOAD, (uint32_t)c->loops[loop].item | 1u << 8 | (uint32_t)list << 16, 0);
+            return (Kind){INDEX, list};
         }
         int param = parameter(c, e->name);
         if (param >= 0 && c->folding && c->scope == c->fold_scope)
@@ -2580,7 +2675,8 @@ static Expr *spread_field(Compiler *c, const Expr *spread, const char *name) {
     }
     if (source->kind == E_NAME) {
         int local = local_named(c, source->name), state = state_index(c, source->name);
-        if (c->walking && !strcmp(source->name, c->walk_name)) list = c->walk_list;
+        int loop = loop_named(c, source->name);
+        if (loop >= 0 && c->loops[loop].list >= 0) list = c->loops[loop].list;
         else if (local >= 0 && c->locals[local].kind.type == INDEX) list = c->locals[local].kind.owner;
         else if (local < 0 && state >= 0 && c->state_types[state] == STATE_INDEX) list = cursor_owner(c, state);
     } else if (source->kind == E_ITEM && !source->member[0])
@@ -2683,11 +2779,26 @@ static void statements(Compiler *c, const Stmt *s) {
     for (; s; s = s->next) {
         switch (s->kind) {
         case S_LET: {
+            if (let_named(c, s->name) >= 0) fail_at(c, s->line, s->column, "'%s' is already a let here", s->name);
             const char *kind = declared_kind(c, s->name);
             if (kind) fail_at(c, s->line, s->column, "'%s' is already declared as %s", s->name, kind);
-            if (local_named(c, s->name) >= 0) fail_at(c, s->line, s->column, "'%s' is already a let here", s->name);
-            if (c->walking && !strcmp(s->name, c->walk_name))
-                fail_at(c, s->line, s->column, "'%s' is the item this for walks", s->name);
+            int loop = loop_named(c, s->name);
+            if (loop >= 0)
+                fail_at(c, s->line, s->column, c->loops[loop].list >= 0 ? "'%s' is the item this for walks" :
+                        "'%s' is what this for counts", s->name);
+            if (c->local_count == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+            if (s->listed) { /* the event's list: its state let.NAME, made before the handlers (event_lists) */
+                if (c->nested) fail_at(c, s->line, s->column, "a let's list goes in the handler's own block, not in an if or a for");
+                char path[2 * NAME];
+                snprintf(path, sizeof(path), "let.%s", s->name);
+                int list = -1;
+                for (unsigned i = 0; i < c->states; ++i) if (c->state_event[i] && !strcmp(c->state_names[i], path)) list = (int)i;
+                unsigned local = c->local_count++;
+                memset(&c->locals[local], 0, sizeof(c->locals[local]));
+                memcpy(c->locals[local].name, s->name, NAME);
+                c->locals[local].list = list;
+                break;
+            }
             if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
             Kind held = value(c, s->value, true, 0);
             if (held.type != NUM && held.type != BOOL && held.type != I64 && held.type != INDEX)
@@ -2697,11 +2808,15 @@ static void statements(Compiler *c, const Stmt *s) {
             memcpy(c->locals[local].name, s->name, NAME);
             c->locals[local].slot = c->local_slots++;
             c->locals[local].kind = held;
+            c->locals[local].list = -1;
+            c->locals[local].counter = false;
             emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, (int)local), 0);
             break;
         }
         case S_ASSIGN: {
             int local = local_named(c, s->name);
+            if (local >= 0 && c->locals[local].counter)
+                fail_at(c, s->line, s->column, "'%s' is what this for counts; it is not assigned", s->name);
             if (local >= 0) { /* a let takes a new value of its kind */
                 Kind kind = wanted(c, s->value, true, 0, c->locals[local].kind.type);
                 if (kind.type != c->locals[local].kind.type || (kind.type == INDEX && kind.owner != c->locals[local].kind.owner))
@@ -2741,8 +2856,10 @@ static void statements(Compiler *c, const Stmt *s) {
             int list = state_index(c, s->name);
             if (list >= 0 && c->state_types[list] == STATE_LIST) {
                 if (s->last) fail_at(c, s->last->line, s->last->column, "a list removes one item, as in %s.remove(index)", s->name);
-                if (s->kind == S_INSERT && c->walking && list == c->walk_list)
+                if (s->kind == S_INSERT && walked(c, list))
                     fail_at(c, s->line, s->column, "a for does not add to the list it walks; add to another list, or after the for");
+                if (s->kind == S_REMOVE && walked(c, list) == 2)
+                    fail_at(c, s->line, s->column, "a for removes from the list it walks, not from one an outer for walks");
                 if (s->kind == S_INSERT && keyed_by(c, list))
                     fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
                             keyed_by(c, list), s->name, record_shown(c, c->module, record_of(c, list)));
@@ -2767,7 +2884,7 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_APPEND: case S_ADD: {
             /* A keyed list places an added item by its key (it fails if the key is there); others append. */
             int list = list_state(c, s->name, s->line, s->column, NULL);
-            if (c->walking && list == c->walk_list)
+            if (walked(c, list))
                 fail_at(c, s->line, s->column, "a for does not add to the list it walks; add to another list, or after the for");
             const char *key = keyed_by(c, list), *record = record_shown(c, c->module, record_of(c, list));
             if (s->kind == S_APPEND && key)
@@ -2859,7 +2976,7 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_REPLY:
             if (c->message < 0 || c->inputs[c->message].kind != KIND_MESSAGE)
                 fail_at(c, s->line, s->column, "reply is only available in a message handler");
-            if (c->walking) fail_at(c, s->line, s->column, "a message replies once: reply after the for");
+            if (c->loop_count) fail_at(c, s->line, s->column, "a message replies once: reply after the for");
             bytes_value(c, s->value, 0, "reply");
             emit(c, s->line, s->column, REPLY, 0, 0);
             break;
@@ -2869,10 +2986,12 @@ static void statements(Compiler *c, const Stmt *s) {
             break;
         case S_FOR: {
             /* EACH and the block after it, run once for every item the list has, with the item as ROW. */
-            if (c->walking) fail_at(c, s->line, s->column, "a for cannot hold another for");
+            if (c->loop_count == NESTING) fail_at(c, s->line, s->column, "fors nest at most %d deep", NESTING);
             int list = list_state(c, s->member, s->first->line, s->first->column, NULL);
             const char *kind = declared_kind(c, s->name);
             if (kind) fail_at(c, s->last->line, s->last->column, "'%s' is already declared as %s", s->name, kind);
+            if (let_named(c, s->name) >= 0 || loop_named(c, s->name) >= 0)
+                fail_at(c, s->last->line, s->last->column, "'%s' is already a let or a for's name here", s->name);
             if (s->low) { /* a slice: the keys from low up to before high */
                 Type key = keyed_by(c, list) ? field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1) : TEXT;
                 if (key != NUM && key != I64)
@@ -2881,20 +3000,28 @@ static void statements(Compiler *c, const Stmt *s) {
                 expect_kind(c, s->low, wanted(c, s->low, true, 0, key), key);
                 expect_kind(c, s->high, wanted(c, s->high, true, 1, key), key);
             }
-            unsigned at = c->code_count, jump = 0;
+            unsigned at = c->code_count, jump = 0, loop = c->loop_count++;
             emit(c, s->line, s->column, EACH, 0, 0);
-            c->walking = true;
-            c->walk_list = list;
-            c->walk_scope = c->scope;
-            memcpy(c->walk_name, s->name, NAME);
+            memcpy(c->loops[loop].name, s->name, NAME);
+            c->loops[loop].list = list;
+            c->loops[loop].item = -1;
+            c->loops[loop].scope = c->scope;
             if (s->value) {
                 truth(c, s->value, true, 0, "where");
                 jump = c->code_count;
                 emit(c, s->line, s->column, JZ, 0, 0);
             }
+            if (holds_walk(s->then)) { /* the walks within read this item from a local */
+                if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+                c->loops[loop].item = (int)c->local_slots++;
+                emit(c, s->line, s->column, ROW, (uint32_t)list, 0);
+                emit(c, s->line, s->column, LOCAL_STORE, (uint32_t)c->loops[loop].item | 1u << 8 | (uint32_t)list << 16, 0);
+            }
+            ++c->nested;
             statements(c, s->then);
+            --c->nested;
             if (s->value) c->code[jump].arg = c->code_count;
-            c->walking = false;
+            --c->loop_count;
             bool empty = c->code_count == at + 1;
             if (empty && !s->low) c->code_count = at; /* nothing to do for any item */
             else {
@@ -2910,6 +3037,7 @@ static void statements(Compiler *c, const Stmt *s) {
             truth(c, s->value, true, 0, "if");
             unsigned jump = c->code_count;
             emit(c, s->line, s->column, JZ, 0, 0);
+            ++c->nested;
             statements(c, s->then);
             if (s->otherwise) {
                 unsigned skip = c->code_count;
@@ -2918,8 +3046,46 @@ static void statements(Compiler *c, const Stmt *s) {
                 statements(c, s->otherwise);
                 c->code[skip].arg = c->code_count;
             } else c->code[jump].arg = c->code_count;
+            --c->nested;
             break;
         }
+        case S_COUNT: {
+            /* LOOP and the block after it, run once for each value from low up to before high, the value in a local:
+             * numbers (whole), or i64s when either is one. */
+            if (c->loop_count == NESTING) fail_at(c, s->line, s->column, "fors nest at most %d deep", NESTING);
+            const char *kind = declared_kind(c, s->name);
+            if (kind) fail_at(c, s->line, s->column, "'%s' is already declared as %s", s->name, kind);
+            if (let_named(c, s->name) >= 0 || loop_named(c, s->name) >= 0)
+                fail_at(c, s->line, s->column, "'%s' is already a let or a for's name here", s->name);
+            if (c->local_slots == LOCALS || c->local_count == LOCALS)
+                fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+            bool integer = probe(c, s->low, true, 0) == I64 || probe(c, s->high, true, 0) == I64;
+            Type type = integer ? I64 : NUM;
+            expect_kind(c, s->low, wanted(c, s->low, true, 0, type), type);
+            expect_kind(c, s->high, wanted(c, s->high, true, 1, type), type);
+            unsigned scope = c->local_count, local = c->local_count++, loop = c->loop_count++, at = c->code_count;
+            memcpy(c->locals[local].name, s->name, NAME);
+            c->locals[local].slot = c->local_slots++;
+            c->locals[local].kind = (Kind){type, -1};
+            c->locals[local].list = -1;
+            c->locals[local].counter = true;
+            memcpy(c->loops[loop].name, s->name, NAME);
+            c->loops[loop].list = -1;
+            c->loops[loop].item = -1;
+            c->loops[loop].scope = c->scope;
+            emit(c, s->line, s->column, LOOP, 0, 0);
+            ++c->nested;
+            statements(c, s->then);
+            --c->nested;
+            c->code[at].arg = c->locals[local].slot | (integer ? LOOP_INTEGER : 0) | (c->code_count - at - 1) << 16;
+            --c->loop_count;
+            c->local_count = scope;
+            break;
+        }
+        case S_BREAK:
+            if (!c->loop_count) fail_at(c, s->line, s->column, "break ends a for; this one is outside any");
+            emit(c, s->line, s->column, BREAK, 0, 0);
+            break;
         }
     }
     c->local_count = scope;
@@ -2962,6 +3128,50 @@ static uint32_t intern(unsigned char *strings, size_t *used, const char *text) {
 
 /* A message's rows field fills a list of its own, named by the input and the
  * field (order.lines): a state that holds rows only while its event runs. */
+/* A let's list (let x: list of R) is a state of its own, let.x: an event's
+ * list (Pure 018), one for the lets of that name in the handlers' own
+ * blocks, which hold one record keyed one way; no two handlers of one event
+ * have one, so each begins empty. */
+static void event_lists(Compiler *c) {
+    for (unsigned h = 0; h < c->handler_count; ++h)
+        for (const Stmt *s = c->handlers[h].body; s; s = s->next) {
+            if (s->kind != S_LET || !s->listed) continue;
+            char path[2 * NAME];
+            snprintf(path, sizeof(path), "let.%s", s->name);
+            if (strlen(path) >= NAME)
+                fail_at(c, s->line, s->column, "a let's list has a name of %d characters at most", NAME - 5);
+            int found = -1;
+            for (unsigned i = 0; i < c->states; ++i)
+                if (c->state_event[i] && !strcmp(c->state_names[i], path)) found = (int)i;
+            if (found >= 0) {
+                if (strcmp(c->state_target[found], s->member) || c->state_library[found] != s->library ||
+                    strcmp(c->state_key[found], s->key))
+                    fail_at(c, s->line, s->column, "'%s' is a let's list of another record or key in another handler; one name "
+                            "holds one kind of list", s->name);
+                for (unsigned k = 0; k < h; ++k) {
+                    if (strcmp(c->handlers[k].input, c->handlers[h].input) || c->handlers[k].edge != c->handlers[h].edge) continue;
+                    for (const Stmt *t = c->handlers[k].body; t; t = t->next)
+                        if (t->kind == S_LET && t->listed && !strcmp(t->name, s->name))
+                            fail_at(c, s->line, s->column, "another handler of this event has a list '%s'; name this one apart",
+                                    s->name);
+                }
+                continue;
+            }
+            if (c->states == STATES) fail_at(c, s->line, s->column, "at most 32 states are allowed, a let's list among them");
+            unsigned i = c->states++;
+            memcpy(c->state_names[i], path, strlen(path) + 1);
+            c->state_types[i] = STATE_LIST;
+            c->state_event[i] = true;
+            memcpy(c->state_target[i], s->member, NAME);
+            c->state_library[i] = s->library;
+            memcpy(c->state_key[i], s->key, NAME);
+            c->state_key_line[i] = s->key_line;
+            c->state_key_column[i] = s->key_column;
+            c->state_line[i] = s->line;
+            c->state_column[i] = s->column;
+        }
+}
+
 static void rows_lists(Compiler *c) {
     for (unsigned i = 0; i < c->input_count; ++i) {
         Input *in = &c->inputs[i];
@@ -3024,6 +3234,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     uint32_t events[HANDLERS], state_ref[STATES] = {0};
     int handler_input[HANDLERS];
     rows_lists(c);
+    event_lists(c);
     pull_records(c);
     for (unsigned i = 0; i < c->states; ++i) {
         if (c->state_types[i] == STATE_TEXT) {
@@ -3188,7 +3399,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         else if (c->state_types[i] == STATE_I64) p = put64(p, (uint64_t)c->state_integer[i]);
         else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */
             p = put32(p, state_ref[i]);
-            p = put32(p, c->state_types[i] == STATE_LIST ? (c->state_rows[i] ? LIST_ROWS : (uint32_t)c->list_key[i]) :
+            p = put32(p, c->state_types[i] == STATE_LIST ? (c->state_rows[i] || c->state_event[i] ? LIST_ROWS : 0) |
+                                                           (uint32_t)c->list_key[i] :
                          c->state_stays[i] ? 1 : 0);
         }
     }
