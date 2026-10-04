@@ -1,6 +1,6 @@
 # aup v0 — 한 언어, 한 모듈 형식
 
-2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use·라이브러리의 레코드·`bool`·`i64`) 구현.
+2026-09-25. 상태: v0a(scalar), v0b(바이트·영속 문서·text·커서), v0c(레코드·리스트·인덱스·조건식·표 보기·fn·use·라이브러리의 레코드·`bool`·`i64`·`transient state`) 구현.
 text와 리스트 문법은 [002](002-dsl-direction.md).
 
 착수 기준:
@@ -49,7 +49,7 @@ on frame {                       # 1/60초 진행. 핸들러 안에서 dt를 쓸
 
 - 선언과 문장은 줄바꿈이나 `;`로 끝난다. 이름은 ASCII `[A-Za-z_][A-Za-z_0-9]*`, 31바이트 이하다.
 - 예약어: `state input view on if else key frame dt min max clamp message by bytes u32 reply require record each fn use now
-  every floor output send for let true false`.
+  every floor output send for let true false transient`.
 - 키: `Space Enter ArrowLeft ArrowRight ArrowUp ArrowDown KeyA..KeyZ Digit0..Digit9`. 입력 이름과
   키는 각각 한 번만 쓴다. 상태·입력·보기의 이름공간은 서로 겹칠 수 없다.
 - 식: 숫자, `true`·`false`, 상태 이름, `dt`(핸들러 안에서만), 괄호, 단항 `- !`, 이항 `* /`, `+ -`,

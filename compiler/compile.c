@@ -28,6 +28,7 @@ enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPU
        FIELD_ROWS = 5, FIELD_BOOL = 6, FIELD_I64 = 7 };
 /* A list of a message's rows: filled as the message arrives, emptied when its event ends (Pure's flag). */
 enum { LIST_ROWS = 256 };
+enum { STATE_TRANSIENT = 256 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, STATE_BOOL = 5, STATE_I64 = 6,
        UNIT_CHAR = 0, UNIT_LINE = 1 };
 /* Pure's view types, record field types (0 a number, 1 a text, 2 a bool, 3 an i64) and what a local holds. */
@@ -151,6 +152,7 @@ typedef struct {
     char state_names[STATES][NAME], state_target[STATES][NAME];
     int state_types[STATES], state_line[STATES], state_column[STATES];
     bool state_stays[STATES]; /* a mark: a cursor that stays before text inserted at it */
+    bool state_transient[STATES]; /* held while the app runs, never stored (Pure 018) */
     int state_rows[STATES];   /* a list of a message's rows: its input + 1, or 0 */
     int state_library[STATES]; /* a list's record's library (LIBRARY.NAME), or 0: the app's */
     /* A keyed list: the field named after by, and once resolved, that field + 1. */
@@ -221,7 +223,8 @@ typedef struct {
 static const char *const reserved[] = {"state", "input", "view", "on", "if", "else", "key", "frame",
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
-                                       "floor", "output", "send", "for", "let", "true", "false"};
+                                       "floor", "output", "send", "for", "let", "true", "false",
+                                       "transient"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -1408,10 +1411,11 @@ static Token held_record(Compiler *c, char name[NAME], int *library) {
     return second;
 }
 
-static void state_declaration(Compiler *c) {
+static void state_declaration(Compiler *c, bool transient) {
     Token name = expect_name(c, "state name");
     declare(c, &name);
     if (is(c, ":") && lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "bytes")) {
+        if (transient) fail_at(c, name.line, name.column, "a keyed collection is stored; only a state can be transient");
         take(c);
         take(c);
         expect_word(c, "by");
@@ -1423,6 +1427,7 @@ static void state_declaration(Compiler *c) {
     if (c->states == STATES) fail_at(c, name.line, name.column, "at most 32 states are allowed");
     unsigned index = c->states;
     memcpy(c->state_names[index], name.text, NAME);
+    c->state_transient[index] = transient;
     c->state_line[index] = name.line;
     c->state_column[index] = name.column;
     if (is(c, ":")) {
@@ -1658,13 +1663,18 @@ static void view_arguments(Compiler *c, unsigned view, const Token *name) {
 }
 
 static void declaration(Compiler *c) {
-    Token kind = expect_name(c, "state, record, input, output, view, fn, use, or on");
+    Token kind = expect_name(c, "state, transient, record, input, output, view, fn, use, or on");
     if (!strcmp(kind.text, "fn")) {
         fn_declaration(c);
     } else if (!strcmp(kind.text, "use")) {
         use_declaration(c);
     } else if (!strcmp(kind.text, "state")) {
-        state_declaration(c);
+        state_declaration(c, false);
+    } else if (!strcmp(kind.text, "transient")) {
+        /* transient state x = 0: the app's while it runs, never stored */
+        if (!word(c, "state")) fail_at(c, c->token.line, c->token.column, "expected 'state' after 'transient'");
+        take(c);
+        state_declaration(c, true);
     } else if (!strcmp(kind.text, "record")) {
         record_declaration(c);
     } else if (!strcmp(kind.text, "input")) {
@@ -3026,6 +3036,9 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                 fail_at(c, c->state_line[i], c->state_column[i], cursor ? "a cursor moves in a text state; '%s' is not one" :
                         "an index points into a list state; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)target;
+            if (!c->state_transient[i] && c->state_transient[target])
+                fail_at(c, c->state_line[i], c->state_column[i], "'%s' is stored but points into transient '%s'; make it "
+                        "transient too", c->state_names[i], c->state_target[i]);
         } else if (c->state_types[i] == STATE_LIST) {
             int record = module_record(c, c->state_library[i], c->state_target[i]);
             for (unsigned l = 1; record < 0 && l < c->module_count; ++l) /* a library's, written without its name */
@@ -3170,7 +3183,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     p += 40;
     for (unsigned i = 0; i < c->states; ++i) {
         p = put32(p, state_name[i]);
-        p = put32(p, (uint32_t)c->state_types[i]);
+        p = put32(p, (uint32_t)c->state_types[i] | (c->state_transient[i] ? STATE_TRANSIENT : 0));
         if (c->state_types[i] == STATE_NUM || c->state_types[i] == STATE_BOOL) p = put_double(p, c->initial[i]);
         else if (c->state_types[i] == STATE_I64) p = put64(p, (uint64_t)c->state_integer[i]);
         else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */

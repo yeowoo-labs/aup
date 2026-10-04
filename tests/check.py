@@ -77,6 +77,13 @@ DIAGNOSTICS = [
     ('input k = key Space\nview v = k\n', '2:10', "'k' is a key input, not a state"),
     ('state a = 0\nview v = min(a)\n', '2:10', 'min expects 2 arguments'),
     ('state if = 0\n', '1:7', "'if' is reserved"),
+    ('state transient = 0\n', '1:7', "'transient' is reserved"),
+    ('transient x = 0\n', '1:11', "expected 'state' after 'transient'"),
+    ('transient state docs: bytes by key\n', '1:17', 'a keyed collection is stored; only a state can be transient'),
+    ('transient state note: text\nstate at: cursor in note\n', '2:7',
+     "'at' is stored but points into transient 'note'; make it transient too"),
+    ('record R {\n  n = 0\n}\ntransient state rs: list of R\nstate at: index of rs\n', '5:7',
+     "'at' is stored but points into transient 'rs'; make it transient too"),
     ('state a = 0 $\n', '1:13', "unexpected character '$'"),
     ('state a = 1e400\n', '1:11', 'number must be finite'),
     ('view v = 1 +\n', '1:13', 'expected a number, state, or expression'),
@@ -1033,6 +1040,59 @@ def library_records(aup, pure_run, pure, work):
             'diagnostics': len(bad)}
 
 
+def transients(aup, pure_run, work):
+    """A transient state (Pure 018) is the app's while it runs and never
+    stored: a run that changes only transient states between the same stored
+    events leaves the store byte for byte as one that does not, a start
+    begins them anew, a failed event undoes them, and replacing the module
+    moves a state between stored and transient by name. Its module differs
+    from the same app's without transient only in those states' type words."""
+    import filecmp
+    app = ('record Hit {\n  n = 0\n}\nstate count = 0\n@state online = 0\n@state recent: list of Hit\n'
+           'state hits: list of Hit\n@state picked: index of hits\ninput tap = key Space\ninput peek = key KeyP\n'
+           'input bad = key KeyB\n'
+           'on tap.down {\n  count = count + 1\n  online = online + 1\n  recent.append(Hit { n: online })\n'
+           '  hits.append(Hit { n: count })\n  picked = hits.last\n}\n'
+           'on peek.down {\n  online = online + 10\n  recent.append(Hit { n: online })\n}\n'
+           'on bad.down {\n  online = online + 100\n  require online < 0\n}\n'
+           'view seen = recent.count\nview at = picked.n\n')
+    (work / 'transient.aup').write_text(app.replace('@', 'transient '))
+    (work / 'stored.aup').write_text(app.replace('@', ''))
+    transient = compile_module(aup, work / 'transient.aup', work / 'transient.pmod')
+    stored = compile_module(aup, work / 'stored.aup', work / 'stored.pmod')
+    differ = [i for i in range(len(stored)) if stored[i] != transient[i]]
+    assert len(stored) == len(transient) and len(differ) == 3 and all(transient[i] == 1 for i in differ), differ
+
+    def states(store, keys):
+        out = run(pure_run, work / 'transient.pmod', '--store', store,
+                  stdin=''.join(f'down {k}\nup {k}\n' for k in keys) + 'show\n', check=False).stdout.splitlines()
+        return json.loads(out[-1])
+
+    plain, mixed = work / 'transient-plain', work / 'transient-mixed'
+    first = states(plain, ['tap', 'tap', 'tap'])
+    second = states(mixed, ['peek', 'tap', 'peek', 'bad', 'tap', 'peek', 'tap', 'peek'])
+    assert first['states']['count'] == second['states']['count'] == 3, (first, second)
+    assert second['states']['online'] == 43 and second['views']['seen'] == 7, second
+    compared = filecmp.dircmp(plain, mixed)
+    assert not compared.left_only and not compared.right_only and not compared.diff_files and not compared.funny_files, \
+        (compared.left_only, compared.right_only, compared.diff_files)
+    for name in compared.common_files:
+        assert (plain / name).read_bytes() == (mixed / name).read_bytes(), name
+    again = states(mixed, [])
+    assert again['states']['count'] == 3 and again['states']['online'] == 0 and again['views']['seen'] == 0, again
+    assert again['states']['picked'] == 0 and again['views']['at'] == 1, again
+    # online stored from now on, count transient: replaced while running, then started again.
+    (work / 'swapped.aup').write_text(app.replace('@', '').replace('state count', 'transient state count')
+                                      .replace('state picked', 'transient state picked'))
+    compile_module(aup, work / 'swapped.aup', work / 'swapped.pmod')
+    swapped = work / 'transient-swapped'
+    run(pure_run, work / 'transient.pmod', '--store', swapped,
+        stdin=f'down tap\nup tap\ndown peek\nreplace {work / "swapped.pmod"}\ndown tap\nup tap\n')
+    back = json.loads(run(pure_run, work / 'swapped.pmod', '--store', swapped, stdin='show\n').stdout.splitlines()[-1])
+    assert back['states']['online'] == 12 and back['states']['count'] == 0 and back['views']['seen'] == 3, back
+    return {'store_files_compared': len(compared.common_files), 'type_words_differ': len(differ)}
+
+
 def stored_runs(aup, pure_run, work, seeds, steps=240):
     """Declared state is stored state: the list app and the text editor run on
     a store, restarting (a new pure-run process) at random points, and keep
@@ -1732,6 +1792,7 @@ def main():
         report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
         report['library_records'] = library_records(aup, pure_run, args.pure.resolve(), work)
+        report['transients'] = transients(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

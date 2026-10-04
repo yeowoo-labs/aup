@@ -303,6 +303,44 @@ view golds = count(u in users where store.rank(u.points) == "gold")
 - 값을 이름이 아니라 선언으로 맞추는 까닭: 쓰이지 않아 모듈에 없는 다른 라이브러리의 같은 이름 레코드가, 이름만 같아서 리스트에
   들어가는 일을 막는다.
 
+### 상태의 수명: transient (구현)
+
+Pure [018](/srv/git/pure.git)의 1단계다. 지금까지 모든 `state`는 저장됐다. 접속 수, 캐시, 계산의 중간값처럼 다시 시작한 뒤에는
+뜻이 없는 상태도 커밋마다 저장소에 썼다. 이제 값의 수명은 선언이 말한다.
+
+```text
+state visits = 0                         # 저장한다: 다시 시작해도 남는다
+transient state online = 0               # 앱이 도는 동안만: 저장하지 않고, 다시 시작하면 초기값
+transient state recent: list of Hit
+transient state status: text = "idle"
+transient state picked: index of tasks   # 저장되는 리스트의 저장되지 않는 선택
+on tap.down {
+  let n = online + 1                     # 이벤트의 값: 이벤트가 끝나면 없다
+  online = n
+}
+```
+
+| | 실패한 이벤트 | 저장소 | 다시 시작하면 | 모듈을 바꾸면 |
+|---|---|---|---|---|
+| `state` | 되돌린다 | 쓴다 | 저장된 값 | 이름으로 잇는다 |
+| `transient state` | 되돌린다 | 쓰지 않는다 | 초기값 | 이름으로 잇는다 |
+| `let` | 버린다 | 없다 | — | — |
+
+- **`transient state`** 는 모든 상태 타입에 쓴다(수, bool, i64, text, 커서, 리스트, 인덱스). 보기, 이벤트, 되돌리기, 메모리 예산,
+  스냅숏의 읽기에서는 다른 상태와 같다. 다른 것은 저장소뿐이다: 그것만 바꾼 이벤트는 저장소에 아무것도 쓰지 않는다.
+- 저장되는 커서나 인덱스는 transient text나 리스트를 가리키지 못한다(다시 시작하면 가리키던 것이 비어 있다). transient 커서나
+  인덱스는 저장되는 것을 가리켜도 된다.
+- 모듈의 상태 타입 워드에 비트 하나다(Pure 008). transient가 없는 앱의 모듈은 바이트 그대로 지금과 같다.
+- 모듈을 바꿀 때(`aup watch`, 호스트의 SIGHUP) 저장되던 상태를 transient로, 또는 그 반대로 바꿀 수 있다. 저장소에 남은 옛 값은
+  버린 상태의 것처럼 다룬다.
+- `transient`는 예약어다.
+
+검증(`tests/check.py`의 `transients`와 진단 5건, Pure의 `test-module`과 `server_transient`): 같은 앱의 transient 판과 저장 판의
+모듈이 상태 타입 워드 세 바이트만 다르다. 같은 저장 이벤트(`tap`) 사이에 transient만 바꾸는 이벤트와 실패하는 이벤트를 섞은 실행의
+저장소가, 섞지 않은 실행의 저장소와 파일과 바이트까지 같다. 다시 열면 transient는 초기값이고 저장되는 것은 그대로다. 달리는 동안
+모듈을 바꿔 저장되던 것을 transient로, transient를 저장되는 것으로 바꾸면 다시 열었을 때 바뀐 대로다. `pure-serve`에서 transient만
+바꾸는 요청 100개가 저장소의 어떤 파일도 바꾸지 않고, `kill -9` 뒤에 다시 띄우면 transient는 초기값이다.
+
 ### 시간
 
 ```text
