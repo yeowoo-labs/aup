@@ -915,7 +915,7 @@ def libraries(aup, pure_run, work):
         assert shown['views'] == views, (source, shown['views'])
     bad = [
         ('use loopa\n', 'loopb.aup:1:5', "library 'loopa' uses itself through its uses"),
-        ('use stateful\n', 'stateful.aup:2:1', 'a library declares only fn and use'),
+        ('use stateful\n', 'stateful.aup:2:1', 'a library declares only fn, record and use'),
         ('use peek\nstate x = 1\nview v = peek.f(1)\n', 'peek.aup:1:15',
          "'x' is not a parameter; a library fn reads only its parameters (in fn 'f' called at 3:15)"),
         ('use shapes\nview v = shapes.volume(1)\n', 'main.aup:2:17', "library 'shapes' has no fn 'volume'"),
@@ -924,6 +924,91 @@ def libraries(aup, pure_run, work):
         result = build(source)
         assert result.returncode == 1 and f'{where}: {message}' in result.stderr, (source, result.stderr)
     return len(good), len(bad)
+
+
+
+def library_records(aup, pure_run, work):
+    """A library declares records (docs/design/002, Pure's review 005): an
+    app writes them LIBRARY.NAME, and they are NAME in its module, so the
+    task list with its record moved into a library builds the same module,
+    byte for byte. Only the records the app's lists and rows hold go into
+    its module. A second module using the same library (a migration) reads
+    and changes what the app stored, and the app reads it after. Names are
+    one namespace in a module, however they were written."""
+    import re
+    import struct
+    lib = work / 'record-libs'
+    lib.mkdir(parents=True, exist_ok=True)
+    env = {'PATH': '/usr/bin:/bin'}
+
+    def build(name, source):
+        path = lib / f'{name}.aup'
+        path.write_text(source)
+        return subprocess.run([str(aup), 'build', str(path), '-o', str(lib / f'{name}.pmod')], capture_output=True,
+                              text=True, env=env, timeout=60)
+
+    # The task list, its record moved into a library: the same module.
+    tasks = (ROOT / 'examples' / 'tasks.aup').read_text()
+    record = re.search(r'record Task \{.*?\n\}\n', tasks, re.S).group(0)
+    (lib / 'words.aup').write_text((ROOT / 'examples' / 'words.aup').read_text())
+    (lib / 'taskrecords.aup').write_text(record)
+    moved = 'use taskrecords\n' + tasks.replace(record, '').replace('list of Task', 'list of taskrecords.Task') \
+        .replace('Task {', 'taskrecords.Task {')
+    assert build('tasks-before', tasks).returncode == 0 and build('tasks-moved', moved).returncode == 0
+    assert (lib / 'tasks-before.pmod').read_bytes() == (lib / 'tasks-moved.pmod').read_bytes()
+    # Only the records used: one of three.
+    (lib / 'people.aup').write_text('record Person { name: text }\nrecord Team { name: text, size = 0 }\n'
+                                    'record Badge { label: text }\nfn big(n) = n > 10\n')
+    assert build('teams', 'use people\nstate teams: list of people.Team\ninput add = text\n'
+                          'on add { teams.append(people.Team { name: add, size: 12 }) }\n'
+                          'view big = count(t in teams where people.big(t.size))\n').returncode == 0
+    module = (lib / 'teams.pmod').read_bytes()
+    assert struct.unpack_from('<H', module, 30)[0] == 1, struct.unpack_from('<H', module, 30)
+    lines = run(pure_run, lib / 'teams.pmod', stdin='type add 61\nshow\n').stdout.splitlines()
+    assert json.loads(lines[-1])['views'] == {'big': 1}, lines[-1]
+    # A migration: another module of the same library changes what the app stored.
+    (lib / 'store.aup').write_text('record User { name: text, points = 0 }\n')
+    assert build('main', 'use store\nstate users: list of store.User by name\ninput join = text\n'
+                         'on join { users.add(store.User { name: join }) }\n'
+                         'view count = users.count\nview points = sum(u.points for u in users)\n').returncode == 0
+    assert build('migrate', 'use store\nstate users: list of store.User by name\ninput bump = key Space\n'
+                            'on bump.down {\n  for u in users {\n    u.points = u.points + 10\n  }\n}\n').returncode == 0
+    store = lib / 'users-store'
+    run(pure_run, lib / 'main.pmod', '--store', store, stdin='type join 616e6e\ntype join 626f\ntype join 6379\n')
+    run(pure_run, lib / 'migrate.pmod', '--store', store, stdin='down bump\nup bump\n')
+    shown = json.loads(run(pure_run, lib / 'main.pmod', '--store', store, stdin='show\n').stdout.splitlines()[-1])
+    assert shown['views'] == {'count': 3, 'points': 30}, shown
+    # A message's rows of a library's record.
+    assert build('rows', 'use store\ninput load = message {\n  rows: list of store.User\n}\nstate n = 0\n'
+                         'on load {\n  n = n + load.rows.count\n}\nview loaded = n\n').returncode == 0, \
+        build('rows', '').stderr
+    (lib / 'other.aup').write_text('record User { name: text }\n')
+    (lib / 'twofold.aup').write_text('record Item { n = 0 }\nfn Item = 1\n')
+    (lib / 'stateful.aup').write_text('record R { n = 0 }\nstate x = 0\n')
+    bad = [
+        ('use store\nstate users: list of User\n', 'main.aup:2:7', "'User' is library store's record: write store.User"),
+        ('use store\nstate users: list of store.Nope\n', 'main.aup:2:28', "library 'store' has no record 'Nope'"),
+        ('state users: list of nope.User\n', 'main.aup:1:22', "unknown library 'nope'; write use nope first"),
+        ('use store\nrecord User { n = 0 }\nstate users: list of store.User\n', 'main.aup:3:28',
+         "store.User is 'User' in the module, as User is: two records cannot share a name"),
+        ('use store\nuse other\nstate a: list of store.User\nstate b: list of other.User\n', 'main.aup:4:24',
+         "other.User is 'User' in the module, as store.User is: two records cannot share a name"),
+        ('use store\nstate User = 0\nstate users: list of store.User\n', 'main.aup:3:28',
+         "store.User is 'User' in the module, and 'User' is a state here"),
+        ('use store\nuse other\nstate users: list of store.User\ninput j = text\n'
+         'on j { users.append(other.User { name: j }) }\n', 'main.aup:5:27', "'users' holds store.User, not other.User"),
+        ('use store\nstate users: list of store.User\ninput j = text\non j { users.append(User { name: j }) }\n',
+         'main.aup:4:21', "'users' holds store.User, not User"),
+        ('use store\nstate users: list of store.User\ninput j = text\non j { users.append(store.Nope { name: j }) }\n',
+         'main.aup:4:27', "library 'store' has no record 'Nope'"),
+        ('use twofold\n', 'twofold.aup:2:4', "'Item' is already declared as a record"),
+        ('use stateful\n', 'stateful.aup:2:1', 'a library declares only fn, record and use'),
+    ]
+    for source, where, message in bad:
+        result = build('main', source)
+        assert result.returncode == 1 and f'{where}: {message}' in result.stderr, (source, where, message, result.stderr)
+    return {'moved_module_bytes': len((lib / 'tasks-moved.pmod').read_bytes()), 'migrated_points': 30,
+            'diagnostics': len(bad)}
 
 
 def stored_runs(aup, pure_run, work, seeds, steps=240):
@@ -1624,6 +1709,7 @@ def main():
         report['keyed_snapshots'], report['keyed_failed_events'] = keyed(aup, pure_run, work, range(args.seeds))
         report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
+        report['library_records'] = library_records(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

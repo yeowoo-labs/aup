@@ -10,7 +10,8 @@
 /* Limits and opcodes of Pure module format v6. */
 enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK = 64, NAME = 32, JOINS = 8,
        DEPTH = 64, FIELDS = 64, COLLECTIONS = 1, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
-       RECORDS = 16, RECORD_FIELDS = 128, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9 };
+       RECORDS = 16, RECORD_FIELDS = 128, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9,
+       LIBRARY_RECORDS = 64 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, DOC, DOC_SIZE, LEN, REPLACE, REPLY, REQUIRE,
        TEXT_CONST, TEXT_LOAD, TEXT_INPUT, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
@@ -95,17 +96,22 @@ typedef struct {
     bool keyed;
     char field_names[FIELDS][NAME];
     int field_types[FIELDS];
-    /* A rows field's record, where it was written, and the list its rows fill. */
+    /* A rows field's record (its library: 0 the app's), where it was written, and the list its rows fill. */
     char field_record[FIELDS][NAME];
-    int field_line[FIELDS], field_column[FIELDS], field_list[FIELDS];
+    int field_library[FIELDS], field_line[FIELDS], field_column[FIELDS], field_list[FIELDS];
     unsigned fields;
     unsigned view; /* arguments: the view they are for */
 } Input;
 
-/* A record: fields in order, each a number, a bool, an i64 or text with its default. */
+/* A record: fields in order, each a number, a bool, an i64 or text with its
+ * default. Declared in the app (module 0) or in a library; a library's goes
+ * into the app's module once a list or a rows field of the app holds it
+ * (used: where first). */
 typedef struct {
     char name[NAME];
-    int line, column;
+    int line, column, module;
+    bool used;
+    int used_line, used_column;
     char field_names[FIELDS_PER_RECORD][NAME];
     Type field_kinds[FIELDS_PER_RECORD]; /* NUM, BOOL, I64 or TEXT */
     double field_number[FIELDS_PER_RECORD];
@@ -146,6 +152,7 @@ typedef struct {
     int state_types[STATES], state_line[STATES], state_column[STATES];
     bool state_stays[STATES]; /* a mark: a cursor that stays before text inserted at it */
     int state_rows[STATES];   /* a list of a message's rows: its input + 1, or 0 */
+    int state_library[STATES]; /* a list's record's library (LIBRARY.NAME), or 0: the app's */
     /* A keyed list: the field named after by, and once resolved, that field + 1. */
     char state_key[STATES][NAME];
     int state_key_line[STATES], state_key_column[STATES], list_key[STATES];
@@ -155,8 +162,10 @@ typedef struct {
     unsigned states;
     char collection_names[COLLECTIONS][NAME];
     unsigned collections;
-    Record records[RECORDS];
+    Record records[RECORDS]; /* the module's: the app's, then the libraries' it uses (pull_records) */
     unsigned record_count, record_fields;
+    Record library_records[LIBRARY_RECORDS]; /* the libraries', in the order they were read */
+    unsigned library_record_count;
     Input inputs[INPUTS];
     unsigned input_count, field_count;
     /* Views in order; a table (no value) is followed by its columns. */
@@ -444,6 +453,9 @@ static Expr *node(Compiler *c, ExprKind kind, int line, int column) {
 }
 
 static Expr *expression(Compiler *c, int minimum, bool multiline);
+static Token held_record(Compiler *c, char name[NAME], int *library);
+static int used_library(const Compiler *c, int module, const char *name);
+static int library_record(const Compiler *c, int library, const char *name);
 
 /* name[key]: collections are indexed only by the message key. */
 static void index_key(Compiler *c) {
@@ -858,11 +870,21 @@ static bool spread(Compiler *c, Expr ***tail) {
     return true;
 }
 
-static Expr *record_value(Compiler *c) {
+/* NAME { ... }, or LIBRARY.NAME { ... } when library is given (its name in
+ * member): a record value, its fields as written. */
+static Expr *record_value(Compiler *c, const Token *library) {
     Token name = take(c);
     take(c); /* { */
     Expr *r = node(c, E_RECORD, name.line, name.column), **tail = &r->args[0];
     memcpy(r->name, name.text, NAME);
+    if (library) {
+        int used = used_library(c, c->module, library->text);
+        if (used < 0)
+            fail_at(c, library->line, library->column, "unknown library '%s'; write use %s first", library->text, library->text);
+        if (library_record(c, used, name.text) < 0)
+            fail_at(c, name.line, name.column, "library '%s' has no record '%s'", library->text, name.text);
+        memcpy(r->member, library->text, NAME);
+    }
     separators(c);
     while (!is(c, "}")) {
         if (spread(c, &tail)) break;
@@ -906,11 +928,25 @@ static Expr *send_fields(Compiler *c) {
     return r;
 }
 
-/* A value inserted into a text or a list: an expression or a record. */
+/* A value inserted into a text or a list: an expression or a record
+ * (NAME { ... }, or LIBRARY.NAME { ... }: looked at two tokens ahead, the
+ * scanner then put back as it was). */
 static Expr *inserted(Compiler *c) {
     newlines(c);
     if (c->token.kind == T_NAME && lookahead(c)->kind == T_PUNCT && !strcmp(lookahead(c)->text, "{"))
-        return record_value(c);
+        return record_value(c, NULL);
+    if (c->token.kind == T_NAME && lookahead(c)->kind == T_PUNCT && !strcmp(lookahead(c)->text, ".")) {
+        size_t at = c->at;
+        int line = c->line, column = c->column;
+        Token token = c->token, ahead = c->ahead;
+        bool has_ahead = c->has_ahead;
+        Token library = take(c);
+        take(c); /* . */
+        if (c->token.kind == T_NAME && lookahead(c)->kind == T_PUNCT && !strcmp(lookahead(c)->text, "{"))
+            return record_value(c, &library);
+        c->at = at, c->line = line, c->column = column;
+        c->token = token, c->ahead = ahead, c->has_ahead = has_ahead;
+    }
     return expression(c, 0, true);
 }
 
@@ -1105,6 +1141,28 @@ static int state_index(const Compiler *c, const char *name) {
     return -1;
 }
 
+/* A library's record, by name: its place among the libraries' records, or -1. */
+static int library_record(const Compiler *c, int library, const char *name) {
+    for (unsigned i = 0; i < c->library_record_count; ++i)
+        if (c->library_records[i].module == library && !strcmp(c->library_records[i].name, name)) return (int)i;
+    return -1;
+}
+
+/* A record as the file of module `from` writes it: its name, or LIBRARY.NAME for a library's. */
+static const char *record_shown(const Compiler *c, int from, const Record *r) {
+    static char shown[2 * NAME + 1];
+    if (r->module == from) return r->name;
+    snprintf(shown, sizeof(shown), "%s.%s", c->modules[r->module].name, r->name);
+    return shown;
+}
+
+/* The module's record of a library (0: the app) by name, or -1. */
+static int module_record(const Compiler *c, int library, const char *name) {
+    for (unsigned i = 0; i < c->record_count; ++i)
+        if (c->records[i].module == library && !strcmp(c->records[i].name, name)) return (int)i;
+    return -1;
+}
+
 static int record_index(const Compiler *c, const char *name) {
     for (unsigned i = 0; i < c->record_count; ++i) if (!strcmp(c->records[i].name, name)) return (int)i;
     return -1;
@@ -1127,7 +1185,7 @@ static const char *declared_kind(const Compiler *c, const char *name) {
     static const char *const states[] = {"a state", "a text state", "a cursor", "a list", "a list index", "a state", "a state"};
     if (fn_index(c, c->module, name) >= 0) return "a fn";
     if (used_library(c, c->module, name) >= 0) return "a library";
-    if (c->module) return NULL; /* a library has only fns and uses */
+    if (c->module) return library_record(c, c->module, name) >= 0 ? "a record" : NULL; /* fns, records and uses */
     int state = state_index(c, name);
     if (state >= 0) return states[c->state_types[state]];
     if (record_index(c, name) >= 0) return "a record";
@@ -1188,6 +1246,7 @@ static void message_like(Compiler *c, Input *in) {
         if (c->field_count == FIELDS) fail_at(c, other.line, other.column, "at most %d message fields are allowed", FIELDS);
         memcpy(in->field_names[in->fields], from->field_names[f], NAME);
         memcpy(in->field_record[in->fields], from->field_record[f], NAME);
+        in->field_library[in->fields] = from->field_library[f];
         in->field_line[in->fields] = from->field_line[f];
         in->field_column[in->fields] = from->field_column[f];
         in->field_types[in->fields++] = from->field_types[f];
@@ -1226,8 +1285,7 @@ static void message_fields(Compiler *c, Input *in, const char *group) {
             /* rows: list of a record, a JSON array of objects; the handler walks them as a list */
             if (in->kind == KIND_OUTPUT) fail_at(c, type.line, type.column, "an output sends no rows: send one message a row");
             expect_word(c, "of");
-            Token record = expect_name(c, "a record");
-            memcpy(in->field_record[in->fields], record.text, NAME);
+            Token record = held_record(c, in->field_record[in->fields], &in->field_library[in->fields]);
             in->field_line[in->fields] = record.line;
             in->field_column[in->fields] = record.column;
             field_type = FIELD_ROWS;
@@ -1276,12 +1334,16 @@ static Expr *plain_string(Compiler *c, const char *what) {
 static void record_declaration(Compiler *c) {
     Token name = expect_name(c, "record name");
     declare(c, &name);
-    if (c->record_count == RECORDS) fail_at(c, name.line, name.column, "at most 8 records are allowed");
-    Record *r = &c->records[c->record_count];
+    bool library = c->module != 0; /* a library's: into the module once the app holds it in a list */
+    if (!library && c->record_count == RECORDS) fail_at(c, name.line, name.column, "at most 16 records are allowed");
+    if (library && c->library_record_count == LIBRARY_RECORDS)
+        fail_at(c, name.line, name.column, "the libraries declare at most %d records", LIBRARY_RECORDS);
+    Record *r = library ? &c->library_records[c->library_record_count] : &c->records[c->record_count];
     memset(r, 0, sizeof(*r));
     memcpy(r->name, name.text, NAME);
     r->line = name.line;
     r->column = name.column;
+    r->module = c->module;
     expect(c, "{", "'{' on the line of the record name");
     separators(c);
     while (!is(c, "}")) {
@@ -1292,10 +1354,11 @@ static void record_declaration(Compiler *c) {
         for (unsigned i = 0; i < r->fields; ++i)
             if (!strcmp(r->field_names[i], field.text)) fail_at(c, field.line, field.column, "duplicate field '%s'", field.text);
         if (r->fields == FIELDS_PER_RECORD) fail_at(c, field.line, field.column, "a record has at most 16 fields");
-        if (c->record_fields == RECORD_FIELDS) fail_at(c, field.line, field.column, "at most 64 record fields are allowed");
+        if (!library && c->record_fields == RECORD_FIELDS)
+            fail_at(c, field.line, field.column, "at most 128 record fields are allowed");
         unsigned index = r->fields++;
         memcpy(r->field_names[index], field.text, NAME);
-        ++c->record_fields;
+        c->record_fields += !library;
         if (is(c, ":")) {
             take(c);
             Token type = expect_name(c, "text or i64");
@@ -1320,7 +1383,29 @@ static void record_declaration(Compiler *c) {
     }
     take(c);
     if (!r->fields) fail_at(c, name.line, name.column, "a record needs at least one field");
-    ++c->record_count;
+    if (library) ++c->library_record_count;
+    else ++c->record_count;
+}
+
+/* The record a list or a message's rows field holds: NAME, the app's, or
+ * LIBRARY.NAME, a library's the app uses, which goes into the module.
+ * Its name into name, its library (0: the app's) into library. */
+static Token held_record(Compiler *c, char name[NAME], int *library) {
+    Token first = expect_name(c, "a record");
+    *library = 0;
+    memcpy(name, first.text, NAME);
+    if (!is(c, ".")) return first;
+    take(c);
+    Token second = expect_name(c, "the library's record");
+    int used = used_library(c, c->module, first.text);
+    if (used < 0) fail_at(c, first.line, first.column, "unknown library '%s'; write use %s first", first.text, first.text);
+    int found = library_record(c, used, second.text);
+    if (found < 0) fail_at(c, second.line, second.column, "library '%s' has no record '%s'", first.text, second.text);
+    Record *r = &c->library_records[found];
+    if (!r->used) r->used = true, r->used_line = second.line, r->used_column = second.column;
+    *library = used;
+    memcpy(name, second.text, NAME);
+    return second;
 }
 
 static void state_declaration(Compiler *c) {
@@ -1365,8 +1450,8 @@ static void state_declaration(Compiler *c) {
         } else if (!strcmp(type.text, "list") || !strcmp(type.text, "index")) {
             c->state_types[index] = type.text[0] == 'l' ? STATE_LIST : STATE_INDEX;
             expect_word(c, "of");
-            Token target = expect_name(c, type.text[0] == 'l' ? "a record" : "a list state");
-            memcpy(c->state_target[index], target.text, NAME);
+            if (type.text[0] == 'l') held_record(c, c->state_target[index], &c->state_library[index]);
+            else memcpy(c->state_target[index], expect_name(c, "a list state").text, NAME);
             if (type.text[0] == 'l' && word(c, "by")) { /* keyed: items in key order, each key once */
                 take(c);
                 Token key = expect_name(c, "a field of the record");
@@ -1516,12 +1601,13 @@ static void use_declaration(Compiler *c) {
     c->modules[c->module].uses[library] = true;
 }
 
-/* A library declares fns and uses only: it has no state and sees none. */
+/* A library declares fns, records and uses only: it has no state and sees none. */
 static void library_declaration(Compiler *c) {
-    Token kind = expect_name(c, "fn or use");
+    Token kind = expect_name(c, "fn, record or use");
     if (!strcmp(kind.text, "fn")) fn_declaration(c);
+    else if (!strcmp(kind.text, "record")) record_declaration(c);
     else if (!strcmp(kind.text, "use")) use_declaration(c);
-    else fail_at(c, kind.line, kind.column, "a library declares only fn and use");
+    else fail_at(c, kind.line, kind.column, "a library declares only fn, record and use");
     end(c);
 }
 
@@ -1760,12 +1846,12 @@ static int list_state(Compiler *c, const char *name, int line, int column, const
 }
 
 static const Record *record_of(const Compiler *c, int list) {
-    return &c->records[record_index(c, c->state_target[list])];
+    return &c->records[module_record(c, c->state_library[list], c->state_target[list])];
 }
 
 static unsigned record_field(Compiler *c, const Record *r, const char *field, int line, int column) {
     for (unsigned i = 0; i < r->fields; ++i) if (!strcmp(r->field_names[i], field)) return i;
-    fail_at(c, line, column, "record '%s' has no field '%s'", r->name, field);
+    fail_at(c, line, column, "record '%s' has no field '%s'", record_shown(c, c->module, r), field);
 }
 
 /* A record field's kind: text, a bool or a number. */
@@ -2516,10 +2602,16 @@ static Expr *spread_field(Compiler *c, const Expr *spread, const char *name) {
  * given): those written, and the rest its spread's source has by name. */
 static void record_values(Compiler *c, const Expr *e, int list, const Expr **values) {
     const Record *r = record_of(c, list);
+    char shown[2 * NAME + 1];
+    snprintf(shown, sizeof(shown), "%s", record_shown(c, c->module, r));
     if (e->kind != E_RECORD)
         fail_at(c, e->line, e->column, "'%s' holds %s records, as in %s.append(%s { %s: ... })", c->state_names[list],
-                r->name, c->state_names[list], r->name, r->field_names[0]);
-    if (strcmp(e->name, r->name)) fail_at(c, e->line, e->column, "'%s' holds %s, not %s", c->state_names[list], r->name, e->name);
+                shown, c->state_names[list], shown, r->field_names[0]);
+    /* The record it names, as the file it is written in names it: its own, or a library's it uses. */
+    int from = e->member[0] ? used_library(c, c->module, e->member) : c->module;
+    if (from != r->module || strcmp(e->name, r->name))
+        fail_at(c, e->line, e->column, "'%s' holds %s, not %s%s%s", c->state_names[list], shown, e->member,
+                e->member[0] ? "." : "", e->name);
     for (unsigned k = 0; k < r->fields; ++k) values[k] = NULL;
     for (const Expr *f = e->args[0]; f; f = f->next) {
         if (!f->member[0]) continue; /* the spread, below */
@@ -2874,6 +2966,7 @@ static void rows_lists(Compiler *c) {
             unsigned index = c->states++;
             memcpy(c->state_names[index], name, (size_t)length + 1);
             memcpy(c->state_target[index], in->field_record[f], NAME);
+            c->state_library[index] = in->field_library[f];
             c->state_types[index] = STATE_LIST;
             c->state_line[index] = in->field_line[f];
             c->state_column[index] = in->field_column[f];
@@ -2883,10 +2976,45 @@ static void rows_lists(Compiler *c) {
     }
 }
 
+/* The libraries' records the app's lists and rows fields hold go into the
+ * module after the app's own: library by library as they were read, each
+ * in its declaration order (so records moved from the top of an app into
+ * a library it uses first leave the module as it was). In a module the
+ * records share one namespace with the states, inputs, views and
+ * collections (Pure's), however they were written. */
+static void pull_records(Compiler *c) {
+    for (unsigned i = 0; i < c->library_record_count; ++i) {
+        const Record *r = &c->library_records[i];
+        if (!r->used) continue;
+        const char *library = c->modules[r->module].name;
+        int other = record_index(c, r->name), input = input_index(c, r->name);
+        const char *taken = other >= 0 ? NULL : state_index(c, r->name) >= 0 ? "a state" :
+                            input >= 0 ? (c->inputs[input].kind == KIND_OUTPUT ? "an output" : "an input") : NULL;
+        for (unsigned v = 0; !taken && other < 0 && v < c->views; ++v)
+            if (!c->view_table[v] && !strcmp(c->view_names[v], r->name)) taken = "a view";
+        for (unsigned k = 0; !taken && other < 0 && k < c->collections; ++k)
+            if (!strcmp(c->collection_names[k], r->name)) taken = "a collection";
+        if (other >= 0)
+            fail_at(c, r->used_line, r->used_column, "%s.%s is '%s' in the module, as %s is: two records cannot share a name",
+                    library, r->name, r->name, record_shown(c, 0, &c->records[other]));
+        if (taken)
+            fail_at(c, r->used_line, r->used_column, "%s.%s is '%s' in the module, and '%s' is %s here", library, r->name,
+                    r->name, r->name, taken);
+        if (c->record_count == RECORDS)
+            fail_at(c, r->used_line, r->used_column, "at most 16 records are allowed (%s.%s is one more)", library, r->name);
+        if (c->record_fields + r->fields > RECORD_FIELDS)
+            fail_at(c, r->used_line, r->used_column, "at most 128 record fields are allowed (%s.%s has %u more)", library,
+                    r->name, r->fields);
+        c->records[c->record_count++] = *r;
+        c->record_fields += r->fields;
+    }
+}
+
 static void generate(Compiler *c, unsigned char **module, size_t *size) {
     uint32_t events[HANDLERS], state_ref[STATES] = {0};
     int handler_input[HANDLERS];
     rows_lists(c);
+    pull_records(c);
     for (unsigned i = 0; i < c->states; ++i) {
         if (c->state_types[i] == STATE_TEXT) {
             Expr empty = {.kind = E_TEXT, .line = c->state_line[i], .column = c->state_column[i]};
@@ -2899,7 +3027,11 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                         "an index points into a list state; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)target;
         } else if (c->state_types[i] == STATE_LIST) {
-            int record = record_index(c, c->state_target[i]);
+            int record = module_record(c, c->state_library[i], c->state_target[i]);
+            for (unsigned l = 1; record < 0 && l < c->module_count; ++l) /* a library's, written without its name */
+                if (c->modules[0].uses[l] && library_record(c, (int)l, c->state_target[i]) >= 0)
+                    fail_at(c, c->state_line[i], c->state_column[i], "'%s' is library %s's record: write %s.%s",
+                            c->state_target[i], c->modules[l].name, c->modules[l].name, c->state_target[i]);
             if (record < 0)
                 fail_at(c, c->state_line[i], c->state_column[i], "a list holds a record; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)record;
