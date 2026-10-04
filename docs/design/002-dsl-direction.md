@@ -387,6 +387,46 @@ on route {
 세 탐색이 Python 모델과 같다(600번). 뉴턴의 제곱근 200개가 같은 순서로 계산한 Python의 binary64와 비트까지, 단계 수까지 같다. 배낭
 문제 100개가 동적 계획법 모델과 같다. 이벤트가 끝난 뒤 이벤트의 리스트는 모두 비어 있다.
 
+### 계산하는 보기 (구현)
+
+Pure [018](/srv/git/pure.git)의 3단계다. 핸들러의 계산은 소유자 스레드에서 돌아 그동안 다른 이벤트를 받지 못한다. 상태를 바꾸지 않는
+계산(경로 찾기, 통계)은 보기가 맞는 자리다: 보기는 스냅숏을 읽는 연결 스레드에서 돈다.
+
+```text
+view distance(start: u32, goal: u32) {
+  let seen: list of Seen by node
+  let queue: list of Step
+  queue.append(Step { node: start })
+  seen.add(Seen { node: start })
+  for i in 0 .. nodes.count {
+    if i >= queue.count { break }
+    let q = queue.first + i
+    for e in edges[q.node * 1048576 .. q.node * 1048576 + 1048576] {
+      if !seen.has(e.to) {
+        seen.add(Seen { node: e.to, depth: seen[q.node].depth + 1 })
+        queue.append(Step { node: e.to })
+      }
+    }
+  }
+  return if seen.has(goal) { seen[goal].depth } else { -1 }
+}
+```
+
+- **`view 이름(인자…) { 문장… return 값 }`** 은 핸들러처럼 문장을 갖는 보기다. `let`(값과 리스트), `for`, `break`, `if`를 쓰고, 마지막
+  줄의 `return`이 보기의 값이다(수, bool, i64, text). `return`은 본문의 마지막 줄에만 있다.
+- **본문은 상태를 바꾸지 않는다.** 바꾸는 것은 그 `let`과 자기 리스트(`let x: list of R`)뿐이다. `send`, `reply`, `require`, `now`, `dt`는
+  없다. 평가마다 `let`은 새로 시작하고 리스트는 비어서 시작한다.
+- HTTP로는 지금의 보기와 같다(`GET /views/distance?start=1&goal=5`). 읽는 연결마다 자기 리스트를 가지므로 여러 연결이 동시에 다른 인자로
+  물어도 된다. 이벤트처럼 실행량 예산과 메모리 예산이 있다(넘으면 422 `work`, 503 `memory`).
+- 표 보기의 열과 필터는 지금처럼 식 하나다.
+- `return`은 예약어다.
+
+예제: `examples/routes.aup`의 `distance`(인자를 받는 BFS)와 `reach`(첫 노드에서 닿는 노드 수와 가장 먼 거리).
+
+검증(`tests/check.py`의 `computing`과 진단 8건, Pure의 `test-module`의 `view_bodies`와 `server_view_bodies`): `reach`가 무작위 그래프
+20개의 모든 단계에서 모델과 같다. `pure-serve`에서 64연결이 동시에 물은 `distance` 1,280개가 모두 모델과 같다. 실행량과 메모리 예산을
+넘는 본문은 `work`와 `memory`로 답한다.
+
 ### 시간
 
 ```text

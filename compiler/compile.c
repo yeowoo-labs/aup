@@ -80,7 +80,7 @@ typedef struct Expr {
 } Expr;
 
 typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
-               S_LET, S_COUNT, S_BREAK } StmtKind;
+               S_LET, S_COUNT, S_BREAK, S_RETURN } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
@@ -180,6 +180,7 @@ typedef struct {
     /* Views in order; a table (no value) is followed by its columns. */
     char view_names[VIEWS][NAME], view_row[VIEWS][NAME], view_list[VIEWS][NAME];
     Expr *view_value[VIEWS];
+    Stmt *view_body[VIEWS];                           /* a view that computes: its statements, return last (view_value) */
     Expr *view_filter[VIEWS];                         /* a table's where condition, or NULL */
     unsigned char view_byte[VIEWS];                   /* a filtered table's list + 1 */
     int view_table[VIEWS];                            /* a column's table + 1, or 0 */
@@ -207,6 +208,9 @@ typedef struct {
     struct { char name[NAME]; int list, item; Scope *scope; } loops[NESTING];
     unsigned loop_count;
     unsigned nested;      /* blocks within the handler's own (an if's, a for's) */
+    bool handling;        /* statements of a handler (else of a view's body: they change no state) */
+    Kind returned;        /* the value a view's body returned, once it has */
+    bool has_returned;
     /* Libraries: module 0 is the main source; each module lists the libraries it uses. */
     struct { char name[NAME], path[AUP_PATH]; bool uses[MODULES], parsing; } modules[MODULES];
     unsigned module_count;
@@ -232,7 +236,7 @@ static const char *const reserved[] = {"state", "input", "view", "on", "if", "el
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
                                        "floor", "output", "send", "for", "let", "true", "false",
-                                       "transient", "break"};
+                                       "transient", "break", "return"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -1026,6 +1030,11 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         s->kind = S_BREAK;
         return s;
     }
+    if (!strcmp(token.text, "return")) { /* a view's body's last line: its value */
+        s->kind = S_RETURN;
+        s->value = expression(c, 0, false);
+        return s;
+    }
     if (!strcmp(token.text, "for")) {
         /* for item in list [where condition] { ... }: the block runs once for every item the list has */
         s->kind = S_FOR;
@@ -1807,10 +1816,19 @@ static void declaration(Compiler *c) {
         if (c->views == VIEWS) fail_at(c, name.line, name.column, "at most 64 views are allowed");
         unsigned index = c->views++;
         if (is(c, "(")) view_arguments(c, index, &name);
-        expect(c, "=", "'='");
         memcpy(c->view_names[index], name.text, NAME);
-        if (!word(c, "each")) c->view_value[index] = expression(c, 0, false);
-        else table_declaration(c, index);
+        if (is(c, "{")) { /* view name(arguments) { statements ... return value }: a view that computes */
+            Stmt *body = block(c, 0), *last = body;
+            while (last && last->next) last = last->next;
+            if (!last || last->kind != S_RETURN)
+                fail_at(c, name.line, name.column, "a view's body ends with return and its value, as in return total");
+            c->view_body[index] = body;
+            c->view_value[index] = last->value;
+        } else {
+            expect(c, "=", "'='");
+            if (!word(c, "each")) c->view_value[index] = expression(c, 0, false);
+            else table_declaration(c, index);
+        }
     } else if (!strcmp(kind.text, "on")) {
         if (c->handler_count == HANDLERS) fail_at(c, kind.line, kind.column, "at most 64 handlers are allowed");
         Token event = expect_name(c, "frame or an input");
@@ -2635,7 +2653,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
 
 /* Bytes, or text sent as its UTF-8 bytes. */
 static void bytes_value(Compiler *c, const Expr *e, int height, const char *what) {
-    Kind kind = value(c, e, true, height);
+    Kind kind = value(c, e, c->handling, height);
     if (kind.type == TEXT) emit(c, e->line, e->column, BYTES_FROM, 0, 0);
     else if (kind.type != BYTES) fail_at(c, e->line, e->column, "%s takes bytes or text, not %s", what, type_name(kind.type));
 }
@@ -2737,7 +2755,7 @@ static void record_fields(Compiler *c, const Expr *e, int list, int height) {
     record_values(c, e, list, values);
     for (unsigned k = 0; k < r->fields; ++k) {
         int at = height + (int)k;
-        if (values[k]) expect_kind(c, values[k], wanted(c, values[k], true, at, field_kind(r, k)), field_kind(r, k));
+        if (values[k]) expect_kind(c, values[k], wanted(c, values[k], c->handling, at, field_kind(r, k)), field_kind(r, k));
         else if (at + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
         else if (r->field_kinds[k] == TEXT) emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
         else if (r->field_kinds[k] == I64) emit_integer(c, e->line, e->column, r->field_integer[k]);
@@ -2774,6 +2792,12 @@ static void send_values(Compiler *c, const Input *out, const Expr *group, const 
     }
 }
 
+/* A view's body changes only its lets and its own lists (a let's list): its states are a snapshot's. */
+static void view_changes(Compiler *c, const Stmt *s, int list, const char *name) {
+    if (!c->handling && (list < 0 || !c->state_event[list]))
+        fail_at(c, s->line, s->column, "a view's body changes only its lets and its own lists, not '%s'", name);
+}
+
 static void statements(Compiler *c, const Stmt *s) {
     unsigned scope = c->local_count; /* a block's lets end with it */
     for (; s; s = s->next) {
@@ -2800,7 +2824,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 break;
             }
             if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
-            Kind held = value(c, s->value, true, 0);
+            Kind held = value(c, s->value, c->handling, 0);
             if (held.type != NUM && held.type != BOOL && held.type != I64 && held.type != INDEX)
                 fail_at(c, s->value->line, s->value->column, "a let holds a number, a bool, an i64 or an index, not %s",
                         type_name(held.type));
@@ -2818,7 +2842,7 @@ static void statements(Compiler *c, const Stmt *s) {
             if (local >= 0 && c->locals[local].counter)
                 fail_at(c, s->line, s->column, "'%s' is what this for counts; it is not assigned", s->name);
             if (local >= 0) { /* a let takes a new value of its kind */
-                Kind kind = wanted(c, s->value, true, 0, c->locals[local].kind.type);
+                Kind kind = wanted(c, s->value, c->handling, 0, c->locals[local].kind.type);
                 if (kind.type != c->locals[local].kind.type || (kind.type == INDEX && kind.owner != c->locals[local].kind.owner))
                     fail_at(c, s->value->line, s->value->column, "'%s' holds %s", s->name,
                             c->locals[local].kind.type == INDEX ? "an index of its list" : type_name(c->locals[local].kind.type));
@@ -2831,29 +2855,31 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (kind) fail_at(c, s->line, s->column, "cannot assign to %s '%s'", kind, s->name);
                 fail_at(c, s->line, s->column, "unknown state '%s'", s->name);
             }
+            view_changes(c, s, -1, s->name);
             if (c->state_types[index] == STATE_I64) {
-                integer(c, s->value, true, 0);
+                integer(c, s->value, c->handling, 0);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_NUM || c->state_types[index] == STATE_BOOL) {
-                expect_kind(c, s->value, value(c, s->value, true, 0), c->state_types[index] == STATE_BOOL ? BOOL : NUM);
+                expect_kind(c, s->value, value(c, s->value, c->handling, 0), c->state_types[index] == STATE_BOOL ? BOOL : NUM);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_LIST) {
                 fail_at(c, s->line, s->column, "a list changes by append, insert, remove and %s[index].field = value", s->name);
             } else if (c->state_types[index] == STATE_INDEX) {
-                index_of(c, s->value, true, 0, cursor_owner(c, index));
+                index_of(c, s->value, c->handling, 0, cursor_owner(c, index));
                 emit(c, s->line, s->column, INDEX_STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_TEXT) {
-                expect_kind(c, s->value, value(c, s->value, true, 0), TEXT);
+                expect_kind(c, s->value, value(c, s->value, c->handling, 0), TEXT);
                 emit(c, s->line, s->column, TEXT_SET, (uint32_t)index, 0);
             } else {
                 int owner = cursor_owner(c, index);
-                cursor_of(c, s->value, true, 0, owner, c->state_names[owner]);
+                cursor_of(c, s->value, c->handling, 0, owner, c->state_names[owner]);
                 emit(c, s->line, s->column, CUR_STORE, (uint32_t)index, 0);
             }
             break;
         }
         case S_INSERT: case S_REMOVE: {
             int list = state_index(c, s->name);
+            view_changes(c, s, list >= 0 && c->state_types[list] == STATE_LIST ? list : -1, s->name);
             if (list >= 0 && c->state_types[list] == STATE_LIST) {
                 if (s->last) fail_at(c, s->last->line, s->last->column, "a list removes one item, as in %s.remove(index)", s->name);
                 if (s->kind == S_INSERT && walked(c, list))
@@ -2863,27 +2889,28 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (s->kind == S_INSERT && keyed_by(c, list))
                     fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
                             keyed_by(c, list), s->name, record_shown(c, c->module, record_of(c, list)));
-                if (s->kind == S_REMOVE) item_of(c, s->first, true, 0, list);
-                else index_of(c, s->first, true, 0, list);
+                if (s->kind == S_REMOVE) item_of(c, s->first, c->handling, 0, list);
+                else index_of(c, s->first, c->handling, 0, list);
                 if (s->kind == S_INSERT) record_fields(c, s->value, list, 1);
                 emit(c, s->line, s->column, s->kind == S_INSERT ? LIST_INSERT : LIST_REMOVE, (uint32_t)list, 0);
                 break;
             }
             int text = text_state(c, s->name, s->line, s->column);
-            cursor_of(c, s->first, true, 0, text, s->name);
+            cursor_of(c, s->first, c->handling, 0, text, s->name);
             if (s->kind == S_INSERT) {
-                expect_kind(c, s->value, value(c, s->value, true, 1), TEXT);
+                expect_kind(c, s->value, value(c, s->value, c->handling, 1), TEXT);
                 emit(c, s->line, s->column, TEXT_INSERT, (uint32_t)text, 0);
                 break;
             }
             if (!s->last) fail_at(c, s->line, s->column, "a text removes a range, as in %s.remove(first .. last)", s->name);
-            cursor_of(c, s->last, true, 1, text, s->name);
+            cursor_of(c, s->last, c->handling, 1, text, s->name);
             emit(c, s->line, s->column, TEXT_REMOVE, (uint32_t)text, 0);
             break;
         }
         case S_APPEND: case S_ADD: {
             /* A keyed list places an added item by its key (it fails if the key is there); others append. */
             int list = list_state(c, s->name, s->line, s->column, NULL);
+            view_changes(c, s, list, s->name);
             if (walked(c, list))
                 fail_at(c, s->line, s->column, "a for does not add to the list it walks; add to another list, or after the for");
             const char *key = keyed_by(c, list), *record = record_shown(c, c->module, record_of(c, list));
@@ -2900,6 +2927,7 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_SET: {
             int list = *s->name ? list_state(c, s->name, s->line, s->column, s->first) : -1;
             if (!s->member[0]) { /* tasks[at] = Task { ... }: each field set, the key the same */
+                view_changes(c, s, list, s->name);
                 const Record *r = record_of(c, list);
                 const Expr *values[FIELDS_PER_RECORD];
                 record_values(c, s->value, list, values);
@@ -2917,40 +2945,43 @@ static void statements(Compiler *c, const Stmt *s) {
                     same->args[0] = item;
                     same->args[1] = (Expr *)values[key];
                     same->count = 2;
-                    truth(c, same, true, 0, "require");
+                    truth(c, same, c->handling, 0, "require");
                     emit(c, s->line, s->column, REQUIRE, 0, 0);
                 }
                 for (unsigned k = 0; k < r->fields; ++k) {
                     if ((int)k == key) continue;
-                    item_of(c, s->first, true, 0, list);
-                    expect_kind(c, values[k], wanted(c, values[k], true, 1, field_kind(r, k)), field_kind(r, k));
+                    item_of(c, s->first, c->handling, 0, list);
+                    expect_kind(c, values[k], wanted(c, values[k], c->handling, 1, field_kind(r, k)), field_kind(r, k));
                     emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | k << 16, 0);
                 }
                 break;
             }
             if (list < 0) {
-                Kind index = value(c, s->first, true, 0);
+                Kind index = value(c, s->first, c->handling, 0);
                 expect_kind(c, s->first, index, INDEX);
                 list = index.owner;
             }
+            view_changes(c, s, list, c->state_names[list]);
             const Record *r = record_of(c, list);
             unsigned field = record_field(c, r, s->member, s->line, s->column);
             if (c->list_key[list] == (int)field + 1)
                 fail_at(c, s->line, s->column, "the key of '%s' does not change; remove the item and add it again", c->state_names[list]);
-            if (*s->name) item_of(c, s->first, true, 0, list);
-            expect_kind(c, s->value, wanted(c, s->value, true, 1, field_kind(r, field)), field_kind(r, field));
+            if (*s->name) item_of(c, s->first, c->handling, 0, list);
+            expect_kind(c, s->value, wanted(c, s->value, c->handling, 1, field_kind(r, field)), field_kind(r, field));
             emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
         }
         case S_REPLACE: {
+            view_changes(c, s, -1, s->name);
             uint32_t target = collection(c, s->name, s->line, s->column);
-            number(c, s->first, true, 0);
-            number(c, s->last, true, 1);
+            number(c, s->first, c->handling, 0);
+            number(c, s->last, c->handling, 1);
             bytes_value(c, s->value, 2, "replace");
             emit(c, s->line, s->column, REPLACE, target, 0);
             break;
         }
         case S_SEND: {
+            if (!c->handling) fail_at(c, s->line, s->column, "a view sends nothing; a handler sends");
             int output = input_index(c, s->name);
             if (output < 0 || c->inputs[output].kind != KIND_OUTPUT) {
                 const char *kind = declared_kind(c, s->name);
@@ -2968,7 +2999,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (!given[f]) fail_at(c, s->line, s->column, "send %s needs '%s'", s->name, out->field_names[f]);
                 int type = out->field_types[f];
                 if (type == FIELD_BYTES) bytes_value(c, given[f], (int)f, "a bytes field");
-                else expect_kind(c, given[f], wanted(c, given[f], true, (int)f, message_kind(type)), message_kind(type));
+                else expect_kind(c, given[f], wanted(c, given[f], c->handling, (int)f, message_kind(type)), message_kind(type));
             }
             emit(c, s->line, s->column, SEND, (uint32_t)output, 0);
             break;
@@ -2981,7 +3012,8 @@ static void statements(Compiler *c, const Stmt *s) {
             emit(c, s->line, s->column, REPLY, 0, 0);
             break;
         case S_REQUIRE:
-            truth(c, s->value, true, 0, "require");
+            if (!c->handling) fail_at(c, s->line, s->column, "a view requires nothing; its value says what it found");
+            truth(c, s->value, c->handling, 0, "require");
             emit(c, s->line, s->column, REQUIRE, 0, 0);
             break;
         case S_FOR: {
@@ -2997,8 +3029,8 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (key != NUM && key != I64)
                     fail_at(c, s->first->line, s->first->column, "'%s' is not keyed by a number or an i64: a slice takes one",
                             s->member);
-                expect_kind(c, s->low, wanted(c, s->low, true, 0, key), key);
-                expect_kind(c, s->high, wanted(c, s->high, true, 1, key), key);
+                expect_kind(c, s->low, wanted(c, s->low, c->handling, 0, key), key);
+                expect_kind(c, s->high, wanted(c, s->high, c->handling, 1, key), key);
             }
             unsigned at = c->code_count, jump = 0, loop = c->loop_count++;
             emit(c, s->line, s->column, EACH, 0, 0);
@@ -3007,7 +3039,7 @@ static void statements(Compiler *c, const Stmt *s) {
             c->loops[loop].item = -1;
             c->loops[loop].scope = c->scope;
             if (s->value) {
-                truth(c, s->value, true, 0, "where");
+                truth(c, s->value, c->handling, 0, "where");
                 jump = c->code_count;
                 emit(c, s->line, s->column, JZ, 0, 0);
             }
@@ -3034,7 +3066,7 @@ static void statements(Compiler *c, const Stmt *s) {
             break;
         }
         case S_IF: {
-            truth(c, s->value, true, 0, "if");
+            truth(c, s->value, c->handling, 0, "if");
             unsigned jump = c->code_count;
             emit(c, s->line, s->column, JZ, 0, 0);
             ++c->nested;
@@ -3059,10 +3091,10 @@ static void statements(Compiler *c, const Stmt *s) {
                 fail_at(c, s->line, s->column, "'%s' is already a let or a for's name here", s->name);
             if (c->local_slots == LOCALS || c->local_count == LOCALS)
                 fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
-            bool integer = probe(c, s->low, true, 0) == I64 || probe(c, s->high, true, 0) == I64;
+            bool integer = probe(c, s->low, c->handling, 0) == I64 || probe(c, s->high, c->handling, 0) == I64;
             Type type = integer ? I64 : NUM;
-            expect_kind(c, s->low, wanted(c, s->low, true, 0, type), type);
-            expect_kind(c, s->high, wanted(c, s->high, true, 1, type), type);
+            expect_kind(c, s->low, wanted(c, s->low, c->handling, 0, type), type);
+            expect_kind(c, s->high, wanted(c, s->high, c->handling, 1, type), type);
             unsigned scope = c->local_count, local = c->local_count++, loop = c->loop_count++, at = c->code_count;
             memcpy(c->locals[local].name, s->name, NAME);
             c->locals[local].slot = c->local_slots++;
@@ -3085,6 +3117,12 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_BREAK:
             if (!c->loop_count) fail_at(c, s->line, s->column, "break ends a for; this one is outside any");
             emit(c, s->line, s->column, BREAK, 0, 0);
+            break;
+        case S_RETURN: /* a view's body's value, its last line */
+            if (c->handling) fail_at(c, s->line, s->column, "return gives a view's body its value; a handler returns nothing");
+            if (s->next || c->nested) fail_at(c, s->line, s->column, "return is the last line of a view's body");
+            c->returned = value(c, s->value, false, 0);
+            c->has_returned = true;
             break;
         }
     }
@@ -3133,8 +3171,8 @@ static uint32_t intern(unsigned char *strings, size_t *used, const char *text) {
  * blocks, which hold one record keyed one way; no two handlers of one event
  * have one, so each begins empty. */
 static void event_lists(Compiler *c) {
-    for (unsigned h = 0; h < c->handler_count; ++h)
-        for (const Stmt *s = c->handlers[h].body; s; s = s->next) {
+    for (unsigned h = 0; h < c->handler_count + c->views; ++h) /* the handlers', then the views' bodies' */
+        for (const Stmt *s = h < c->handler_count ? c->handlers[h].body : c->view_body[h - c->handler_count]; s; s = s->next) {
             if (s->kind != S_LET || !s->listed) continue;
             char path[2 * NAME];
             snprintf(path, sizeof(path), "let.%s", s->name);
@@ -3148,7 +3186,7 @@ static void event_lists(Compiler *c) {
                     strcmp(c->state_key[found], s->key))
                     fail_at(c, s->line, s->column, "'%s' is a let's list of another record or key in another handler; one name "
                             "holds one kind of list", s->name);
-                for (unsigned k = 0; k < h; ++k) {
+                for (unsigned k = 0; h < c->handler_count && k < h; ++k) {
                     if (strcmp(c->handlers[k].input, c->handlers[h].input) || c->handlers[k].edge != c->handlers[h].edge) continue;
                     for (const Stmt *t = c->handlers[k].body; t; t = t->next)
                         if (t->kind == S_LET && t->listed && !strcmp(t->name, s->name))
@@ -3337,7 +3375,13 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         c->row = c->view_table[i] - 1;
         c->arguments = c->view_arguments[c->row >= 0 ? (unsigned)c->row : i] - 1;
         c->view_code[i][0] = c->code_count;
-        Kind kind = value(c, c->view_value[i], false, 0);
+        Kind kind;
+        if (c->view_body[i]) { /* statements as a handler's, changing only its lets and lists, and the value returned */
+            c->local_count = c->local_slots = c->loop_count = c->nested = 0;
+            c->handling = c->has_returned = false;
+            statements(c, c->view_body[i]);
+            kind = c->returned;
+        } else kind = value(c, c->view_value[i], false, 0);
         if (kind.type != NUM && kind.type != BOOL && kind.type != I64 && kind.type != TEXT)
             fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a %s is a number, a bool, an i64 or text, not %s",
                     c->row >= 0 ? "column" : "view", type_name(kind.type));
@@ -3347,10 +3391,11 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     c->row = -1;
     c->arguments = -1;
     c->fold_list = -1;
+    c->handling = true;
     for (unsigned i = 0; i < c->handler_count; ++i) {
         int input = handler_input[i];
         c->message = input >= 0 && c->inputs[input].kind != KIND_KEY ? input : -1;
-        c->local_count = c->local_slots = 0;
+        c->local_count = c->local_slots = c->loop_count = c->nested = 0;
         c->handler_code[i][0] = c->code_count;
         statements(c, c->handlers[i].body);
         c->handler_code[i][1] = c->code_count - c->handler_code[i][0];

@@ -317,6 +317,16 @@ DIAGNOSTICS = [
     (LETS + 'on k.down {\n  for i in t .. 3 {\n  }\n}\n', '10:12', 'expected a number'),
     ('state break = 0\n', '1:7', "'break' is reserved"),
     (LETS + 'on k.down {\n  let q: list of T\n  for i in 0 .. 3 {\n    let q = 1\n  }\n}\n', '12:9', "'q' is already a let here"),
+    # A view that computes (Pure 018's stage 3) changes only its lets and its own lists, and returns its value last.
+    (LETS + 'view v {\n  n = 1\n  return n\n}\n', '10:3', "a view's body changes only its lets and its own lists, not 'n'"),
+    (LETS + 'view v {\n  xs.append(T { a: 1 })\n  return 0\n}\n', '10:3',
+     "a view's body changes only its lets and its own lists, not 'xs'"),
+    (LETS + 'view v {\n  let q = 1\n}\n', '9:6', "a view's body ends with return and its value"),
+    (LETS + 'view v {\n  if n > 0 {\n    return 1\n  }\n  return 0\n}\n', '11:5', "return is the last line of a view's body"),
+    (LETS + 'on k.down {\n  return 1\n}\n', '10:3', "return gives a view's body its value; a handler returns nothing"),
+    (LETS + 'view v {\n  require n > 0\n  return n\n}\n', '10:3', "a view requires nothing; its value says what it found"),
+    (LETS + 'view v {\n  let x = now\n  return x\n}\n', '10:11', 'now is only available in handlers'),
+    ('state return = 0\n', '1:7', "'return' is reserved"),
     (LETS + 'view v = x\non k.down {\n  let x = 1\n}\n', '9:10', "unknown state 'x'"),
     (LETS + 'on k.down {\n  let let = 1\n}\n', '10:7', "'let' is reserved"),
     # A slice takes a list keyed by a number.
@@ -1176,6 +1186,17 @@ def computing(aup, pure_run, work, graphs=20):
                         heapq.heappush(pending, (best[t], t))
             assert path['states']['shortest'] == best.get(b, -1), (seed, a, b, path['states']['shortest'], best.get(b, -1))
             searched += 3
+        # The view that computes (Pure 018's stage 3): from the first node, evaluated on the app after each search.
+        first = min(v for edge in edges for v in edge)
+        depth, frontier = {first: 0}, [first]
+        for v in frontier:
+            for t in out[v]:
+                if t not in depth:
+                    depth[t] = depth[v] + 1
+                    frontier.append(t)
+        reach = len(depth) * 1000 + max(depth.values())
+        assert all(json.loads(line)['views']['reach'] == reach for line in lines), (seed, reach)
+        assert all(json.loads(line)['views']['distance'] is None for line in lines)  # no arguments given
 
     rng = random.Random(18)
     xs = [1.0, 2.0, 4.0, 0.25, 1e-6, 1e12] + [10 ** rng.uniform(-6, 12) for _ in range(194)]

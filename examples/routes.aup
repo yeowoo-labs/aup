@@ -117,4 +117,48 @@ on path {
   shortest = if best.has(path.to) { best[path.to].depth } else { -1 }
 }
 
+# The same search as a view (Pure 018's stage 3): it reads a snapshot, so
+# it keeps no event from the owner, and readers search at once.
+view distance(start: u32, goal: u32) {
+  let seen: list of Seen by node
+  let queue: list of Step
+  queue.append(Step { node: start })
+  seen.add(Seen { node: start })
+  for i in 0 .. nodes.count {
+    if i >= queue.count { break }
+    let q = queue.first + i
+    for e in edges[q.node * 1048576 .. q.node * 1048576 + 1048576] {
+      if !seen.has(e.to) {
+        seen.add(Seen { node: e.to, depth: seen[q.node].depth + 1 })
+        queue.append(Step { node: e.to })
+      }
+    }
+  }
+  return if seen.has(goal) { seen[goal].depth } else { -1 }
+}
+
+# How many nodes the first node reaches (times 1000), and how far the farthest is.
+view reach {
+  let seen: list of Seen by node
+  let queue: list of Step
+  let farthest = 0
+  if nodes.count > 0 {
+    queue.append(Step { node: nodes.first.id })
+    seen.add(Seen { node: nodes.first.id })
+  }
+  for i in 0 .. nodes.count {
+    if i >= queue.count { break }
+    let q = queue.first + i
+    for e in edges[q.node * 1048576 .. q.node * 1048576 + 1048576] {
+      if !seen.has(e.to) {
+        let far = seen[q.node].depth + 1
+        seen.add(Seen { node: e.to, depth: far })
+        queue.append(Step { node: e.to })
+        farthest = max(farthest, far)
+      }
+    }
+  }
+  return seen.count * 1000 + farthest
+}
+
 view graph = "{nodes.count} nodes, {edges.count} edges"
