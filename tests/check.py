@@ -927,14 +927,17 @@ def libraries(aup, pure_run, work):
 
 
 
-def library_records(aup, pure_run, work):
+def library_records(aup, pure_run, pure, work):
     """A library declares records (docs/design/002, Pure's review 005): an
     app writes them LIBRARY.NAME, and they are NAME in its module, so the
     task list with its record moved into a library builds the same module,
     byte for byte. Only the records the app's lists and rows hold go into
     its module. A second module using the same library (a migration) reads
-    and changes what the app stored, and the app reads it after. Names are
-    one namespace in a module, however they were written."""
+    and changes what the app stored, and the app reads it after; a message's
+    rows of a library's record arrive over HTTP (pure-serve). Names are one
+    namespace in a module, however they were written; hints write a
+    library's record as the app does."""
+    import http.client
     import re
     import struct
     lib = work / 'record-libs'
@@ -978,10 +981,26 @@ def library_records(aup, pure_run, work):
     run(pure_run, lib / 'migrate.pmod', '--store', store, stdin='down bump\nup bump\n')
     shown = json.loads(run(pure_run, lib / 'main.pmod', '--store', store, stdin='show\n').stdout.splitlines()[-1])
     assert shown['views'] == {'count': 3, 'points': 30}, shown
-    # A message's rows of a library's record.
+    # A message's rows of a library's record, posted as JSON to pure-serve.
     assert build('rows', 'use store\ninput load = message {\n  rows: list of store.User\n}\nstate n = 0\n'
-                         'on load {\n  n = n + load.rows.count\n}\nview loaded = n\n').returncode == 0, \
-        build('rows', '').stderr
+                         'on load {\n  n = n + sum(r.points for r in load.rows)\n}\nview loaded = n\n').returncode == 0
+    host = subprocess.Popen([str(pure / 'build' / 'pure-serve'), '--module', str(lib / 'rows.pmod'), '--store',
+                             str(lib / 'rows-store'), '--port', '0'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        port = json.loads(host.stdout.readline())['port']
+        body = json.dumps({'rows': [{'name': 'a', 'points': 4}, {'name': 'b', 'points': 5}]}).encode()
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        connection.request('POST', '/inputs/load', body, {'Content-Type': 'application/json'})
+        answer = connection.getresponse()
+        assert answer.status == 200, (answer.status, answer.getheader('X-Pure-Error'), answer.read())
+        answer.read()
+        connection.request('GET', '/views/loaded')
+        loaded = connection.getresponse().read()
+        connection.close()
+        assert loaded == b'9', loaded
+    finally:
+        host.terminate()
+        host.communicate(timeout=30)
     (lib / 'other.aup').write_text('record User { name: text }\n')
     (lib / 'twofold.aup').write_text('record Item { n = 0 }\nfn Item = 1\n')
     (lib / 'stateful.aup').write_text('record R { n = 0 }\nstate x = 0\n')
@@ -1001,6 +1020,9 @@ def library_records(aup, pure_run, work):
          'main.aup:4:21', "'users' holds store.User, not User"),
         ('use store\nstate users: list of store.User\ninput j = text\non j { users.append(store.Nope { name: j }) }\n',
          'main.aup:4:27', "library 'store' has no record 'Nope'"),
+        ('use store\nstate users: list of store.User by name\ninput j = text\n'
+         'on j { users.append(store.User { name: j }) }\n', 'main.aup:4:8',
+         "'users' is keyed by name: users.add(store.User { ... }) places an item by its key"),
         ('use twofold\n', 'twofold.aup:2:4', "'Item' is already declared as a record"),
         ('use stateful\n', 'stateful.aup:2:1', 'a library declares only fn, record and use'),
     ]
@@ -1709,7 +1731,7 @@ def main():
         report['keyed_snapshots'], report['keyed_failed_events'] = keyed(aup, pure_run, work, range(args.seeds))
         report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
         report['library_programs'], report['library_diagnostics'] = libraries(aup, pure_run, work)
-        report['library_records'] = library_records(aup, pure_run, work)
+        report['library_records'] = library_records(aup, pure_run, args.pure.resolve(), work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

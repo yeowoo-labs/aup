@@ -2309,7 +2309,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             app_name(c, e, e->member);
             const char *key = keyed_by(c, list);
             if (!key) fail_at(c, e->line, e->column, "'%s' has no key; declare it as list of %s by a field to ask has",
-                              e->member, record_of(c, list)->name);
+                              e->member, record_shown(c, c->module, record_of(c, list)));
             if (e->count != 1) fail_at(c, e->line, e->column, "%s.has takes one key", e->member);
             Type type = field_kind(record_of(c, list), (unsigned)c->list_key[list] - 1);
             Kind given = wanted(c, e->args[0], handler, height, type);
@@ -2735,7 +2735,7 @@ static void statements(Compiler *c, const Stmt *s) {
                     fail_at(c, s->line, s->column, "a for does not add to the list it walks; add to another list, or after the for");
                 if (s->kind == S_INSERT && keyed_by(c, list))
                     fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
-                            keyed_by(c, list), s->name, record_of(c, list)->name);
+                            keyed_by(c, list), s->name, record_shown(c, c->module, record_of(c, list)));
                 if (s->kind == S_REMOVE) item_of(c, s->first, true, 0, list);
                 else index_of(c, s->first, true, 0, list);
                 if (s->kind == S_INSERT) record_fields(c, s->value, list, 1);
@@ -2759,7 +2759,7 @@ static void statements(Compiler *c, const Stmt *s) {
             int list = list_state(c, s->name, s->line, s->column, NULL);
             if (c->walking && list == c->walk_list)
                 fail_at(c, s->line, s->column, "a for does not add to the list it walks; add to another list, or after the for");
-            const char *key = keyed_by(c, list), *record = record_of(c, list)->name;
+            const char *key = keyed_by(c, list), *record = record_shown(c, c->module, record_of(c, list));
             if (s->kind == S_APPEND && key)
                 fail_at(c, s->line, s->column, "'%s' is keyed by %s: %s.add(%s { ... }) places an item by its key", s->name,
                         key, s->name, record);
@@ -2779,7 +2779,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 int key = c->list_key[list] - 1;
                 for (unsigned k = 0; k < r->fields; ++k)
                     if (!values[k]) fail_at(c, s->value->line, s->value->column, "%s[...] = %s { ... } needs '%s'", s->name,
-                                            r->name, r->field_names[k]);
+                                            record_shown(c, c->module, r), r->field_names[k]);
                 if (key >= 0) { /* require tasks[at].key == the value's key */
                     Expr *item = node(c, E_ITEM, s->line, s->column), *same = node(c, E_BINARY, s->line, s->column);
                     memcpy(item->name, s->name, NAME);
