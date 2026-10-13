@@ -65,6 +65,21 @@ CARDS = ('record Card {\n  title: text\n  lane = 0\n  note: text\n}\nstate cards
 SENDS = ('state n = 0\ninput buy = message {\n  item: text\n  count: u32\n}\noutput ordered = message {\n'
          '  item: text\n  count: u32\n  to: {\n    city: text\n  }\n}\n')
 DIAGNOSTICS = [
+    # Bits and bytes (Pure 027's stage 1): bit operations take i64s; only bytes are read by position; a, b = x, y names
+    # as many values, each a let's or a number's, bool's or i64's state; bytes(xs) of a list of i64.
+    ('state n = 0\nview v = n & 1\n', '2:10', 'bit operations take i64s, not numbers'),
+    ('state y: i64\non frame {\n  y = 1.5 << 2\n}\n', '3:7', 'bit operations take i64s, not numbers'),
+    ('state t: text\nview v = t[0]\n', '2:10', 'a text is read by position through its bytes, as in bytes(t)[i]'),
+    ('state n = 0\nview v = n[0]\n', '2:10', 'only bytes are read by position, not a number'),
+    ('state n = 0\nview v = 0x1G\n', '2:10', 'a hex number is 0x and the digits 0-9 and a-f'),
+    ('state y: i64\nview v = 0xffffffffffffffff + y\n', '2:10', "the number is past an i64's range"),
+    ('state a = 0\nstate b = 0\non frame {\n  a, b = 1\n}\n', '4:3', '2 names take 2 values, not 1'),
+    ('state a = 0\non frame {\n  a, a = 1, 2\n}\n', '3:6', "'a' is named twice"),
+    ('state s: text\nstate a = 0\non frame {\n  s, a = "x", 1\n}\n', '4:3', "'s' takes its value apart"),
+    ('state x = 0\non frame {\n  let a, b = 1, "s"\n}\n', '3:17', 'a let holds a number, a bool, an i64 or an index, not text'),
+    ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
+     '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
+    ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
     ('state x = 1\nstate x = 2\n', '2:7', "already declared as a state"),
     ('state a = b\n', '1:11', 'expected a numeric state initializer'),
     ('view v = dt\n', '1:10', 'dt is only available in handlers'),
@@ -377,6 +392,16 @@ DIAGNOSTICS = [
 ]
 
 ACCEPTED = [
+    # Bits and bytes (Pure 027's stage 1): hex, bit operations by Python's precedence, a byte of a message's bytes, of an
+    # argument's and of a fn's parameter, lists of i64, number, bool and text with their elements, positions read and
+    # written, a, b = b, a and let a, b = ..., bytes(xs).
+    'state r: i64\nstate n = 0\nstate t: text\ninput go = message { d: bytes }\n'
+    'fn last(data) = data[data.bytes - 1]\n'
+    'on go {\n  let xs: list of i64 = [0x10, 2,\n    3]\n  let a, b = xs[0], xs[2]\n  a, b = b, a\n  xs[1] = a ^ ~b & 0xff\n'
+    '  xs.append(last(go.d) >> 1 | go.d[0] << 2)\n  r = sum(x for x in xs) + xs.first + xs.last\n'
+    '  let ns: list of number = [1.5, 2]\n  let bs: list of bool = [true]\n  let ts: list of text = ["a", "b"]\n'
+    '  for u in ts { t = "{t}{u}" }\n  n = ns[1] + ns.count + bs.count + number(bytes(t)[0])\n  t = text(bytes(xs))\n}\n'
+    'view v(d: bytes) = d[0] & 1\n',
     # Literals beside numbers and i64s, nested deep: each chain is typed in one probe (a probe per level would take 2^30).
     'state x = 0\nstate y: i64\nview v = ' + '1 + (' * 30 + 'x' + ')' * 30 + '\nview w = ' + '1 + (' * 30 + 'y' + ')' * 30 + '\n',
     # i64s: states, fields, keys, slices, messages, outputs, arguments, lets, arithmetic, conditionals, folds, text.
@@ -1122,6 +1147,115 @@ def transients(aup, pure_run, work):
     back = json.loads(run(pure_run, work / 'swapped.pmod', '--store', swapped, stdin='show\n').stdout.splitlines()[-1])
     assert back['states']['online'] == 12 and back['states']['count'] == 0 and back['views']['seen'] == 3, back
     return {'store_files_compared': len(compared.common_files), 'type_words_differ': len(differ)}
+
+
+def bits_and_bytes(aup, pure_run, work, apps=8, per_app=24):
+    """Pure 027's stage 1. Random bit expressions over two i64s a message
+    gives (&, |, ^, ~, <<, >>, + and - by Python's precedence, hex and decimal
+    literals, shift counts of numbers and i64s) against Python's integers in
+    an i64: a left shift or a sum past the range fails as overflow, a shift
+    count outside 0-63 as limit. Then an app of bytes and lists: a message's
+    bytes by position (past the end: limit), lists of i64 written and read
+    by position (past the end: not_found), a, b = b, a, and bytes(xs) shown
+    as text, each against Python."""
+    import struct
+    rng = random.Random(27)
+    low, high = -(1 << 63), (1 << 63) - 1
+
+    class Fault(Exception):
+        pass
+
+    def fits(v):
+        if not low <= v <= high:
+            raise Fault('overflow')
+        return v
+
+    def expression(depth):
+        if depth == 0 or rng.random() < 0.25:
+            pick = rng.random()
+            if pick < 0.3:
+                return 'e.x', lambda x, y: x
+            if pick < 0.6:
+                return 'e.y', lambda x, y: y
+            v = rng.choice([rng.randrange(0, 70), rng.randrange(1 << 32), 0xff, 0xffffffff, -1, -(1 << 31)])
+            text = f'0x{v:x}' if v >= 0 and rng.random() < 0.5 else (f'({v})' if v < 0 else str(v))
+            return text, lambda x, y, v=v: v
+        if rng.random() < 0.15:
+            text, f = expression(depth - 1)
+            return f'~({text})', lambda x, y: ~f(x, y)
+        op = rng.choice(['&', '|', '^', '<<', '>>', '+', '-'])
+        a, fa = expression(depth - 1)
+        if op in ('<<', '>>'):
+            count = rng.choice([rng.randrange(0, 64), rng.randrange(0, 70), -1])
+            b, fb = (str(count) if count >= 0 else f'({count})'), (lambda x, y, c=count: c)
+            if rng.random() < 0.3:
+                b, fb = '(e.y & 63)', (lambda x, y: y & 63)
+        else:
+            b, fb = expression(depth - 1)
+
+        def run(x, y, op=op, fa=fa, fb=fb):
+            u, v = fa(x, y), fb(x, y)
+            if op in ('<<', '>>'):
+                if not 0 <= v <= 63:
+                    raise Fault('limit')
+                return fits(u << v) if op == '<<' else u >> v
+            return fits({'&': u & v, '|': u | v, '^': u ^ v, '+': u + v, '-': u - v}[op])
+        return f'({a} {op} {b})', run
+
+    checked = faults = 0
+    for app in range(apps):
+        cases = [expression(3) for _ in range(per_app)]
+        source = 'state r: i64\n' + ''.join(f'input e{i} = message {{\n  x: i64\n  y: i64\n}}\n' for i in range(per_app))
+        source += ''.join(f'on e{i} {{\n  r = {text.replace("e.", f"e{i}.")}\n}}\n' for i, (text, _) in enumerate(cases))
+        path = work / f'bits{app}.aup'
+        path.write_text(source)
+        compile_module(aup, path, work / f'bits{app}.pmod')
+        given, wanted = '', []
+        for i, (_, f) in enumerate(cases):
+            for _ in range(4):
+                x = rng.choice([rng.randrange(low, high), rng.randrange(1 << 32), rng.randrange(-100, 100)])
+                y = rng.choice([rng.randrange(low, high), rng.randrange(64), rng.randrange(1 << 16)])
+                given += f'message e{i} {struct.pack("<qq", x, y).hex()}\n'
+                try:
+                    wanted.append((f(x, y), 'none'))
+                except Fault as fault:
+                    wanted.append((None, str(fault)))
+        lines = run(pure_run, work / f'bits{app}.pmod', stdin=given, check=False).stdout.splitlines()
+        assert len(lines) == len(wanted), (app, len(lines))
+        for line, (value, fault) in zip(lines, wanted):
+            state = json.loads(line)
+            assert state['fault'] == fault, (app, state, value, fault)
+            if fault == 'none':
+                assert int(state['states']['r']) == value, (app, state['states']['r'], value)
+            checked += 1
+            faults += fault != 'none'
+
+    # Bytes and lists.
+    source = ('state r: i64\nstate n = 0\nstate t: text\ninput go = message {\n  at: u32\n  d: bytes\n}\n'
+              'on go {\n  let xs: list of i64 = [0x41, 0x42, 0x43]\n  let a, b = xs[0], xs[2]\n  a, b = b, a\n'
+              '  xs[1] = go.d[go.at]\n  xs.append(a)\n  r = sum(x for x in xs) + xs.first * 1000 + xs.last\n'
+              '  n = xs.count\n  t = text(bytes(xs))\n  r = r + xs[go.at + 3]\n}\n')
+    path = work / 'bytes.aup'
+    path.write_text(source)
+    compile_module(aup, path, work / 'bytes.pmod')
+    given, wanted = '', []
+    for at, data in ((0, b'abc'), (2, b'xyz'), (3, b'xyz'), (0, b'\x00'), (1, b'pq')):
+        given += f'message go {struct.pack("<I", at).hex()}{data.hex()}\n'
+        if at >= len(data):
+            wanted.append('limit')
+        elif at + 3 >= 4:
+            wanted.append('not_found')
+        else:
+            xs = [0x41, data[at], 0x43, 0x43]  # a, b = b, a: a is 0x43 when it is appended
+            wanted.append((sum(xs) + xs[0] * 1000 + xs[-1] + xs[at + 3], bytes(xs).decode()))
+    lines = run(pure_run, work / 'bytes.pmod', stdin=given, check=False).stdout.splitlines()
+    for line, want in zip(lines, wanted):
+        state = json.loads(line)
+        if isinstance(want, str):
+            assert state['fault'] == want, (state, want)
+        else:
+            assert state['fault'] == 'none' and int(state['states']['r']) == want[0] and state['states']['t'] == want[1], (state, want)
+    return {'expressions': apps * per_app, 'events': checked, 'faults': faults, 'bytes_events': len(wanted)}
 
 
 def computing(aup, pure_run, work, graphs=20):
@@ -1929,6 +2063,7 @@ def main():
         report['library_records'] = library_records(aup, pure_run, args.pure.resolve(), work)
         report['transients'] = transients(aup, pure_run, work)
         report['computing'] = computing(aup, pure_run, work)
+        report['bits_and_bytes'] = bits_and_bytes(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

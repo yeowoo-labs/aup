@@ -1,4 +1,5 @@
 #include "aup.h"
+#include <ctype.h>
 #include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -20,7 +21,9 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
        LOCAL_LOAD, LOCAL_STORE, I64_ADD, I64_SUB, I64_MUL, I64_DIV, I64_MOD, I64_NEG, I64_COMPARE, I64_MIN, I64_MAX,
-       I64_FROM, NUM_FROM, LOOP, BREAK };
+       I64_FROM, NUM_FROM, LOOP, BREAK, I64_BITS, BYTE_AT, BYTES_OF, INDEX_AT };
+/* Bit operations (Pure's I64_BITS by its argument), apart from the opcodes: ~x is x ^ -1. */
+enum { BIT_AND = 0x100, BIT_OR, BIT_XOR, BIT_LEFT, BIT_RIGHT, BIT_NOT };
 enum { LOCALS = 64 }; /* an event's locals (Pure's) */
 enum { NESTING = 8, LOOP_INTEGER = 256 }; /* loops (for) nest 8 deep; an i64's count (Pure 018) */
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT, FOLD_INTEGER = 0x40 };
@@ -44,7 +47,7 @@ typedef struct {
     int line, column;
     double number;
     int64_t integer; /* a literal of digits alone (whole): its exact value, when not past an i64's range (wide) */
-    bool whole, wide;
+    bool whole, wide, hex; /* hex: written 0x..., an i64 wherever it stands */
     char text[NAME + 1]; /* name, or punctuation of one or two characters */
     size_t start, end;   /* string contents in the source */
 } Token;
@@ -65,13 +68,15 @@ typedef enum {
     E_IF,      /* if args[0] { args[1] } else { args[2] } */
     E_FOLD,    /* op(args[1] for name in member[args[2] .. args[3]] where args[0]): count, first (no value), sum, max, min,
                   distinct; args[2] and args[3], when given, slice a list keyed by a number */
+    E_INDEX,   /* args[0][args[1]]: the byte at a position */
+    E_LIST,    /* [ elements linked from args[0] by next ]: a let's list as it begins */
 } ExprKind;
 typedef struct Expr {
     ExprKind kind;
     int line, column, op;
     double number;
     int64_t integer; /* E_NUMBER: as its token's */
-    bool whole, wide;
+    bool whole, wide, hex;
     char name[NAME], member[NAME];
     struct Expr *args[PARAMS], *next;
     unsigned count;
@@ -80,7 +85,7 @@ typedef struct Expr {
 } Expr;
 
 typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
-               S_LET, S_COUNT, S_BREAK, S_RETURN } StmtKind;
+               S_LET, S_COUNT, S_BREAK, S_RETURN, S_ASSIGNS, S_LETS } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
@@ -93,6 +98,10 @@ typedef struct Stmt {
     bool listed;
     int library, key_line, key_column;
     char key[NAME];
+    /* S_ASSIGNS and S_LETS: a, b = x, y gives every name its value at once (the values first, in order): the names, and
+     * the values linked from value by next. */
+    char (*names)[NAME];
+    unsigned name_count;
     struct Stmt *then, *otherwise, *next;
 } Stmt;
 
@@ -126,6 +135,7 @@ typedef struct {
     Expr *field_string[FIELDS_PER_RECORD]; /* a text default, or NULL for "" */
     uint32_t field_constant[FIELDS_PER_RECORD];
     unsigned fields;
+    bool scalar; /* list of i64 (number, bool, text): one field, value, its item read as the value itself */
 } Record;
 
 /* A fn: one expression over its parameters, inlined where it is called. */
@@ -307,6 +317,25 @@ static Token scan(Compiler *c) {
         advance(c);
         return token;
     }
+    if (ch == '0' && (peek_char(c, 1) == 'x' || peek_char(c, 1) == 'X') && isxdigit((unsigned char)peek_char(c, 2))) {
+        /* 0x then hex digits: an i64 (past its range, wide) */
+        advance(c);
+        advance(c);
+        uint64_t exact = 0;
+        token.kind = T_NUMBER;
+        token.whole = token.hex = true;
+        while (isxdigit((unsigned char)peek_char(c, 0))) {
+            char h = peek_char(c, 0);
+            unsigned v = (unsigned)(digit(h) ? h - '0' : (h | 0x20) - 'a' + 10);
+            token.wide = token.wide || exact > (UINT64_C(9223372036854775807) - v) / 16;
+            exact = exact * 16 + v;
+            advance(c);
+        }
+        if (letter(peek_char(c, 0))) fail_at(c, token.line, token.column, "a hex number is 0x and the digits 0-9 and a-f");
+        token.integer = token.wide ? 0 : (int64_t)exact;
+        token.number = (double)exact;
+        return token;
+    }
     if (digit(ch) || (ch == '.' && digit(peek_char(c, 1)))) {
         /* \d+(\.\d*)?|\.\d+ with an optional exponent; a '.' that starts '..' ends the number. */
         char text[400];
@@ -352,7 +381,7 @@ static Token scan(Compiler *c) {
         token.kind = T_NAME;
         return token;
     }
-    static const char *const pairs[] = {"<=", ">=", "==", "!=", "&&", "||", ".."};
+    static const char *const pairs[] = {"<=", ">=", "==", "!=", "&&", "||", "..", "<<", ">>"};
     for (size_t i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)
         if (ch == pairs[i][0] && peek_char(c, 1) == pairs[i][1]) {
             memcpy(token.text, pairs[i], 3);
@@ -361,7 +390,7 @@ static Token scan(Compiler *c) {
             token.kind = T_PUNCT;
             return token;
         }
-    if (strchr("=+-*/%!<>(){}[],.;:", ch)) {
+    if (strchr("=+-*/%!<>(){}[],.;:&|^~", ch)) {
         token.text[0] = ch;
         advance(c);
         token.kind = T_PUNCT;
@@ -456,8 +485,10 @@ static bool utf8_valid(const unsigned char *bytes, size_t size) {
 
 static const struct { const char *text; int precedence, op; } binary[] = {
     {"||", 1, OR}, {"&&", 2, AND}, {"==", 3, EQ}, {"!=", 3, NE}, {"<", 4, LT}, {"<=", 4, LE},
-    {">", 4, GT}, {">=", 4, GE}, {"+", 5, ADD}, {"-", 5, SUB}, {"*", 6, MUL}, {"/", 6, DIV}, {"%", 6, MOD},
+    {">", 4, GT}, {">=", 4, GE}, {"|", 5, BIT_OR}, {"^", 6, BIT_XOR}, {"&", 7, BIT_AND}, {"<<", 8, BIT_LEFT},
+    {">>", 8, BIT_RIGHT}, {"+", 9, ADD}, {"-", 9, SUB}, {"*", 10, MUL}, {"/", 10, DIV}, {"%", 10, MOD},
 };
+enum { UNARY = 11 }; /* a unary operator's operand binds tighter than any binary one */
 
 static Expr *node(Compiler *c, ExprKind kind, int line, int column) {
     Expr *e = allocate(c, sizeof(*e));
@@ -529,7 +560,18 @@ static Expr *postfix(Compiler *c, Expr *e) {
         }
         e = item;
     }
-    while (is(c, ".")) {
+    while (is(c, ".") || is(c, "[")) {
+        if (is(c, "[")) { /* packet.data[i]: the byte at a position */
+            Token open = take(c);
+            Expr *at = node(c, E_INDEX, open.line, open.column);
+            at->args[0] = e;
+            at->args[1] = expression(c, 0, true);
+            at->count = 2;
+            newlines(c);
+            expect(c, "]", "']'");
+            e = at;
+            continue;
+        }
         take(c);
         Token member = expect_name(c, "a field or member name");
         if (is(c, "(")) {
@@ -742,12 +784,13 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
         left->integer = token.integer;
         left->whole = token.whole;
         left->wide = token.wide;
+        left->hex = token.hex;
     } else if (token.kind == T_STRING) {
         left = string(c, &token);
-    } else if (token.kind == T_PUNCT && (!strcmp(token.text, "-") || !strcmp(token.text, "!"))) {
+    } else if (token.kind == T_PUNCT && (!strcmp(token.text, "-") || !strcmp(token.text, "!") || !strcmp(token.text, "~"))) {
         left = node(c, E_UNARY, token.line, token.column);
-        left->op = token.text[0] == '-' ? NEG : NOT;
-        left->args[0] = expression(c, 7, multiline);
+        left->op = token.text[0] == '-' ? NEG : token.text[0] == '!' ? NOT : BIT_NOT;
+        left->args[0] = expression(c, UNARY, multiline);
         left->count = 1;
         if (left->op == NEG && left->args[0]->kind == E_NUMBER) { /* -5: one literal, a number or an i64 */
             Expr *literal = left->args[0];
@@ -760,6 +803,16 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
         left = expression(c, 0, true);
         newlines(c);
         expect(c, ")", "')'");
+    } else if (token.kind == T_PUNCT && !strcmp(token.text, "[")) { /* refused where it stands (only a let's list begins so) */
+        left = node(c, E_LIST, token.line, token.column);
+        newlines(c);
+        while (!is(c, "]")) {
+            expression(c, 0, true);
+            newlines(c);
+            if (!is(c, ",")) break;
+            take(c);
+        }
+        expect(c, "]", "']'");
     } else if (token.kind == T_NAME && (!strcmp(token.text, "true") || !strcmp(token.text, "false"))) {
         left = node(c, E_BOOL, token.line, token.column);
         left->number = token.text[0] == 't';
@@ -828,6 +881,7 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
             if (left->count != calls[call].count)
                 fail_at(c, token.line, token.column, "%s expects %u argument%s", token.text, calls[call].count,
                         calls[call].count == 1 ? "" : "s");
+            if (left->kind == E_CONVERT && is(c, "[")) left = postfix(c, left); /* bytes(t)[i] */
         } else if (!strcmp(token.text, "dt") || !strcmp(token.text, "now")) {
             left = node(c, token.text[0] == 'd' ? E_DT : E_NOW, token.line, token.column);
         } else if (!strcmp(token.text, "if")) {
@@ -946,8 +1000,12 @@ static Expr *send_fields(Compiler *c) {
 /* A value inserted into a text or a list: an expression or a record
  * (NAME { ... }, or LIBRARY.NAME { ... }: looked at two tokens ahead, the
  * scanner then put back as it was). */
-static Expr *inserted(Compiler *c) {
-    newlines(c);
+static Expr *inserted_value(Compiler *c, bool multiline);
+static Expr *inserted(Compiler *c) { return inserted_value(c, true); }
+
+/* A record value, or an expression that goes into a list (one line unless multiline). */
+static Expr *inserted_value(Compiler *c, bool multiline) {
+    if (multiline) newlines(c);
     if (c->token.kind == T_NAME && lookahead(c)->kind == T_PUNCT && !strcmp(lookahead(c)->text, "{"))
         return record_value(c, NULL);
     if (c->token.kind == T_NAME && lookahead(c)->kind == T_PUNCT && !strcmp(lookahead(c)->text, ".")) {
@@ -962,7 +1020,7 @@ static Expr *inserted(Compiler *c) {
         c->at = at, c->line = line, c->column = column;
         c->token = token, c->ahead = ahead, c->has_ahead = has_ahead;
     }
-    return expression(c, 0, true);
+    return expression(c, 0, multiline);
 }
 
 static Stmt *block(Compiler *c, unsigned depth);
@@ -973,6 +1031,34 @@ static void range(Compiler *c, Stmt *s) {
     expect(c, "..", "'..'");
     s->last = expression(c, 0, true);
     newlines(c);
+}
+
+/* , b, c = x, y, z after the first name: every name, then as many values on the line. */
+static void several(Compiler *c, Stmt *s, const char *first) {
+    s->names = allocate(c, STACK * sizeof(*s->names));
+    memcpy(s->names[s->name_count++], first, NAME);
+    while (is(c, ",")) {
+        take(c);
+        Token name = expect_name(c, "a name");
+        if (reserved_name(name.text)) fail_at(c, name.line, name.column, "'%s' is reserved", name.text);
+        if (s->name_count == STACK) fail_at(c, name.line, name.column, "at most %d names take values at once", STACK);
+        for (unsigned i = 0; i < s->name_count; ++i)
+            if (!strcmp(s->names[i], name.text)) fail_at(c, name.line, name.column, "'%s' is named twice", name.text);
+        memcpy(s->names[s->name_count++], name.text, NAME);
+    }
+    expect(c, "=", "'='");
+    Expr **tail = &s->value;
+    unsigned values = 0;
+    for (;;) {
+        *tail = expression(c, 0, false);
+        tail = &(*tail)->next;
+        ++values;
+        if (!is(c, ",")) break;
+        take(c);
+        newlines(c); /* a line may end after a comma */
+    }
+    if (values != s->name_count)
+        fail_at(c, s->line, s->column, "%u names take %u values, not %u", s->name_count, s->name_count, values);
 }
 
 static Stmt *statement(Compiler *c, unsigned depth) {
@@ -1005,6 +1091,11 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         memcpy(s->name, name.text, NAME);
         s->line = name.line;
         s->column = name.column;
+        if (is(c, ",")) { /* let a, b = x, y */
+            s->kind = S_LETS;
+            several(c, s, name.text);
+            return s;
+        }
         if (is(c, ":")) { /* let name: list of R [by field]: the event's list, empty as it begins */
             take(c);
             Token type = expect_name(c, "list");
@@ -1020,6 +1111,23 @@ static Stmt *statement(Compiler *c, unsigned depth) {
                 s->key_column = key.column;
             }
             s->listed = true;
+            if (is(c, "=")) { /* = [a, b, ...]: what it holds as it begins, appended in order */
+                take(c);
+                Token open = expect(c, "[", "'[' and the list's elements");
+                Expr *list = node(c, E_LIST, open.line, open.column), **tail = &list->args[0];
+                newlines(c);
+                while (!is(c, "]")) {
+                    *tail = inserted(c);
+                    tail = &(*tail)->next;
+                    ++list->count;
+                    newlines(c);
+                    if (!is(c, ",")) break;
+                    take(c);
+                    newlines(c);
+                }
+                expect(c, "]", "']'");
+                s->value = list;
+            }
             return s;
         }
         expect(c, "=", "'='");
@@ -1107,9 +1215,9 @@ static Stmt *statement(Compiler *c, unsigned depth) {
             if (is(c, "("))
                 fail_at(c, s->first->line, s->first->column, "a collection is indexed by the message key, as in name[key]");
             memcpy(s->member, field.text, NAME);
-        } else if (is(c, "=")) { /* tasks[at] = Task { ... }: every field of the item (no member) */
+        } else if (is(c, "=")) { /* tasks[at] = Task { ... }: every field of the item (no member); xs[i] = 5 */
             take(c);
-            s->value = inserted(c);
+            s->value = inserted_value(c, false);
             return s;
         } else
             fail_at(c, c->token.line, c->token.column,
@@ -1171,6 +1279,11 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         } else fail_at(c, method.line, method.column,
                        "a text supports insert and remove; a list supports append, insert and remove (add when keyed)");
         expect(c, ")", "')'");
+        return s;
+    }
+    if (is(c, ",")) { /* a, b = b, a */
+        s->kind = S_ASSIGNS;
+        several(c, s, token.text);
         return s;
     }
     s->kind = S_ASSIGN;
@@ -2107,6 +2220,11 @@ static void item_of(Compiler *c, const Expr *e, bool handler, int height, int li
         emit(c, e->line, e->column, LIST_FIND, (uint32_t)list, 0);
         return;
     }
+    if (kind.type == NUM || kind.type == I64) { /* xs[2]: the item at a position */
+        if (kind.type == I64) emit(c, e->line, e->column, NUM_FROM, 0, 0);
+        emit(c, e->line, e->column, INDEX_AT, (uint32_t)list, 0);
+        return;
+    }
     expect_kind(c, e, kind, INDEX);
     if (kind.owner != list)
         fail_at(c, e->line, e->column, "an index of '%s' cannot point into '%s'", c->state_names[kind.owner],
@@ -2116,6 +2234,20 @@ static void item_of(Compiler *c, const Expr *e, bool handler, int height, int li
 /* The key field of a keyed list, or NULL. */
 static const char *keyed_by(const Compiler *c, int list) {
     return c->list_key[list] ? c->state_key[list] : NULL;
+}
+
+/* An item of list, its index on the stack: the value itself in a list of
+ * i64 (number, bool, text), else the index. */
+static Kind item_value(Compiler *c, const Expr *e, int list) {
+    const Record *r = record_of(c, list);
+    if (!r->scalar) return (Kind){INDEX, list};
+    emit(c, e->line, e->column, ITEM_GET, (uint32_t)list, 0);
+    return (Kind){field_kind(r, 0), -1};
+}
+
+static int collection_index(const Compiler *c, const char *name) {
+    for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) return (int)i;
+    return -1;
 }
 
 /* A fn inlined: its arguments go on the stack once, the body reads them with
@@ -2257,7 +2389,14 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     c->want = 0;
     if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
     switch (e->kind) {
-    case E_NUMBER: emit(c, e->line, e->column, CONST, 0, e->number); return (Kind){NUM, -1};
+    case E_NUMBER:
+        if (e->hex) { /* 0x...: an i64 */
+            emit(c, e->line, e->column, CONST, 2, 0);
+            made_i64(c, e, c->code_count - 1);
+            return (Kind){I64, -1};
+        }
+        emit(c, e->line, e->column, CONST, 0, e->number);
+        return (Kind){NUM, -1};
     case E_BOOL: emit(c, e->line, e->column, CONST, 1, e->number); return (Kind){BOOL, -1};
     case E_DT: case E_NOW: {
         const char *name = e->kind == E_DT ? "dt" : "now";
@@ -2284,7 +2423,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     case E_NAME: {
         if (c->folding && c->scope == c->fold_scope && !strcmp(e->name, c->fold_name)) {
             emit(c, e->line, e->column, ROW, (uint32_t)c->fold_list, 0); /* the item a fold's block runs for */
-            return (Kind){INDEX, c->fold_list};
+            return item_value(c, e, c->fold_list);
         }
         int loop = loop_named(c, e->name);
         if (loop >= 0 && c->loops[loop].list >= 0 && c->scope == c->loops[loop].scope) {
@@ -2293,7 +2432,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             int list = c->loops[loop].list;
             if (loop == innermost_walk(c)) emit(c, e->line, e->column, c->folding ? OUTER_ROW : ROW, (uint32_t)list, 0);
             else emit(c, e->line, e->column, LOCAL_LOAD, (uint32_t)c->loops[loop].item | 1u << 8 | (uint32_t)list << 16, 0);
-            return (Kind){INDEX, list};
+            return item_value(c, e, list);
         }
         int param = parameter(c, e->name);
         if (param >= 0 && c->folding && c->scope == c->fold_scope)
@@ -2386,7 +2525,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 if (!strcmp(m, "count")) { emit(c, e->line, e->column, LIST_COUNT, (uint32_t)state, 0); return (Kind){NUM, -1}; }
                 if (!strcmp(m, "first") || !strcmp(m, "last")) {
                     emit(c, e->line, e->column, m[0] == 'f' ? INDEX_FIRST : INDEX_LAST, (uint32_t)state, 0);
-                    return (Kind){INDEX, state};
+                    return item_value(c, e, state);
                 }
                 fail_at(c, e->line, e->column, "a list has count, first and last, not '%s'", m);
             }
@@ -2460,6 +2599,16 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         emit(c, e->line, e->column, DOC_SIZE, collection(c, e->name, e->line, e->column), 0);
         return (Kind){NUM, -1};
     case E_CONVERT: {
+        const Expr *a = e->args[0];
+        int list = e->op == BYTES_FROM && a->kind == E_NAME && !c->module && parameter(c, a->name) < 0 ? state_index(c, a->name) : -1;
+        if (list >= 0 && c->state_types[list] == STATE_LIST) { /* bytes(xs): a list of i64s, each a byte */
+            list = list_state(c, a->name, a->line, a->column, NULL);
+            const Record *r = record_of(c, list);
+            if (!r->scalar || r->field_kinds[0] != I64)
+                fail_at(c, a->line, a->column, "bytes(...) makes bytes of a list of i64, not of %s", record_shown(c, c->module, r));
+            emit(c, e->line, e->column, BYTES_OF, (uint32_t)list, 0);
+            return (Kind){BYTES, -1};
+        }
         Kind inner = value(c, e->args[0], handler, height);
         Type from = e->op == TEXT_FROM ? BYTES : TEXT;
         if (inner.type != from)
@@ -2469,9 +2618,24 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         return (Kind){e->op == TEXT_FROM ? TEXT : BYTES, -1};
     }
     case E_ITEM: {
+        int named = c->module || parameter(c, e->name) >= 0 ? -1 : state_index(c, e->name);
+        if (!*e->member && (named < 0 || c->state_types[named] != STATE_LIST) && collection_index(c, e->name) < 0) {
+            Expr name = *e, at = *e; /* data[i]: a parameter's, an argument's or a state's byte */
+            name.kind = E_NAME;
+            at.kind = E_INDEX;
+            at.args[0] = &name;
+            at.args[1] = e->args[0];
+            at.count = 2;
+            return value(c, &at, handler, height);
+        }
         app_name(c, e, e->name);
         int list = list_state(c, e->name, e->line, e->column, e->args[0]);
         const Record *r = record_of(c, list);
+        if (!*e->member && r->scalar) { /* xs[i]: the value at a position (or a key) */
+            item_of(c, e->args[0], handler, height, list);
+            emit(c, e->line, e->column, ITEM_GET, (uint32_t)list, 0);
+            return (Kind){field_kind(r, 0), -1};
+        }
         if (!*e->member) {
             /* people["bob"]: the index of the item with that key. */
             if (!keyed_by(c, list))
@@ -2487,6 +2651,19 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         emit(c, e->line, e->column, ITEM_GET, (uint32_t)list | field << 16, 0);
         return (Kind){field_kind(r, field), -1};
     }
+    case E_INDEX: {
+        Kind base = value(c, e->args[0], handler, height);
+        if (base.type == TEXT)
+            fail_at(c, e->line, e->column, "a text is read by position through its bytes, as in bytes(t)[i]");
+        if (base.type != BYTES) fail_at(c, e->line, e->column, "only bytes are read by position, not %s", type_name(base.type));
+        Kind at = value(c, e->args[1], handler, height + 1);
+        if (at.type != NUM && at.type != I64)
+            fail_at(c, e->args[1]->line, e->args[1]->column, "a position is a number or an i64, not %s", type_name(at.type));
+        emit(c, e->line, e->column, BYTE_AT, at.type == I64, 0);
+        return (Kind){I64, -1};
+    }
+    case E_LIST:
+        fail_at(c, e->line, e->column, "a list's elements begin a let's list, as in let xs: list of i64 = [1, 2]");
     case E_IF: {
         /* Arms of an else-if chain share one end; a value crosses it, so the
          * branches ahead that carry one are counted against Pure's limit. An
@@ -2605,6 +2782,25 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         }
         /* fall through */
     default: {
+        if (e->op >= BIT_AND && e->op <= BIT_NOT) { /* &, |, ^, <<, >> and ~: on i64s, as integers without end (Pure 027) */
+            for (unsigned i = 0; i < e->count; ++i) {
+                bool count = i == 1 && (e->op == BIT_LEFT || e->op == BIT_RIGHT); /* a number or an i64, as a position is */
+                Kind kind = count && !loose(e->args[i]) ? value(c, e->args[i], handler, height + 1)
+                                                        : wanted(c, e->args[i], handler, height + (int)i, I64);
+                if (count && kind.type == NUM) {
+                    emit(c, e->args[i]->line, e->args[i]->column, I64_FROM, 0, 0);
+                    continue;
+                }
+                if (kind.type != I64)
+                    fail_at(c, e->args[i]->line, e->args[i]->column, kind.type == NUM ?
+                            "bit operations take i64s, not numbers: convert, as in i64(x)" : "bit operations take i64s, not %s",
+                            type_name(kind.type));
+            }
+            if (e->op == BIT_NOT) emit_integer(c, e->line, e->column, -1);
+            static const uint8_t how[] = {0, 1, 2, 3, 4, 2}; /* Pure's PureBits: and, or, xor, left, right; ~ is xor -1 */
+            emit(c, e->line, e->column, I64_BITS, how[e->op - BIT_AND], 0);
+            return (Kind){I64, -1};
+        }
         /* !, && and || take bools (both sides are computed); *, /, %, min and
          * max numbers or i64s; clamp and floor numbers. */
         bool logic = e->op == AND || e->op == OR || e->op == NOT;
@@ -2726,6 +2922,10 @@ static Expr *spread_field(Compiler *c, const Expr *spread, const char *name) {
  * given): those written, and the rest its spread's source has by name. */
 static void record_values(Compiler *c, const Expr *e, int list, const Expr **values) {
     const Record *r = record_of(c, list);
+    if (r->scalar && e->kind != E_RECORD) { /* xs.append(5): the value itself */
+        values[0] = e;
+        return;
+    }
     char shown[2 * NAME + 1];
     snprintf(shown, sizeof(shown), "%s", record_shown(c, c->module, r));
     if (e->kind != E_RECORD)
@@ -2821,6 +3021,12 @@ static void statements(Compiler *c, const Stmt *s) {
                 memset(&c->locals[local], 0, sizeof(c->locals[local]));
                 memcpy(c->locals[local].name, s->name, NAME);
                 c->locals[local].list = list;
+                for (const Expr *element = s->value ? s->value->args[0] : NULL; element; element = element->next) {
+                    if (keyed_by(c, list))
+                        fail_at(c, element->line, element->column, "a keyed list adds its elements by key; add them one by one");
+                    record_fields(c, element, list, 0);
+                    emit(c, element->line, element->column, LIST_APPEND, (uint32_t)list, 0);
+                }
                 break;
             }
             if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
@@ -2835,6 +3041,63 @@ static void statements(Compiler *c, const Stmt *s) {
             c->locals[local].list = -1;
             c->locals[local].counter = false;
             emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, (int)local), 0);
+            break;
+        }
+        case S_LETS: {
+            const Expr *v = s->value;
+            Kind kinds[STACK];
+            for (unsigned i = 0; i < s->name_count; ++i, v = v->next) {
+                kinds[i] = value(c, v, c->handling, (int)i);
+                if (kinds[i].type != NUM && kinds[i].type != BOOL && kinds[i].type != I64 && kinds[i].type != INDEX)
+                    fail_at(c, v->line, v->column, "a let holds a number, a bool, an i64 or an index, not %s", type_name(kinds[i].type));
+            }
+            unsigned first = c->local_count;
+            for (unsigned i = 0; i < s->name_count; ++i) {
+                const char *name = s->names[i];
+                if (let_named(c, name) >= 0) fail_at(c, s->line, s->column, "'%s' is already a let here", name);
+                const char *kind = declared_kind(c, name);
+                if (kind) fail_at(c, s->line, s->column, "'%s' is already declared as %s", name, kind);
+                if (loop_named(c, name) >= 0) fail_at(c, s->line, s->column, "'%s' is named by a for around it", name);
+                if (c->local_count == LOCALS || c->local_slots == LOCALS)
+                    fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+                unsigned local = c->local_count++;
+                memset(&c->locals[local], 0, sizeof(c->locals[local]));
+                memcpy(c->locals[local].name, name, NAME);
+                c->locals[local].slot = c->local_slots++;
+                c->locals[local].kind = kinds[i];
+                c->locals[local].list = -1;
+            }
+            for (unsigned i = s->name_count; i-- > 0;) emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, (int)(first + i)), 0);
+            break;
+        }
+        case S_ASSIGNS: {
+            const Expr *v = s->value;
+            int locals[STACK], states[STACK];
+            for (unsigned i = 0; i < s->name_count; ++i, v = v->next) {
+                const char *name = s->names[i];
+                locals[i] = local_named(c, name);
+                states[i] = locals[i] < 0 ? state_index(c, name) : -1;
+                if (locals[i] >= 0 && c->locals[locals[i]].counter)
+                    fail_at(c, s->line, s->column, "'%s' is what this for counts; it is not assigned", name);
+                Kind want;
+                if (locals[i] >= 0) want = c->locals[locals[i]].kind;
+                else if (states[i] >= 0 && (c->state_types[states[i]] == STATE_NUM || c->state_types[states[i]] == STATE_BOOL ||
+                                            c->state_types[states[i]] == STATE_I64)) {
+                    want = (Kind){c->state_types[states[i]] == STATE_I64 ? I64 : c->state_types[states[i]] == STATE_BOOL ? BOOL : NUM, -1};
+                    view_changes(c, s, -1, name);
+                } else if (states[i] >= 0) fail_at(c, s->line, s->column, "'%s' takes its value apart, as in %s = ...", name, name);
+                else {
+                    const char *kind = declared_kind(c, name);
+                    if (kind) fail_at(c, s->line, s->column, "cannot assign to %s '%s'", kind, name);
+                    fail_at(c, s->line, s->column, "unknown state '%s'", name);
+                }
+                Kind got = wanted(c, v, c->handling, (int)i, want.type);
+                if (got.type != want.type || (got.type == INDEX && got.owner != want.owner))
+                    fail_at(c, v->line, v->column, "'%s' holds %s", name, want.type == INDEX ? "an index of its list" : type_name(want.type));
+            }
+            for (unsigned i = s->name_count; i-- > 0;)
+                if (locals[i] >= 0) emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, locals[i]), 0);
+                else emit(c, s->line, s->column, STORE, (uint32_t)states[i], 0);
             break;
         }
         case S_ASSIGN: {
@@ -3268,6 +3531,30 @@ static void pull_records(Compiler *c) {
     }
 }
 
+/* The record a list of i64 (number, bool, text) holds: one field, value, made once the app holds such a list; -1 for
+ * another name. */
+static int scalar_record(Compiler *c, const char *name, int line, int column) {
+    static const struct { const char *name; Type kind; } scalars[] = {{"i64", I64}, {"number", NUM}, {"bool", BOOL}, {"text", TEXT}};
+    for (unsigned k = 0; k < sizeof(scalars) / sizeof(*scalars); ++k) {
+        if (strcmp(name, scalars[k].name)) continue;
+        int found = module_record(c, 0, name);
+        if (found >= 0) return found;
+        if (c->record_count == RECORDS) fail_at(c, line, column, "at most 16 records are allowed, a list of %s among them", name);
+        if (c->record_fields == RECORD_FIELDS) fail_at(c, line, column, "at most 128 record fields are allowed");
+        Record *r = &c->records[c->record_count];
+        memset(r, 0, sizeof(*r));
+        memcpy(r->name, name, strlen(name) + 1);
+        memcpy(r->field_names[0], "value", 6);
+        r->field_kinds[0] = scalars[k].kind;
+        r->fields = 1;
+        r->scalar = true;
+        r->line = line, r->column = column;
+        ++c->record_fields;
+        return (int)c->record_count++;
+    }
+    return -1;
+}
+
 static void generate(Compiler *c, unsigned char **module, size_t *size) {
     uint32_t events[HANDLERS], state_ref[STATES] = {0};
     int handler_input[HANDLERS];
@@ -3290,6 +3577,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                         "transient too", c->state_names[i], c->state_target[i]);
         } else if (c->state_types[i] == STATE_LIST) {
             int record = module_record(c, c->state_library[i], c->state_target[i]);
+            if (record < 0 && !c->state_library[i])
+                record = scalar_record(c, c->state_target[i], c->state_line[i], c->state_column[i]);
             for (unsigned l = 1; record < 0 && l < c->module_count; ++l) /* a library's, written without its name */
                 if (c->modules[0].uses[l] && library_record(c, (int)l, c->state_target[i]) >= 0)
                     fail_at(c, c->state_line[i], c->state_column[i], "'%s' is library %s's record: write %s.%s",
