@@ -693,3 +693,62 @@ on check {
 - 무작위 형식 144개, 사건 720개(그중 `limit` 171개)가 파이썬과 같다.
 - 쉼표로 자르는 앱 하나가 67개의 입력에서 파이썬과 같다. 빈 입력도 단락 평가로 읽지 않는다.
 - `examples/json.aup`는 Pure의 검사가 JSONTestSuite로 대조한다.
+
+### 레코드 안의 레코드, 갈래, 리스트를 담은 필드, match (Pure 027의 2b)
+
+`examples/json_tree.aup`(JSON 텍스트를 값의 트리로 읽고 너비 우선으로 돌아 다이제스트를 낸다)가 이것으로 쓰였다.
+
+```text
+variant Json {                         # 경우 하나를 갖는 값: 경우마다 값 하나(타입 하나) 또는 없음
+  null
+  num(number)
+  str(text)
+  arr(list of Json)                    # 리스트를 담은 경우: 갈래는 리스트를 거쳐 자기 자신을 담는다
+  obj(list of Member)
+}
+record Member {
+  name: text
+  value: Json                          # 레코드 안의 갈래(레코드 안의 레코드도: at: Point)
+}
+on check {
+  let kids: list of Json
+  kids.append(Json.num(1))
+  docs.append(Json.arr(kids))          # let의 리스트를 값으로(복사)
+  docs.last.arr.append(Json.num(2))    # 항목의 필드에 담긴 리스트에 덧붙이기
+  for d in docs {
+    match d {
+      num(x) => total = total + x
+      arr(items) => { for y in items { ... } }
+      _ => {}
+    }
+  }
+}
+```
+
+- **펼치기.** 레코드나 갈래인 필드는 컴파일할 때 경로 이름의 필드로 펼쳐진다.
+  - `at: Point` → `at.x`, `at.y`.
+  - 갈래 필드는 그 이름의 필드가 경우 번호(i64)이고, 경우의 값이 `이름.경우`에 놓인다. 맨 위 갈래의 경우 번호는 `case`다.
+  - 그래서 런타임에는 레코드 값이 따로 없다. 저장 상태도 경로 이름의 열로 그대로 저장된다.
+  - 레코드가 리스트를 거치지 않고 자기 자신을 담으면 진단이 나온다. 펼친 필드는 Pure의 한도대로 16개까지다.
+- **리스트를 담은 필드** `items: list of X`는 이벤트의 값이다. let의 리스트와 그 항목에만 둘 수 있다. 저장 상태와 메시지의 행은
+  저장되는 리스트의 리스트가 생길 때(027의 3단계) 받는다.
+  - 값으로 짓기: let의 리스트를 주면 복사(Pure의 LIST_VALUE), `[]`는 빈 것, 다른 항목의 리스트 필드는 그대로 나눠 가진다.
+  - 덧붙이기: `x.items.append(…)`, `xs.last.items.append(…)`, `xs[i].items.append(…)`(APPEND_IN). 나눠 가진 리스트는 먼저
+    제 것으로 복사되므로 다른 값은 바뀌지 않는다.
+  - 읽기: `for y in x.items`, 접기, `x.items.count`·`.first`·`.last`·`[i]`. 이것들은 읽기 전용 레지스터에 묶여 읽힌다
+    (LIST_BIND).
+- **갈래의 경우를 짓기**: `Json.num(3)`, `Json.null`. 값이 있는 경우에는 값을 꼭 준다.
+- **`match 항목 { 경우(이름) => 문장 또는 { 블록 } … _ => … }`**
+  - 항목은 갈래의 리스트의 항목이거나, 레코드 안의 갈래 필드(`match m.value`)다.
+  - 경우의 값은 이름으로 묶인다. 수와 text는 그 값, 리스트는 읽을 리스트, 레코드나 갈래는 그 필드(`p.x`, 안쪽 `match`)다.
+  - 빠진 경우는 `_`가 없으면 진단이 나온다. 같은 경우를 두 번 쓰거나 `_` 뒤에 쓴 갈래도 진단이 나온다.
+  - 갈래 필드를 그냥 읽으면 `match`하라는 진단이 나온다.
+- **`xs[i]`** 는 키 없는 레코드 리스트의 i번째 항목(인덱스)이다.
+- **`number(t)`** 는 JSON의 수로 쓴 text를 가장 가까운 수로 읽는다. 아니면 `limit`이다(Pure의 NUM_PARSE).
+
+검증:
+- 진단 16건: 자기 자신을 담는 레코드, 모르는 타입, 같은 경우, 값의 유무, 없는 경우, 빠진 경우, 두 번 쓴 경우, 갈래가 아닌
+  match, 값 없는 경우의 이름, `_` 뒤의 갈래, 다른 레코드의 리스트, 저장 상태의 리스트 필드, 갈래 필드의 읽기, 16개를 넘는 펼침.
+- 받아들이는 꼴 하나.
+- 중첩 값의 앱이 기대값을 낸다. 같은 이벤트를 두 번 해도 같은 몫이 늘고, 실패한 이벤트는 아무것도 남기지 않는다.
+- `examples/json_tree.aup`는 Pure의 검사가 JSONTestSuite와 무작위 문서 100개로 파이썬의 읽기와 대조한다.

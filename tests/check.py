@@ -64,6 +64,7 @@ CARDS = ('record Card {\n  title: text\n  lane = 0\n  note: text\n}\nstate cards
          'output o = message {\n  title: text\n  lane: u32\n  note: text\n}\n')
 SENDS = ('state n = 0\ninput buy = message {\n  item: text\n  count: u32\n}\noutput ordered = message {\n'
          '  item: text\n  count: u32\n  to: {\n    city: text\n  }\n}\n')
+JSON_M = 'variant Json {\n  null\n  num(number)\n  arr(list of Json)\n}\nrecord M {\n  name: text\n  value: Json\n}\n'
 DIAGNOSTICS = [
     # Bits and bytes (Pure 027's stage 1): bit operations take i64s; only bytes are read by position; a, b = x, y names
     # as many values, each a let's or a number's, bool's or i64's state; bytes(xs) of a list of i64.
@@ -81,6 +82,32 @@ DIAGNOSTICS = [
     ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
      '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
     ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
+    # Records in records, variants, lists in records and match (Pure 027's stage 2b).
+    ('record A {\n  b: B\n}\nrecord B {\n  a: A\n}\nstate xs: list of A\n', '1:8', "'A' holds itself: hold it in a list"),
+    ('record A {\n  b: Nope\n}\nstate xs: list of A\n', '2:3', "unknown record or variant 'Nope'"),
+    (JSON_M + 'variant V {\n  a\n  a\n}\n', '12:3', "duplicate case 'a'"),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  xs.append(Json.num)\n}\n', '13:13', 'Json.num holds a value: give it'),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  xs.append(Json.null(1))\n}\n', '13:18', 'Json.null holds no value'),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  xs.append(Json.nope(1))\n}\n', '13:18', "variant 'Json' has no case 'nope'"),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  for x in xs {\n    match x {\n      null => n = 1\n    }\n  }\n}\n',
+     '14:5', "match misses case 'num': add it, or _ for the rest"),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  for x in xs {\n    match x {\n      null => n = 1\n      null => n = 2\n'
+     '      _ => n = 3\n    }\n  }\n}\n', '16:7', "case 'null' is matched twice"),
+    (JSON_M + 'state n = 0\non frame {\n  let ms: list of M\n  for m in ms {\n    match m {\n      _ => n = 3\n    }\n  }\n}\n', '14:11',
+     "match takes an item that holds a variant; 'M' holds none"),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  for x in xs {\n    match x {\n      null(v) => n = 1\n      _ => n = 2\n'
+     '    }\n  }\n}\n', '15:12', "case 'null' holds no value to name"),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  for x in xs {\n    match x {\n      _ => n = 1\n      null => n = 2\n'
+     '    }\n  }\n}\n', '16:7', 'an arm after _ is never taken'),
+    (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  let ms: list of M\n  xs.append(Json.arr(ms))\n}\n', '14:22',
+     "'arr' holds a list of Json, not of M"),
+    (JSON_M + 'state xs: list of Json\n', '10:7', "'xs' holds lists in its items: a let's list may, for now"),
+    (JSON_M + 'state n = 0\non frame {\n  let ms: list of M\n  for m in ms {\n    n = m.value\n  }\n}\n', '14:9',
+     "'value' holds a variant: match it"),
+    ('record P {\n  x = 0\n}\nstate n = 0\non frame {\n  let ps: list of P\n  match ps.first {\n    _ => n = 1\n  }\n}\n', '7:9',
+     "match takes an item that holds a variant; 'P' holds none"),
+    ('record W {\n' + ''.join(f'  f{i} = 0\n' for i in range(12)) + '}\nrecord X {\n  a: W\n  b: W\n}\nstate xs: list of X\n', '15:8',
+     "'X' flattens into more than 16 fields"),
     # Formats, joins, slices, lets of bytes and text, while (Pure 027's stage 2a).
     ('state t: text\nstate n = 0\non frame {\n  t = "{n:08q}"\n}\n', '4:11', 'a format is [0][width][.digits][d x X b o f]'),
     ('state t: text\nstate n = 0\non frame {\n  t = "{n:.2x}"\n}\n', '4:11', 'digits after the point go with f'),
@@ -185,7 +212,7 @@ DIAGNOSTICS = [
     # records, lists and indices
     ('record T {\n  a = 0\n  a = 1\n}\n', '3:3', "duplicate field 'a'"),
     ('record T {\n}\n', '1:8', 'a record needs at least one field'),
-    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0), a bool (field = false), text (field: text) or an i64 (field: i64)'),
+    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0), a bool (field = false), text (field: text), an i64 (field: i64), a record'),
     ('record T {\n  a = 0\n}\nstate T = 0\n', '4:7', "'T' is already declared as a record"),
     ('state xs: list of Missing\n', '1:7', "a list holds a record; 'Missing' is not one"),
     ('state x = 0\nstate at: index of x\n', '2:7', "an index points into a list state; 'x' is not one"),
@@ -193,7 +220,7 @@ DIAGNOSTICS = [
     (RECORD + 'state xs: list of T\nstate ys: list of T\nstate at: index of xs\nview v = ys[at].a\n', '7:13',
      "an index of 'xs' cannot point into 'ys'"),
     (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at].b\n', '6:10', "record 'T' has no field 'b'"),
-    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at]\n', '6:10', 'read a field of the item'),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at]\n', '6:10', 'a view is a number, a bool, an i64 or text, not an index'),
     (RECORD + 'state xs: list of T\nview v = xs\n', '5:10', "'xs' is a list; read xs.count"),
     (RECORD + 'state xs: list of T\nview v = xs.size\n', '5:10', "a list has count, first and last, not 'size'"),
     (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number, a bool, an i64 or text, not an index'),
@@ -245,7 +272,7 @@ DIAGNOSTICS = [
     ('use missing\n', '1:5', "cannot find library 'missing' (missing.aup)"),
     ('view v = shapes.area(1, 2)\n', '1:17', "unknown library 'shapes'; write use shapes first"),
     (LIST + 'view v = count(x in xs where count(y in xs) > 0)\n', '6:30', 'a count, sum, max or min cannot hold another'),
-    (LIST + 'view v = count(x in at)\n', '6:10', "'at' is not a list"),
+    (LIST + 'view v = count(x in at)\n', '6:10', "'at' is a list index, not a list"),
     ('record T {\n  t: text\n}\nstate xs: list of T\nview v = sum(x.t for x in xs)\n', '5:14',
      'sum, max, min and distinct take numbers or i64s, not text'),
     (LIST + 'fn f(n) = count(x in xs where x.a == n)\nview v = f(1)\n', '6:38',
@@ -409,7 +436,10 @@ DIAGNOSTICS = [
      'an i64 is a whole number; this one is not'),
 ]
 
+NESTED = 'variant Json {\n  null\n  bool(bool)\n  num(number)\n  str(text)\n  arr(list of Json)\n  obj(list of Member)\n}\nrecord Member {\n  name: text\n  value: Json\n}\nrecord Point {\n  x = 0\n  y = 0\n}\nrecord Box {\n  at: Point\n  tag: text\n}\nstate boxes: list of Box\nstate total = 0\nstate chars = 0\nstate nulls = 0\nstate trues = 0\nstate corner = 0\ninput go = key KeyG\non go.down {\n  let docs: list of Json\n  docs.append(Json.num(3))\n  docs.append(Json.str("hi"))\n  docs.append(Json.null)\n  let kids: list of Json\n  kids.append(Json.num(1))\n  kids.append(Json.num(2))\n  docs.append(Json.arr(kids))\n  docs.last.arr.append(Json.num(10))\n  let ms: list of Member\n  ms.append(Member { name: "a", value: Json.bool(true) })\n  ms.append(Member { name: "b", value: Json.arr([]) })\n  docs.append(Json.obj(ms))\n  for d in docs {\n    match d {\n      num(n) => total = total + n\n      str(t) => chars = chars + t.chars\n      null => nulls = nulls + 1\n      arr(items) => {\n        for y in items {\n          match y {\n            num(n) => total = total + n\n            _ => nulls = nulls + 100\n          }\n        }\n      }\n      obj(members) => {\n        for m in members {\n          match m.value {\n            bool(b) => trues = trues + (if b { 1 } else { 0 })\n            arr(xs) => chars = chars + xs.count * 1000\n            _ => nulls = nulls + 1000\n          }\n        }\n      }\n      bool(b) => nulls = nulls + 10000\n    }\n  }\n  boxes.append(Box { at: Point { x: 1, y: 2 }, tag: "a" })\n  corner = boxes.last.at.x * 10 + boxes.last.at.y + docs.count * 100\n}\n'
 ACCEPTED = [
+    # Records in records, variants, lists in records, match, appends into a field's list (Pure 027's 2b).
+    NESTED,
     # Formats, joins, slices, lets of bytes and text appended to, while, && and || that decide alone (Pure 027's 2a).
     'state t: text\nstate n = 0\nstate y: i64\ninput m = message { d: bytes }\n'
     'on m {\n  let s = "" + "{n:5}{y:08x}{n:.2f}{y:X}{true:6}"\n  let b = m.d[0 .. 0] + byte(0x41)\n  b = b + m.d\n'
@@ -1358,6 +1388,25 @@ def formats_and_texts(aup, pure_run, work, apps=6, per_app=24):
     return {'formats': apps * per_app, 'events': checked, 'faults': faults, 'cuts': len(samples)}
 
 
+def nested_values(aup, pure_run, work):
+    """Pure 027's 2b: an event builds values of a variant (numbers, a string, null, an array made of a let's list and
+    appended to through its field, an object of members whose values are variants), walks them with match, and stores
+    a record holding a record (its fields by path). The same every event (the lists in records go as each ends); a
+    failing event leaves nothing."""
+    path = work / 'nested.aup'
+    path.write_text(NESTED + 'input bad = key KeyB\non bad.down {\n  let xs: list of Json\n  xs.append(Json.num(1))\n'
+                    '  total = total + 1\n  xs.last.arr.append(Json.num(2))\n  require total < 0\n}\n')
+    compile_module(aup, path, work / 'nested.pmod')
+    lines = run(pure_run, work / 'nested.pmod', stdin='down go\ndown go\ndown bad\n', check=False).stdout.splitlines()
+    first, second, bad = (json.loads(line) for line in lines)
+    assert first['fault'] == 'none' and first['states']['total'] == 16 and first['states']['chars'] == 2, first
+    assert first['states']['nulls'] == 1 and first['states']['trues'] == 1 and first['states']['corner'] == 512, first
+    assert first['states']['boxes'] == [{'at.x': 1, 'at.y': 2, 'tag': 'a'}], first['states']['boxes']
+    assert second['states']['total'] == 32 and second['states']['corner'] == 512, second
+    assert bad['fault'] == 'limit' and bad['states'] == second['states'], bad
+    return {'events': 3}
+
+
 def computing(aup, pure_run, work, graphs=20):
     """Computing in one event (Pure 018): examples/routes.aup's searches
     over random graphs (breadth first, depth first, nearest by weight) and
@@ -2165,6 +2214,7 @@ def main():
         report['computing'] = computing(aup, pure_run, work)
         report['bits_and_bytes'] = bits_and_bytes(aup, pure_run, work)
         report['formats_and_texts'] = formats_and_texts(aup, pure_run, work)
+        report['nested_values'] = nested_values(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))
