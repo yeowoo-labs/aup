@@ -3,9 +3,6 @@ state digest: text
 input hash = message { data: bytes }
 
 fn rotr(x, n) = (x >> n | x << (32 - n)) & 0xffffffff
-# The byte at j of the message padded to whole blocks: 0x80 after it, its length in bits in the last 8.
-fn padded(data, size, total, j) = (if j < size { data[j] } else if j == size { 0x80 }
-  else if j >= total - 8 { i64(size) * 8 >> 8 * (total - 1 - j) & 0xff } else { 0 })
 
 on hash {
   let k: list of i64 = [
@@ -22,13 +19,13 @@ on hash {
     0x1f83d9ab, 0x5be0cd19
   let w: list of i64
   for t in 0 .. 64 { w.append(0) }
-  let size = hash.data.bytes
-  let total = (floor((size + 8) / 64) + 1) * 64
-  for block in 0 .. total / 64 {
+  let m = hash.data + byte(0x80)                 # padded: 0x80, zeros, the length in bits in the last 8 bytes
+  while m.bytes % 64 != 56 { m = m + byte(0) }
+  for s in 0 .. 8 { m = m + byte(i64(hash.data.bytes) * 8 >> 56 - 8 * s & 0xff) }
+  for block in 0 .. m.bytes / 64 {
     for t in 0 .. 16 {
       let j = block * 64 + t * 4
-      w[t] = (padded(hash.data, size, total, j) << 24 | padded(hash.data, size, total, j + 1) << 16 |
-              padded(hash.data, size, total, j + 2) << 8 | padded(hash.data, size, total, j + 3))
+      w[t] = m[j] << 24 | m[j + 1] << 16 | m[j + 2] << 8 | m[j + 3]
     }
     for t in 16 .. 64 {
       let x = w[t - 15]
@@ -44,13 +41,5 @@ on hash {
     h0, h1, h2, h3 = (h0 + a) & 0xffffffff, (h1 + b) & 0xffffffff, (h2 + c) & 0xffffffff, (h3 + d) & 0xffffffff
     h4, h5, h6, h7 = (h4 + e) & 0xffffffff, (h5 + f) & 0xffffffff, (h6 + g) & 0xffffffff, (h7 + hh) & 0xffffffff
   }
-  let h: list of i64 = [h0, h1, h2, h3, h4, h5, h6, h7]
-  let hex: list of i64
-  for i in 0 .. 8 {
-    for s in 0 .. 8 {
-      let nibble = h[i] >> 28 - 4 * s & 0xf
-      hex.append(if nibble < 10 { 48 + nibble } else { 87 + nibble })
-    }
-  }
-  digest = text(bytes(hex))
+  digest = "{h0:08x}{h1:08x}{h2:08x}{h3:08x}{h4:08x}{h5:08x}{h6:08x}{h7:08x}"
 }

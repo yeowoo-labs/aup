@@ -21,7 +21,11 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
        LOCAL_LOAD, LOCAL_STORE, I64_ADD, I64_SUB, I64_MUL, I64_DIV, I64_MOD, I64_NEG, I64_COMPARE, I64_MIN, I64_MAX,
-       I64_FROM, NUM_FROM, LOOP, BREAK, I64_BITS, BYTE_AT, BYTES_OF, INDEX_AT };
+       I64_FROM, NUM_FROM, LOOP, BREAK, I64_BITS, BYTE_AT, BYTES_OF, INDEX_AT, BYTES_SLICE, BYTE, BYTES_LOAD, BYTES_STORE };
+/* Pure's values held by name: 0-15 bytes, 16-31 texts; BYTES_STORE's bit 8 appends. NUM_TEXT's format (Pure 027). */
+enum { HELD = 16, HELD_TEXT = 16, HELD_APPEND = 1 << 8 };
+enum { FORMAT_WIDTH = 8, FORMAT_ZEROS = 1 << 16, FORMAT_FORM = 17, FORMAT_DIGITS = 20,
+       FORM_DECIMAL = 1, FORM_HEX, FORM_HEX_UPPER, FORM_BINARY, FORM_OCTAL, FORM_FIXED };
 /* Bit operations (Pure's I64_BITS by its argument), apart from the opcodes: ~x is x ^ -1. */
 enum { BIT_AND = 0x100, BIT_OR, BIT_XOR, BIT_LEFT, BIT_RIGHT, BIT_NOT };
 enum { LOCALS = 64 }; /* an event's locals (Pure's) */
@@ -77,6 +81,7 @@ typedef struct Expr {
     double number;
     int64_t integer; /* E_NUMBER: as its token's */
     bool whole, wide, hex;
+    uint32_t format; /* a part of a string: how NUM_TEXT writes it ({x:08x}), past its type */
     char name[NAME], member[NAME];
     struct Expr *args[PARAMS], *next;
     unsigned count;
@@ -212,7 +217,9 @@ typedef struct {
     /* A handler's locals in scope (let), innermost last, and the slots it used. A let's list (list: its
      * state) has no slot; a for's count (counter) is read, never assigned. */
     struct { char name[NAME]; unsigned slot; Kind kind; int list; bool counter; } locals[LOCALS];
-    unsigned local_count, local_slots;
+    unsigned local_count, local_slots, held_bytes, held_texts; /* held: the bytes' and texts' lets' slots */
+    unsigned whiles; /* while loops so far: each counts by a name of its own */
+    const struct Expr *given; /* the left side of the && or || whose right side faultless looks at */
     /* The fors whose blocks are being generated, innermost last: the item's or count's name, the list a walk
      * walks (-1: a count), and the index local an outer walk's item is kept in for the fors inside it (-1: none). */
     struct { char name[NAME]; int list, item; Scope *scope; } loops[NESTING];
@@ -246,7 +253,7 @@ static const char *const reserved[] = {"state", "input", "view", "on", "if", "el
                                        "dt", "min", "max", "clamp", "message", "by", "bytes", "u32",
                                        "reply", "require", "record", "each", "fn", "use", "now", "every",
                                        "floor", "output", "send", "for", "let", "true", "false",
-                                       "transient", "break", "return"};
+                                       "transient", "break", "return", "while"};
 
 /* An error in the module being parsed or inlined; inside a fn it names the call. */
 static _Noreturn void fail_at(Compiler *c, int line, int column, const char *format, ...) {
@@ -553,6 +560,12 @@ static Expr *postfix(Compiler *c, Expr *e) {
         item->args[0] = expression(c, 0, true);
         item->count = 1;
         newlines(c);
+        if (is(c, "..")) { /* data[a .. c]: a slice of a value's bytes */
+            take(c);
+            item->args[1] = expression(c, 0, true);
+            item->count = 2;
+            newlines(c);
+        }
         expect(c, "]", "']'");
         if (is(c, ".")) {
             take(c);
@@ -561,13 +574,19 @@ static Expr *postfix(Compiler *c, Expr *e) {
         e = item;
     }
     while (is(c, ".") || is(c, "[")) {
-        if (is(c, "[")) { /* packet.data[i]: the byte at a position */
+        if (is(c, "[")) { /* packet.data[i]: the byte at a position; data[a .. c] its bytes from a up to before c */
             Token open = take(c);
             Expr *at = node(c, E_INDEX, open.line, open.column);
             at->args[0] = e;
             at->args[1] = expression(c, 0, true);
             at->count = 2;
             newlines(c);
+            if (is(c, "..")) {
+                take(c);
+                at->args[2] = expression(c, 0, true);
+                at->count = 3;
+                newlines(c);
+            }
             expect(c, "]", "']'");
             e = at;
             continue;
@@ -591,6 +610,31 @@ static Expr *postfix(Compiler *c, Expr *e) {
         e = access;
     }
     return e;
+}
+
+/* A format after ':' in a string's braces, as Python's: [0][width][.digits][d x X b o f]; how NUM_TEXT writes it. */
+static uint32_t format_of(Compiler *c, const char *text, size_t length, int line, int column) {
+    size_t at = 0;
+    uint32_t format = 0, width = 0, digits = 0, form = 0;
+    if (at < length && text[at] == '0') format |= FORMAT_ZEROS, ++at;
+    while (at < length && digit(text[at]) && width <= 255) width = width * 10 + (uint32_t)(text[at++] - '0');
+    if (width > 255) fail_at(c, line, column, "a format's width is at most 255");
+    if (at < length && text[at] == '.') {
+        ++at;
+        if (at == length || !digit(text[at])) fail_at(c, line, column, "a format's '.' takes the digits after the point, as in .2f");
+        while (at < length && digit(text[at]) && digits <= 30) digits = digits * 10 + (uint32_t)(text[at++] - '0');
+        if (digits > 30) fail_at(c, line, column, "a format shows at most 30 digits after the point");
+        ++digits; /* Pure's: one more, 0 meaning none */
+    }
+    if (at < length) {
+        const char *forms = "dxXbof", *found = strchr(forms, text[at]);
+        if (!found || !text[at]) fail_at(c, line, column, "a format is [0][width][.digits][d x X b o f], as in 08x or .2f");
+        form = (uint32_t)(found - forms) + FORM_DECIMAL;
+        ++at;
+    }
+    if (at != length) fail_at(c, line, column, "a format is [0][width][.digits][d x X b o f], as in 08x or .2f");
+    if (digits && form != FORM_FIXED) fail_at(c, line, column, "digits after the point go with f, as in .2f");
+    return format | width << FORMAT_WIDTH | form << FORMAT_FORM | digits << FORMAT_DIGITS | 0x80000000u; /* written */
 }
 
 /* "text {expression} more": literal parts and expressions, escapes decoded. */
@@ -622,8 +666,10 @@ static Expr *string(Compiler *c, const Token *token) {
             int saved_line = c->line, saved_column = c->column;
             Token saved_token = c->token, saved_ahead = c->ahead;
             bool saved_has_ahead = c->has_ahead;
+            size_t colon = at + 1; /* {value:format}: the format after the first ':' */
+            while (colon < close && c->source[colon] != ':') ++colon;
             c->at = at + 1;
-            c->length = close;
+            c->length = colon;
             c->line = token->line;
             c->column = column + 1;
             c->has_ahead = false;
@@ -631,6 +677,8 @@ static Expr *string(Compiler *c, const Token *token) {
             if (c->token.kind == T_EOF) fail_at(c, token->line, column, "empty {expression}");
             Expr *part = expression(c, 0, false);
             if (c->token.kind != T_EOF) fail_at(c, c->token.line, c->token.column, "expected '}'");
+            if (colon < close) part->format = format_of(c, c->source + colon + 1, close - colon - 1, token->line,
+                                                       token->column + 1 + (int)(colon + 1 - token->start));
             c->at = saved_at;
             c->length = saved_length;
             c->line = saved_line;
@@ -819,7 +867,7 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     } else if (token.kind == T_NAME) {
         static const struct { const char *name; unsigned count; int op; } calls[] =
             {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM},
-             {"floor", 1, FLOOR}, {"i64", 1, I64_FROM}, {"number", 1, NUM_FROM}};
+             {"floor", 1, FLOOR}, {"i64", 1, I64_FROM}, {"number", 1, NUM_FROM}, {"byte", 1, BYTE}};
         int call = -1, how = -1;
         for (int i = 0; i < (int)(sizeof(calls) / sizeof(*calls)); ++i) if (!strcmp(token.text, calls[i].name)) call = i;
         static const char *const folds[] = {"count", "sum", "max", "min", "first", "distinct"};
@@ -1132,6 +1180,33 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         }
         expect(c, "=", "'='");
         s->value = expression(c, 0, false);
+        return s;
+    }
+    if (!strcmp(token.text, "while")) {
+        /* while condition { ... }: a count from 0 up to 2^53 whose block begins if !condition { break }; the budget ends
+         * one that never stops */
+        s->kind = S_COUNT;
+        snprintf(s->name, NAME, "while.%u", c->whiles++);
+        s->low = node(c, E_NUMBER, token.line, token.column);
+        s->low->whole = true;
+        s->high = node(c, E_NUMBER, token.line, token.column);
+        s->high->number = 9007199254740992.0;
+        s->high->integer = INT64_C(9007199254740992);
+        s->high->whole = true;
+        Stmt *check = allocate(c, sizeof(*check)), *stop = allocate(c, sizeof(*stop));
+        check->kind = S_IF;
+        check->line = token.line, check->column = token.column;
+        Expr *not = node(c, E_UNARY, token.line, token.column);
+        not->op = NOT;
+        memcpy(not->member, "while", 6); /* what takes the bool, for its message */
+        not->args[0] = expression(c, 0, false);
+        not->count = 1;
+        check->value = not;
+        stop->kind = S_BREAK;
+        stop->line = token.line, stop->column = token.column;
+        check->then = stop;
+        check->next = block(c, depth + 1);
+        s->then = check;
         return s;
     }
     if (!strcmp(token.text, "break")) { /* ends the innermost for */
@@ -2384,6 +2459,80 @@ static uint32_t local_arg(const Compiler *c, int local) {
 }
 
 /* Emit an expression; height is the stack height before it. */
+/* Whether e cannot fail, as far as its form shows (conservative: any read that may find nothing, any arithmetic that
+ * may pass its range, any conversion or call may). && and || compute their right side only where it decides, and
+ * where it cannot fail they compute it anyway (one AND or OR). */
+static Type probe(Compiler *c, const Expr *e, bool handler, int height);
+
+/* Whether two expressions are written the same (and so compute the same: expressions change nothing). */
+static bool same_expr(const Expr *a, const Expr *b) {
+    if (!a || !b) return a == b;
+    if (a->kind != b->kind || a->op != b->op || a->count != b->count || strcmp(a->name, b->name) || strcmp(a->member, b->member) ||
+        memcmp(&a->number, &b->number, sizeof(a->number)) || a->hex != b->hex || a->format != b->format || a->size != b->size ||
+        (a->size && memcmp(a->bytes, b->bytes, a->size)))
+        return false;
+    for (unsigned i = 0; i < PARAMS; ++i) if (!same_expr(a->args[i], b->args[i])) return false;
+    return same_expr(a->next, b->next);
+}
+
+/* Whether x is computed whenever in is (not in a branch of in's: an if's, or the right side of && and ||). */
+static bool computed_in(const Expr *x, const Expr *in) {
+    if (!in) return false;
+    if (same_expr(x, in)) return true;
+    if (in->kind == E_IF) return computed_in(x, in->args[0]);
+    if (in->kind == E_BINARY && (in->op == AND || in->op == OR)) return computed_in(x, in->args[0]);
+    if (in->kind == E_STRING) {
+        for (const Expr *part = in->args[0]; part; part = part->next) if (computed_in(x, part)) return true;
+        return false;
+    }
+    for (unsigned i = 0; i < in->count && i < PARAMS; ++i) if (computed_in(x, in->args[i])) return true;
+    return false;
+}
+
+static bool faultless(Compiler *c, const Expr *e) {
+    if (c->given && computed_in(e, c->given)) return true; /* the left side computed it: had it failed, so had the left */
+    switch (e->kind) {
+    case E_NUMBER: case E_BOOL: case E_TEXT: case E_DT: case E_NOW: return true;
+    case E_NAME: /* a state, a let, a parameter, an argument, an item a walk or a fold runs for; not a fn's value */
+        return parameter(c, e->name) >= 0 || fn_index(c, c->module, e->name) < 0;
+    case E_STRING:
+        for (const Expr *part = e->args[0]; part; part = part->next)
+            if (!faultless(c, part) || (part->format & 0x7FFFFFFFu) >> FORMAT_FORM & 7) return false; /* a form may refuse */
+        return true;
+    case E_MEMBER: { /* a message's field, a list's count, a text's length; a field of the item a walk or fold runs for */
+        const Expr *base = e->args[0];
+        if (!strcmp(e->member, "count") || !strcmp(e->member, "chars") || !strcmp(e->member, "lines") ||
+            !strcmp(e->member, "bytes") || !strcmp(e->member, "position"))
+            return faultless(c, base);
+        if (base->kind != E_NAME) return false;
+        int input;
+        char path[NAME];
+        if (message_path(c, e, &input, path)) return true;
+        return (c->folding && !strcmp(base->name, c->fold_name)) || loop_named(c, base->name) >= 0 ||
+               (c->row >= 0 && !strcmp(base->name, c->view_row[c->row]));
+    }
+    case E_UNARY: return e->op == NOT && faultless(c, e->args[0]);
+    case E_BINARY:
+        if (e->op >= LT && e->op <= NE) return faultless(c, e->args[0]) && faultless(c, e->args[1]);
+        if (e->op == AND || e->op == OR || e->op == BIT_AND || e->op == BIT_OR || e->op == BIT_XOR)
+            return faultless(c, e->args[0]) && faultless(c, e->args[1]);
+        if ((e->op == ADD || e->op == SUB) && e->args[1]->kind != E_UNIT) {
+            /* a finite number and a literal below 2^969 cannot sum past the largest finite one (it rounds to it) */
+            for (unsigned k = 0; k < 2; ++k) {
+                const Expr *literal = e->args[k], *other = e->args[1 - k];
+                if (literal->kind == E_NUMBER && !literal->hex && fabs(literal->number) < 0x1p969 && faultless(c, other) &&
+                    probe(c, other, c->handling, 0) == NUM)
+                    return true;
+            }
+        }
+        return false; /* arithmetic may pass its range, a shift its count */
+    case E_CALL: return (e->op == MIN || e->op == MAX || e->op == FLOOR) && faultless(c, e->args[0]) &&
+                        (e->count < 2 || faultless(c, e->args[1]));
+    case E_IF: return faultless(c, e->args[0]) && faultless(c, e->args[1]) && faultless(c, e->args[2]);
+    default: return false;
+    }
+}
+
 static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     Type want = c->want; /* set by wanted() for this expression alone */
     c->want = 0;
@@ -2412,8 +2561,14 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         int pieces = 0;
         for (const Expr *part = e->args[0]; part; part = part->next) {
             Kind kind = value(c, part, handler, height + (pieces > 0));
+            uint32_t format = part->format & 0x7FFFFFFFu, form = format >> FORMAT_FORM & 7;
+            if (part->format && kind.type != NUM && kind.type != BOOL && kind.type != I64)
+                fail_at(c, part->line, part->column, "a format writes a number, a bool or an i64, not %s", type_name(kind.type));
+            if (kind.type == BOOL && form) fail_at(c, part->line, part->column, "a bool's format is a width alone");
+            if (kind.type == I64 && form == FORM_FIXED)
+                fail_at(c, part->line, part->column, "f writes a number; an i64 is written as one by number(i)");
             if (kind.type == NUM || kind.type == BOOL || kind.type == I64)
-                emit(c, part->line, part->column, NUM_TEXT, kind.type == BOOL ? 1 : kind.type == I64 ? 2 : 0, 0);
+                emit(c, part->line, part->column, NUM_TEXT, (kind.type == BOOL ? 1u : kind.type == I64 ? 2u : 0u) | format, 0);
             else if (kind.type != TEXT)
                 fail_at(c, part->line, part->column, "a string shows numbers, bools, i64s and text, not %s", type_name(kind.type));
             if (pieces++) emit(c, part->line, part->column, CONCAT, 0, 0);
@@ -2446,7 +2601,9 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
         int local = c->scope ? -1 : local_named(c, e->name);
         if (local >= 0) { /* a let in the handler */
-            emit(c, e->line, e->column, LOCAL_LOAD, local_arg(c, local), 0);
+            if (c->locals[local].kind.type == BYTES || c->locals[local].kind.type == TEXT)
+                emit(c, e->line, e->column, BYTES_LOAD, c->locals[local].slot, 0);
+            else emit(c, e->line, e->column, LOCAL_LOAD, local_arg(c, local), 0);
             return c->locals[local].kind;
         }
         if (!c->scope && c->arguments >= 0) { /* an argument of the view (a table's, in its columns and filter) */
@@ -2620,14 +2777,17 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     case E_ITEM: {
         int named = c->module || parameter(c, e->name) >= 0 ? -1 : state_index(c, e->name);
         if (!*e->member && (named < 0 || c->state_types[named] != STATE_LIST) && collection_index(c, e->name) < 0) {
-            Expr name = *e, at = *e; /* data[i]: a parameter's, an argument's or a state's byte */
+            Expr name = *e, at = *e; /* data[i]: a parameter's, an argument's, a let's or a state's byte; data[a .. c] */
             name.kind = E_NAME;
+            name.count = 0;
             at.kind = E_INDEX;
             at.args[0] = &name;
             at.args[1] = e->args[0];
-            at.count = 2;
+            at.args[2] = e->count == 2 ? e->args[1] : NULL;
+            at.count = e->count + 1;
             return value(c, &at, handler, height);
         }
+        if (e->count == 2) fail_at(c, e->line, e->column, "a list's slice goes in a for or a fold, as in for x in %s[a .. b]", e->name);
         app_name(c, e, e->name);
         int list = list_state(c, e->name, e->line, e->column, e->args[0]);
         const Record *r = record_of(c, list);
@@ -2653,6 +2813,20 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     }
     case E_INDEX: {
         Kind base = value(c, e->args[0], handler, height);
+        if (e->count == 3) { /* b[a .. c]: bytes, or a text's (whose cut must fall between characters) */
+            if (base.type != BYTES && base.type != TEXT)
+                fail_at(c, e->line, e->column, "only bytes and texts are sliced, not %s", type_name(base.type));
+            if (base.type == TEXT) emit(c, e->line, e->column, BYTES_FROM, 0, 0);
+            Kind low = value(c, e->args[1], handler, height + 1);
+            if (low.type != NUM && low.type != I64)
+                fail_at(c, e->args[1]->line, e->args[1]->column, "a position is a number or an i64, not %s", type_name(low.type));
+            Kind high = wanted(c, e->args[2], handler, height + 2, low.type);
+            if (high.type != low.type)
+                fail_at(c, e->args[2]->line, e->args[2]->column, "a slice's ends are both numbers or both i64s");
+            emit(c, e->line, e->column, BYTES_SLICE, low.type == I64, 0);
+            if (base.type == TEXT) emit(c, e->line, e->column, TEXT_FROM, 0, 0);
+            return (Kind){base.type, -1};
+        }
         if (base.type == TEXT)
             fail_at(c, e->line, e->column, "a text is read by position through its bytes, as in bytes(t)[i]");
         if (base.type != BYTES) fail_at(c, e->line, e->column, "only bytes are read by position, not %s", type_name(base.type));
@@ -2749,6 +2923,15 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             /* at + 1 char moves a cursor, at + 1 an index; both stop at the ends. */
             bool distance = e->args[1]->kind == E_UNIT;
             Kind left = wanted(c, e->args[0], handler, height, distance ? 0 : left_hint(c, e, handler, height, want));
+            if (!distance && (left.type == BYTES || left.type == TEXT)) { /* joined */
+                if (e->op == SUB) fail_at(c, e->line, e->column, "texts and bytes are joined with +; - takes nothing apart");
+                Kind right = value(c, e->args[1], handler, height + 1);
+                if (right.type != left.type)
+                    fail_at(c, e->args[1]->line, e->args[1]->column, "%s joins %s, not %s", type_name(left.type), type_name(left.type),
+                            type_name(right.type));
+                emit(c, e->line, e->column, CONCAT, left.type == BYTES, 0);
+                return left;
+            }
             if (distance && left.type != CURSOR)
                 fail_at(c, e->line, e->column, "only a cursor moves by a distance, not %s", type_name(left.type));
             if (distance || left.type == INDEX) {
@@ -2804,11 +2987,39 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         /* !, && and || take bools (both sides are computed); *, /, %, min and
          * max numbers or i64s; clamp and floor numbers. */
         bool logic = e->op == AND || e->op == OR || e->op == NOT;
+        const Expr *outer = c->given;
+        c->given = e->args[0];
+        bool eager = (e->op != AND && e->op != OR) || faultless(c, e->args[1]);
+        c->given = outer;
+        if (!eager) {
+            /* a && b is false and a || b true without b once a says so: b, which could fail, then runs only where it
+             * decides (a branch; where b cannot fail, AND and OR give the same and compute both) */
+            truth(c, e->args[0], handler, height, e->op == AND ? "&&" : "||");
+            unsigned skip = c->code_count;
+            emit(c, e->line, e->column, JZ, 0, 0);
+            if (height && ++c->joins > JOINS) fail_at(c, e->line, e->column, "conditional expressions nest too deeply");
+            if (e->op == AND) truth(c, e->args[1], handler, height, "&&");
+            else emit(c, e->line, e->column, CONST, 1, 1);
+            unsigned end = c->code_count;
+            emit(c, e->line, e->column, JMP, 0, 0);
+            if (++c->joins > JOINS) fail_at(c, e->line, e->column, "conditional expressions nest too deeply");
+            c->code[skip].arg = c->code_count;
+            if (e->op == AND) emit(c, e->line, e->column, CONST, 1, 0);
+            else truth(c, e->args[1], handler, height, "||");
+            c->code[end].arg = c->code_count;
+            c->joins -= 1 + (height > 0);
+            return (Kind){BOOL, -1};
+        }
         if (logic) {
             for (unsigned i = 0; i < e->count; ++i)
-                truth(c, e->args[i], handler, height + (int)i, e->op == NOT ? "!" : e->op == AND ? "&&" : "||");
+                truth(c, e->args[i], handler, height + (int)i, *e->member ? e->member : e->op == NOT ? "!" : e->op == AND ? "&&" : "||");
             emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
             return (Kind){BOOL, -1};
+        }
+        if (e->op == BYTE) { /* byte(n): one byte, n an i64 0-255 */
+            integer(c, e->args[0], handler, height);
+            emit(c, e->line, e->column, BYTE, 0, 0);
+            return (Kind){BYTES, -1};
         }
         if (e->op == I64_FROM) { /* i64(x): a whole number in range; a literal is one exactly */
             if (loose(e->args[0])) integer(c, e->args[0], handler, height);
@@ -2998,6 +3209,13 @@ static void view_changes(Compiler *c, const Stmt *s, int list, const char *name)
         fail_at(c, s->line, s->column, "a view's body changes only its lets and its own lists, not '%s'", name);
 }
 
+/* A slot for a let of bytes or text (Pure's: 0-15 bytes, 16-31 texts), the handler's next. */
+static unsigned held_slot(Compiler *c, const Stmt *s, Type type) {
+    unsigned *count = type == BYTES ? &c->held_bytes : &c->held_texts;
+    if (*count == HELD) fail_at(c, s->line, s->column, "at most %d lets of %s are allowed in a handler", HELD, type_name(type));
+    return (type == TEXT ? HELD_TEXT : 0) + (*count)++;
+}
+
 static void statements(Compiler *c, const Stmt *s) {
     unsigned scope = c->local_count; /* a block's lets end with it */
     for (; s; s = s->next) {
@@ -3031,8 +3249,19 @@ static void statements(Compiler *c, const Stmt *s) {
             }
             if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
             Kind held = value(c, s->value, c->handling, 0);
+            if (held.type == BYTES || held.type == TEXT) { /* held by name in Pure: a slot of its own */
+                unsigned slot = held_slot(c, s, held.type);
+                unsigned local = c->local_count++;
+                memset(&c->locals[local], 0, sizeof(c->locals[local]));
+                memcpy(c->locals[local].name, s->name, NAME);
+                c->locals[local].slot = slot;
+                c->locals[local].kind = held;
+                c->locals[local].list = -1;
+                emit(c, s->line, s->column, BYTES_STORE, slot, 0);
+                break;
+            }
             if (held.type != NUM && held.type != BOOL && held.type != I64 && held.type != INDEX)
-                fail_at(c, s->value->line, s->value->column, "a let holds a number, a bool, an i64 or an index, not %s",
+                fail_at(c, s->value->line, s->value->column, "a let holds a number, a bool, an i64, an index, bytes or text, not %s",
                         type_name(held.type));
             unsigned local = c->local_count++;
             memcpy(c->locals[local].name, s->name, NAME);
@@ -3048,8 +3277,10 @@ static void statements(Compiler *c, const Stmt *s) {
             Kind kinds[STACK];
             for (unsigned i = 0; i < s->name_count; ++i, v = v->next) {
                 kinds[i] = value(c, v, c->handling, (int)i);
-                if (kinds[i].type != NUM && kinds[i].type != BOOL && kinds[i].type != I64 && kinds[i].type != INDEX)
-                    fail_at(c, v->line, v->column, "a let holds a number, a bool, an i64 or an index, not %s", type_name(kinds[i].type));
+                if (kinds[i].type != NUM && kinds[i].type != BOOL && kinds[i].type != I64 && kinds[i].type != INDEX &&
+                    kinds[i].type != BYTES && kinds[i].type != TEXT)
+                    fail_at(c, v->line, v->column, "a let holds a number, a bool, an i64, an index, bytes or text, not %s",
+                            type_name(kinds[i].type));
             }
             unsigned first = c->local_count;
             for (unsigned i = 0; i < s->name_count; ++i) {
@@ -3063,11 +3294,16 @@ static void statements(Compiler *c, const Stmt *s) {
                 unsigned local = c->local_count++;
                 memset(&c->locals[local], 0, sizeof(c->locals[local]));
                 memcpy(c->locals[local].name, name, NAME);
-                c->locals[local].slot = c->local_slots++;
+                bool held = kinds[i].type == BYTES || kinds[i].type == TEXT;
+                c->locals[local].slot = held ? held_slot(c, s, kinds[i].type) : c->local_slots++;
                 c->locals[local].kind = kinds[i];
                 c->locals[local].list = -1;
             }
-            for (unsigned i = s->name_count; i-- > 0;) emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, (int)(first + i)), 0);
+            for (unsigned i = s->name_count; i-- > 0;) {
+                const Kind *kind = &c->locals[first + i].kind;
+                if (kind->type == BYTES || kind->type == TEXT) emit(c, s->line, s->column, BYTES_STORE, c->locals[first + i].slot, 0);
+                else emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, (int)(first + i)), 0);
+            }
             break;
         }
         case S_ASSIGNS: {
@@ -3080,6 +3316,9 @@ static void statements(Compiler *c, const Stmt *s) {
                 if (locals[i] >= 0 && c->locals[locals[i]].counter)
                     fail_at(c, s->line, s->column, "'%s' is what this for counts; it is not assigned", name);
                 Kind want;
+                if (locals[i] >= 0 && (c->locals[locals[i]].kind.type == BYTES || c->locals[locals[i]].kind.type == TEXT))
+                    fail_at(c, s->line, s->column, "'%s' holds %s: it takes its value apart, as in %s = ...", name,
+                            type_name(c->locals[locals[i]].kind.type), name);
                 if (locals[i] >= 0) want = c->locals[locals[i]].kind;
                 else if (states[i] >= 0 && (c->state_types[states[i]] == STATE_NUM || c->state_types[states[i]] == STATE_BOOL ||
                                             c->state_types[states[i]] == STATE_I64)) {
@@ -3104,6 +3343,19 @@ static void statements(Compiler *c, const Stmt *s) {
             int local = local_named(c, s->name);
             if (local >= 0 && c->locals[local].counter)
                 fail_at(c, s->line, s->column, "'%s' is what this for counts; it is not assigned", s->name);
+            if (local >= 0 && (c->locals[local].kind.type == BYTES || c->locals[local].kind.type == TEXT)) {
+                /* s = s + e appends e to what s holds; else s holds the value */
+                const Expr *v = s->value;
+                bool append = v->kind == E_BINARY && v->op == ADD && v->args[0]->kind == E_NAME && !strcmp(v->args[0]->name, s->name) &&
+                              v->args[1]->kind != E_UNIT;
+                const Expr *given = append ? v->args[1] : v;
+                Kind kind = value(c, given, c->handling, 0);
+                if (kind.type != c->locals[local].kind.type)
+                    fail_at(c, given->line, given->column, "'%s' holds %s, not %s", s->name, type_name(c->locals[local].kind.type),
+                            type_name(kind.type));
+                emit(c, s->line, s->column, BYTES_STORE, c->locals[local].slot | (append ? HELD_APPEND : 0), 0);
+                break;
+            }
             if (local >= 0) { /* a let takes a new value of its kind */
                 Kind kind = wanted(c, s->value, c->handling, 0, c->locals[local].kind.type);
                 if (kind.type != c->locals[local].kind.type || (kind.type == INDEX && kind.owner != c->locals[local].kind.owner))
@@ -3666,7 +3918,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         c->view_code[i][0] = c->code_count;
         Kind kind;
         if (c->view_body[i]) { /* statements as a handler's, changing only its lets and lists, and the value returned */
-            c->local_count = c->local_slots = c->loop_count = c->nested = 0;
+            c->local_count = c->local_slots = c->loop_count = c->nested = c->held_bytes = c->held_texts = 0;
             c->handling = c->has_returned = false;
             statements(c, c->view_body[i]);
             kind = c->returned;
@@ -3684,7 +3936,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->handler_count; ++i) {
         int input = handler_input[i];
         c->message = input >= 0 && c->inputs[input].kind != KIND_KEY ? input : -1;
-        c->local_count = c->local_slots = c->loop_count = c->nested = 0;
+        c->local_count = c->local_slots = c->loop_count = c->nested = c->held_bytes = c->held_texts = 0;
         c->handler_code[i][0] = c->code_count;
         statements(c, c->handlers[i].body);
         c->handler_code[i][1] = c->code_count - c->handler_code[i][0];

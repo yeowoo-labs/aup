@@ -76,10 +76,28 @@ DIAGNOSTICS = [
     ('state a = 0\nstate b = 0\non frame {\n  a, b = 1\n}\n', '4:3', '2 names take 2 values, not 1'),
     ('state a = 0\non frame {\n  a, a = 1, 2\n}\n', '3:6', "'a' is named twice"),
     ('state s: text\nstate a = 0\non frame {\n  s, a = "x", 1\n}\n', '4:3', "'s' takes its value apart"),
-    ('state x = 0\non frame {\n  let a, b = 1, "s"\n}\n', '3:17', 'a let holds a number, a bool, an i64 or an index, not text'),
+    ('state t: text\nstate c: cursor in t\non frame {\n  let a, b = 1, c\n}\n', '4:17',
+     'a let holds a number, a bool, an i64, an index, bytes or text, not a cursor'),
     ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
      '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
     ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
+    # Formats, joins, slices, lets of bytes and text, while (Pure 027's stage 2a).
+    ('state t: text\nstate n = 0\non frame {\n  t = "{n:08q}"\n}\n', '4:11', 'a format is [0][width][.digits][d x X b o f]'),
+    ('state t: text\nstate n = 0\non frame {\n  t = "{n:.2x}"\n}\n', '4:11', 'digits after the point go with f'),
+    ('state t: text\non frame {\n  t = "{t:5}"\n}\n', '3:9', 'a format writes a number, a bool or an i64, not text'),
+    ('state t: text\non frame {\n  t = "{true:x}"\n}\n', '3:9', "a bool's format is a width alone"),
+    ('state t: text\nstate y: i64\non frame {\n  t = "{y:.2f}"\n}\n', '4:9', 'f writes a number'),
+    ('state t: text\non frame {\n  t = "{1:256}"\n}\n', '3:11', "a format's width is at most 255"),
+    ('state t: text\non frame {\n  t = t - "a"\n}\n', '3:9', 'texts and bytes are joined with +'),
+    ('state t: text\ninput m = message { d: bytes }\non m {\n  t = t + m.d\n}\n', '4:11', 'text joins text, not bytes'),
+    ('state t: text\non frame {\n  let s = "a"\n  s = 1\n}\n', '4:7', "'s' holds text, not a number"),
+    ('state t: text\non frame {\n  let a, b = "x", "y"\n  a, b = b, a\n}\n', '4:3', "'a' holds text: it takes its value apart"),
+    ('state n = 0\non frame {\n  while n {\n    n = n + 1\n  }\n}\n', '3:9', 'while takes a bool, not a number'),
+    ('record R {\n  v = 0\n}\nstate xs: list of R\nstate n = 0\non frame {\n  n = xs[0 .. 2]\n}\n', '7:7',
+     "a list's slice goes in a for or a fold"),
+    ('state n = 0\nview v = n[1 .. 2]\n', '2:10', 'only bytes and texts are sliced, not a number'),
+    ('state t: text\non frame {\n' + ''.join(f'  let b{i} = byte({i})\n' for i in range(17)) + '}\n', '19:7',
+     'at most 16 lets of bytes are allowed in a handler'),
     ('state x = 1\nstate x = 2\n', '2:7', "already declared as a state"),
     ('state a = b\n', '1:11', 'expected a numeric state initializer'),
     ('view v = dt\n', '1:10', 'dt is only available in handlers'),
@@ -307,7 +325,7 @@ DIAGNOSTICS = [
     # A let holds a number or an index for the rest of its block, in its handler.
     (LETS + 'on k.down {\n  let n = 1\n}\n', '10:7', "'n' is already declared as a state"),
     (LETS + 'on k.down {\n  let x = 1\n  let x = 2\n}\n', '11:7', "'x' is already a let here"),
-    (LETS + 'on k.down {\n  let x = t\n}\n', '10:11', 'a let holds a number, a bool, an i64 or an index, not text'),
+    (LETS + 'on k.down {\n  let x = t.start\n}\n', '10:11', 'a let holds a number, a bool, an i64, an index, bytes or text, not a cursor'),
     (LETS + 'on k.down {\n  let x = 1\n  x = xs.first\n}\n', '11:7', "'x' holds a number"),
     (LETS + 'on k.down {\n  let i = xs.first\n  i = ys.first\n}\n', '11:7', "'i' holds an index of its list"),
     (LETS + 'on k.down {\n  if n > 0 {\n    let x = 1\n  }\n  n = x\n}\n', '13:7', "unknown state 'x'"),
@@ -392,6 +410,12 @@ DIAGNOSTICS = [
 ]
 
 ACCEPTED = [
+    # Formats, joins, slices, lets of bytes and text appended to, while, && and || that decide alone (Pure 027's 2a).
+    'state t: text\nstate n = 0\nstate y: i64\ninput m = message { d: bytes }\n'
+    'on m {\n  let s = "" + "{n:5}{y:08x}{n:.2f}{y:X}{true:6}"\n  let b = m.d[0 .. 0] + byte(0x41)\n  b = b + m.d\n'
+    '  let i = 0\n  while i < b.bytes && b[i] != 0x2c {\n    s = s + text(b[i .. i + 1])\n    i = i + 1\n  }\n'
+    '  t = s[0 .. 2] + t\n  n = if i > 0 || b[0] == 0 { 1 } else { 0 }\n}\n'
+    'view v(d: bytes) = if d.bytes > 0 && d[0] == 1 { 1 } else { 0 }\n',
     # Bits and bytes (Pure 027's stage 1): hex, bit operations by Python's precedence, a byte of a message's bytes, of an
     # argument's and of a fn's parameter, lists of i64, number, bool and text with their elements, positions read and
     # written, a, b = b, a and let a, b = ..., bytes(xs).
@@ -1258,6 +1282,82 @@ def bits_and_bytes(aup, pure_run, work, apps=8, per_app=24):
     return {'expressions': apps * per_app, 'events': checked, 'faults': faults, 'bytes_events': len(wanted)}
 
 
+def formats_and_texts(aup, pure_run, work, apps=6, per_app=24):
+    """Pure 027's stage 2a. Random formats ({v:08x}, {x:.3f}, ...) of i64s
+    and numbers a message gives, against Python's format(): an integer's
+    form of a number that is not whole fails as limit, -0 is written as 0.
+    Then an app that cuts a message's bytes at commas into a text joined by
+    '|', counting with while and reading by position only where && decides
+    (an empty message reads nothing), against Python."""
+    import struct
+    rng = random.Random(272)
+    checked = faults = 0
+    for app in range(apps):
+        specs = []
+        for _ in range(per_app):
+            integer = rng.random() < 0.6
+            form = rng.choice('dxXbo' if integer else 'dxXbof')
+            width = rng.choice([0, 0, 1, 5, 8, 20])
+            zeros = width > 0 and rng.random() < 0.5
+            digits = rng.randrange(0, 11) if form == 'f' else None
+            spec = ('0' if zeros else '') + (str(width) if width else '') + (f'.{digits}' if digits is not None else '') + form
+            specs.append((integer, spec))
+        source = 'state t: text\n' + ''.join(f'input e{i} = message {{\n  v: i64\n  x: number\n}}\n' for i in range(per_app))
+        source += ''.join(f'on e{i} {{\n  t = "{{e{i}.{"v" if integer else "x"}:{spec}}}"\n}}\n' for i, (integer, spec) in enumerate(specs))
+        path = work / f'formats{app}.aup'
+        path.write_text(source)
+        compile_module(aup, path, work / f'formats{app}.pmod')
+        given, wanted = '', []
+        for i, (integer, spec) in enumerate(specs):
+            for _ in range(5):
+                v = rng.choice([rng.randrange(-(1 << 63), 1 << 63), rng.randrange(-1000, 1000), 0])
+                x = rng.choice([rng.uniform(-1e6, 1e6), float(rng.randrange(-5000, 5000)), rng.uniform(-1, 1), -0.0, 2.5, 1e20])
+                given += f'message e{i} {struct.pack("<qd", v, x).hex()}\n'
+                if integer:
+                    wanted.append((format(v, spec), 'none'))
+                elif spec.endswith('f'):
+                    wanted.append((format(x + 0.0 if x else 0.0, spec), 'none'))
+                elif x == int(x) and abs(x) <= 2 ** 53:
+                    wanted.append((format(int(x), spec), 'none'))
+                else:
+                    wanted.append((None, 'limit'))
+        lines = run(pure_run, work / f'formats{app}.pmod', stdin=given, check=False).stdout.splitlines()
+        assert len(lines) == len(wanted), (app, len(lines))
+        previous = ''
+        for line, (text, fault) in zip(lines, wanted):
+            state = json.loads(line)
+            assert state['fault'] == fault, (app, state, text, fault)
+            if fault == 'none':
+                assert state['states']['t'] == text, (app, state['states']['t'], text)
+                previous = text
+            else:
+                assert state['states']['t'] == previous
+                faults += 1
+            checked += 1
+
+    # Cut at commas: t is the fields joined by '|', n how many; an empty message reads nothing.
+    source = ('state t: text\nstate n = 0\ninput go = message { d: bytes }\n'
+              'on go {\n  let d = go.d\n  let out = ""\n  let i, start, fields = 0, 0, 0\n'
+              '  while i <= d.bytes {\n    if i == d.bytes || d[i] == 0x2c {\n'
+              '      out = out + (if fields > 0 { "|" } else { "" }) + text(d[start .. i])\n'
+              '      fields = fields + 1\n      start = i + 1\n    }\n    i = i + 1\n  }\n'
+              '  t = out\n  n = if d.bytes > 0 && d[0] == 0x2c { -fields } else { fields }\n}\n')
+    path = work / 'cuts.aup'
+    path.write_text(source)
+    compile_module(aup, path, work / 'cuts.pmod')
+    samples = [b'', b',', b'a', b'a,b', b'ab,,cd,', ',x'.encode(), 'é,ü'.encode()]
+    samples += [bytes(rng.choice(b'ab,') for _ in range(rng.randrange(0, 30))) for _ in range(60)]
+    given = ''.join(f"message go {d.hex() or '-'}\n" for d in samples)
+    lines = run(pure_run, work / 'cuts.pmod', stdin=given, check=False).stdout.splitlines()
+    for d, line in zip(samples, lines):
+        state = json.loads(line)
+        fields = d.split(b',')
+        want_n = -len(fields) if d[:1] == b',' else len(fields)
+        assert state['fault'] == 'none' and state['states']['t'] == '|'.join(f.decode() for f in fields) and \
+            state['states']['n'] == want_n, (d, state)
+    return {'formats': apps * per_app, 'events': checked, 'faults': faults, 'cuts': len(samples)}
+
+
 def computing(aup, pure_run, work, graphs=20):
     """Computing in one event (Pure 018): examples/routes.aup's searches
     over random graphs (breadth first, depth first, nearest by weight) and
@@ -2064,6 +2164,7 @@ def main():
         report['transients'] = transients(aup, pure_run, work)
         report['computing'] = computing(aup, pure_run, work)
         report['bits_and_bytes'] = bits_and_bytes(aup, pure_run, work)
+        report['formats_and_texts'] = formats_and_texts(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))
