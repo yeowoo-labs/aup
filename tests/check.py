@@ -78,10 +78,34 @@ DIAGNOSTICS = [
     ('state a = 0\non frame {\n  a, a = 1, 2\n}\n', '3:6', "'a' is named twice"),
     ('state s: text\nstate a = 0\non frame {\n  s, a = "x", 1\n}\n', '4:3', "'s' takes its value apart"),
     ('state t: text\nstate c: cursor in t\non frame {\n  let a, b = 1, c\n}\n', '4:17',
-     'a let holds a number, a bool, an i64, an index, bytes or text, not a cursor'),
+     'a let holds a number, a bool, an i64, an index, bytes, text, a list or a record, not a cursor'),
     ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
      '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
     ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
+    # Fns that call themselves, blocks, several values, records' values and characters (Pure 027's stage 2c).
+    ('fn f(n) = if n == 0 { 0 } else { f(n - 1) + 1 }\nstate x = 0\non frame {\n  x = f(3)\n}\n', '1:34',
+     "fn 'f' calls itself before a return gives its value: write its type"),
+    ('fn f(x) {\n  return x\n}\nview v = f(1)\n', '4:10', 'a view calls no fn with a block, nor one that calls itself'),
+    ('fn f(x) {\n  if x > 0 { return 1 }\n}\nstate y = 0\non frame {\n  y = f(1)\n}\n', '1:4',
+     "fn 'f' may end without giving its value: return it at the end"),
+    ('fn f(x) {\n  if x > 0 { return 1 }\n  return "a"\n}\nstate y = 0\non frame {\n  y = f(1)\n}\n', '3:3',
+     "fn 'f' gives 1 value here (text first), and 1 before (a number first)"),
+    ('fn f(x) {\n  return x\n  x = 2\n}\nstate y = 0\non frame {\n  y = f(1)\n}\n', '3:3',
+     'this is never run: the line before it returns or breaks'),
+    ('fn f(x) {\n  return x\n}\non frame {\n  f(1)\n}\n', '5:3', "'f' gives a number: name it, as in let x = f(...)"),
+    ('fn f(x) {\n  return x, x\n}\nstate y = 0\non frame {\n  let a = f(1)\n  y = a\n}\n', '6:11',
+     'this gives several values: name each, as in let a, b = ...'),
+    ('fn f(x) {\n  return x, x\n}\nstate y = 0\non frame {\n  let a, b, c = f(1)\n  y = a\n}\n', '6:17',
+     '3 names take 3 values, not 2'),
+    ('fn f(x) -> nope {\n  return x\n}\nstate y = 0\non frame {\n  y = f(1)\n}\n', '1:12', "unknown type 'nope'"),
+    ('state t: text\nstate at: cursor in t\nfn f(x) {\n  return 1\n}\nstate y = 0\non frame {\n  y = f(at)\n}\n', '8:9',
+     "a cursor does not go to a fn's call or come back from one"),
+    (JSON_M + 'state n = 0\nfn f(j) {\n  match j {\n    num(x) => x = 1\n    _ => n = 1\n  }\n}\non frame {\n  f(Json.null)\n}\n',
+     '13:15', "'x' names what a case holds; it is not assigned"),
+    ('record P {\n  x = 0\n}\nstate n = 0\non frame {\n  let p = P { x: 1 }\n  match p {\n    _ => n = 1\n  }\n}\n', '7:9',
+     "match takes a variant; 'p' holds none"),
+    ('record T {\n  a = 0\n}\nstate xs: list of T\nfn f(x) {\n  return x > 0\n}\nview v = count(x in xs where f(x.a))\n',
+     '8:30', 'count, sum, max and min call no fn with a block'),
     # Records in records, variants, lists in records and match (Pure 027's stage 2b).
     ('record A {\n  b: B\n}\nrecord B {\n  a: A\n}\nstate xs: list of A\n', '1:8', "'A' holds itself: hold it in a list"),
     ('record A {\n  b: Nope\n}\nstate xs: list of A\n', '2:3', "unknown record or variant 'Nope'"),
@@ -239,7 +263,7 @@ DIAGNOSTICS = [
     (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  xs[at].a = "x"\n}\n', '8:14',
      'expected a number, not text'),
     (RECORD + 'state n: text\nstate at: cursor in n\n' + ON_K + '  n.insert(at, T { a: 1 })\n}\n', '8:16',
-     'a record value goes into a list'),
+     'expected text, not a record'),
     ('state n: text\nstate at: cursor in n\n' + ON_K + '  n.remove(at)\n}\n', '5:3', 'a text removes a range'),
     ('record T {\n  position = 0\n}\n', '2:3', "'position' is where an index is"),
     (LIST + 'view v = at.b\n', '6:10', "record 'T' has no field 'b'"),
@@ -262,7 +286,7 @@ DIAGNOSTICS = [
     ('view each = 1\n', '1:6', "'each' is reserved"),
     # fns
     ('fn f(x) = x\nview v = f(1, 2)\n', '2:10', 'f expects 1 argument'),
-    ('fn f(x) = f(x)\nview v = f(1)\n', '1:11', "fn 'f' calls itself (in fn 'f' called at 2:10)"),
+    ('fn f(x) = f(x)\nview v = f(1)\n', '2:10', "a view calls no fn with a block, nor one that calls itself"),
     ('fn f(x, x) = 1\n', '1:9', "duplicate parameter 'x'"),
     ('view v = g(1)\n', '1:10', "unknown fn 'g'"),
     ('fn f(x) = x + "a"\nview v = f(1)\n', '1:15', "expected a number, not text (in fn 'f' called at 2:10)"),
@@ -437,7 +461,86 @@ DIAGNOSTICS = [
 ]
 
 NESTED = 'variant Json {\n  null\n  bool(bool)\n  num(number)\n  str(text)\n  arr(list of Json)\n  obj(list of Member)\n}\nrecord Member {\n  name: text\n  value: Json\n}\nrecord Point {\n  x = 0\n  y = 0\n}\nrecord Box {\n  at: Point\n  tag: text\n}\nstate boxes: list of Box\nstate total = 0\nstate chars = 0\nstate nulls = 0\nstate trues = 0\nstate corner = 0\ninput go = key KeyG\non go.down {\n  let docs: list of Json\n  docs.append(Json.num(3))\n  docs.append(Json.str("hi"))\n  docs.append(Json.null)\n  let kids: list of Json\n  kids.append(Json.num(1))\n  kids.append(Json.num(2))\n  docs.append(Json.arr(kids))\n  docs.last.arr.append(Json.num(10))\n  let ms: list of Member\n  ms.append(Member { name: "a", value: Json.bool(true) })\n  ms.append(Member { name: "b", value: Json.arr([]) })\n  docs.append(Json.obj(ms))\n  for d in docs {\n    match d {\n      num(n) => total = total + n\n      str(t) => chars = chars + t.chars\n      null => nulls = nulls + 1\n      arr(items) => {\n        for y in items {\n          match y {\n            num(n) => total = total + n\n            _ => nulls = nulls + 100\n          }\n        }\n      }\n      obj(members) => {\n        for m in members {\n          match m.value {\n            bool(b) => trues = trues + (if b { 1 } else { 0 })\n            arr(xs) => chars = chars + xs.count * 1000\n            _ => nulls = nulls + 1000\n          }\n        }\n      }\n      bool(b) => nulls = nulls + 10000\n    }\n  }\n  boxes.append(Box { at: Point { x: 1, y: 2 }, tag: "a" })\n  corner = boxes.last.at.x * 10 + boxes.last.at.y + docs.count * 100\n}\n'
+FUNCTIONS = '''variant Tree {
+  leaf(i64)
+  node(list of Tree)
+}
+state summed: i64 = 0
+state depth: i64 = 0
+state leaves = 0
+state count = 0
+state total: i64 = 0
+state wide = 0
+state said: text = ""
+state ran: i64 = 0
+input make = message { seed: i64, levels: i64 }
+input chars = message { t: text }
+input forever = key KeyF
+
+# A tree of levels levels: a leaf of seed at the bottom, else a node of seed % 3 + 1 trees, each its own seed.
+fn tree(seed, levels) -> Tree {
+  let kids: list of Tree
+  if levels == 0 { return Tree.leaf(seed) }
+  for k in 0 .. seed % 3 + 1 { kids.append(tree(seed * 7 + k, levels - 1)) }
+  return Tree.node(kids)
+}
+fn sum(t) -> i64 {
+  match t {
+    leaf(v) => return v
+    node(kids) => {
+      let s = i64(0)
+      for k in kids { s = s + sum(k) }
+      return s
+    }
+  }
+}
+fn deepest(t) -> i64, number {
+  match t {
+    leaf(v) => return 0x0, 1
+    node(kids) => {
+      let most, n = 0x0, 0
+      for k in kids {
+        let d, m = deepest(k)
+        if d + 1 > most { most = d + 1 }
+        n = n + m
+      }
+      return most, n
+    }
+  }
+}
+fn without_end(n) -> i64 = without_end(n + 1)
+
+on make {
+  let t = tree(make.seed, make.levels)
+  summed = sum(t)
+  depth, leaves = deepest(t)
+}
+on chars {
+  count, total, wide = 0, 0, 0
+  let out = ""
+  for ch in chars.t {
+    count = count + 1
+    total = total + ch
+    if ch >= 0x80 { wide = wide + 1 }
+    out = out + char(ch)
+  }
+  said = out
+}
+on forever.down {
+  ran = ran + 1
+  ran = without_end(0)
+}
+'''
+
 ACCEPTED = [
+    # Fns that call themselves (Pure 027's 2c): a block, several values, records' values made, held, matched, given and
+    # appended, an item and a field's record passed as values, a walk of a list a value holds, a text's characters.
+    FUNCTIONS,
+    JSON_M + 'state n = 0\nstate t: text = "a\u00e9"\nfn both(a, b) {\n  return b, a\n}\nfn tag(j) -> i64 {\n  match j {\n'
+    '    num(x) => return 1\n    arr(xs) => {\n      for y in xs { n = n + number(tag(y)) }\n      return 2\n    }\n    _ => return 0\n  }\n}\n'
+    'on frame {\n  let xs: list of Json\n  let j = Json.num(2)\n  xs.append(j)\n  let a, b = both(j, 3)\n  xs.append(b)\n'
+    '  let ms: list of M\n  ms.append(M { name: "k", value: Json.arr(xs) })\n  for m in ms { n = n + number(tag(m.value)) }\n'
+    '  for ch in t { n = n + number(ch) }\n  n = n + a\n}\n',
     # Records in records, variants, lists in records, match, appends into a field's list (Pure 027's 2b).
     NESTED,
     # Formats, joins, slices, lets of bytes and text appended to, while, && and || that decide alone (Pure 027's 2a).
@@ -1407,6 +1510,51 @@ def nested_values(aup, pure_run, work):
     return {'events': 3}
 
 
+
+
+def functions(aup, pure_run, work, trees=40, texts=60):
+    """Pure 027's 2c: fns that call themselves, each call its own (a let's list each, records' values passed and
+    given back, several values at once), against the same in Python: random trees built and summed; the characters of
+    random texts (code points, and the text again of them); a call without end fails the event, nothing changed."""
+    import random
+    import struct
+    path = work / 'functions.pmod'
+    (work / 'functions.aup').write_text(FUNCTIONS)
+    compile_module(aup, work / 'functions.aup', path)
+
+    def tree(seed, levels):
+        return seed if levels == 0 else [tree(seed * 7 + k, levels - 1) for k in range(seed % 3 + 1)]
+
+    def deepest(t):
+        if not isinstance(t, list):
+            return 0, 1
+        found = [deepest(k) for k in t]
+        return max(d for d, _ in found) + 1, sum(m for _, m in found)
+
+    def total(t):
+        return t if not isinstance(t, list) else sum(total(k) for k in t)
+
+    rng = random.Random(2)
+    asked = [(rng.randrange(1000), rng.randrange(7)) for _ in range(trees)]
+    alphabet = ['a', 'Z', ' ', '\n', 'é', 'ü', 'ß', '€', '한', 'ࠀ', '￿', '😀', '\U0010ffff', '\u007f', '\u0080']
+    words = [''.join(rng.choice(alphabet) for _ in range(rng.randrange(0, 40))) for _ in range(texts)]
+    commands = ''.join(f"message make {struct.pack('<qq', seed, levels).hex()}\n" for seed, levels in asked)
+    commands += ''.join(f"message chars {(w.encode() or b'').hex() or '-'}\n" for w in words)
+    commands += 'down forever\n'
+    lines = run(pure_run, path, stdin=commands, check=False).stdout.splitlines()
+    for (seed, levels), line in zip(asked, lines):
+        state = json.loads(line)
+        t = tree(seed, levels)
+        assert state['fault'] == 'none', (seed, levels, state['fault'])
+        assert state['states']['summed'] == total(t) and (state['states']['depth'], state['states']['leaves']) == deepest(t), (seed, levels)
+    for w, line in zip(words, lines[trees:]):
+        state = json.loads(line)['states']
+        assert (state['count'], state['total'], state['wide'], state['said']) == (len(w), sum(map(ord, w)), sum(ord(c) >= 0x80 for c in w), w), w
+    last = json.loads(lines[-1])
+    assert last['fault'] == 'memory' and last['states']['ran'] == 0, last['fault']
+    return {'trees': trees, 'texts': texts}
+
+
 def computing(aup, pure_run, work, graphs=20):
     """Computing in one event (Pure 018): examples/routes.aup's searches
     over random graphs (breadth first, depth first, nearest by weight) and
@@ -2215,6 +2363,7 @@ def main():
         report['bits_and_bytes'] = bits_and_bytes(aup, pure_run, work)
         report['formats_and_texts'] = formats_and_texts(aup, pure_run, work)
         report['nested_values'] = nested_values(aup, pure_run, work)
+        report['functions'] = functions(aup, pure_run, work)
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

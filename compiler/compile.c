@@ -22,7 +22,7 @@ enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
        LOCAL_LOAD, LOCAL_STORE, I64_ADD, I64_SUB, I64_MUL, I64_DIV, I64_MOD, I64_NEG, I64_COMPARE, I64_MIN, I64_MAX,
        I64_FROM, NUM_FROM, LOOP, BREAK, I64_BITS, BYTE_AT, BYTES_OF, INDEX_AT, BYTES_SLICE, BYTE, BYTES_LOAD, BYTES_STORE,
-       LIST_VALUE, LIST_BIND, APPEND_IN, NUM_PARSE };
+       LIST_VALUE, LIST_BIND, APPEND_IN, NUM_PARSE, CALL, RETURN, CHAR_AT, CHAR };
 /* Pure's values held by name: 0-15 bytes, 16-31 texts; BYTES_STORE's bit 8 appends. NUM_TEXT's format (Pure 027). */
 enum { HELD = 16, HELD_TEXT = 16, HELD_APPEND = 1 << 8 };
 enum { FORMAT_WIDTH = 8, FORMAT_ZEROS = 1 << 16, FORMAT_FORM = 17, FORMAT_DIGITS = 20,
@@ -42,9 +42,11 @@ enum { STATE_TRANSIENT = 256 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, STATE_BOOL = 5, STATE_I64 = 6,
        UNIT_CHAR = 0, UNIT_LINE = 1 };
 /* Pure's view types, record field types (0 a number, 1 a text, 2 a bool, 3 an i64) and what a local holds. */
-enum { VIEW_NUM = 0, VIEW_TEXT = 1, VIEW_TABLE = 2, VIEW_BOOL = 3, VIEW_I64 = 4, LOCAL_BOOL = 2, LOCAL_I64 = 3 };
-typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX, BOOL, I64, LIST } Type; /* LIST: a list in a record (Pure 027) */
-typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state or an index's list state */
+enum { VIEW_NUM = 0, VIEW_TEXT = 1, VIEW_TABLE = 2, VIEW_BOOL = 3, VIEW_I64 = 4, LOCAL_BOOL = 2, LOCAL_I64 = 3, LOCAL_LIST = 4 };
+/* LIST: a list in a record (Pure 027). RECORD: a record's or a variant's value, its fields on the stack in its order
+ * (027's 2c); TUPLE: the values a fn gives (owner: its instance); NOTHING: what a fn that gives none gives. */
+typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX, BOOL, I64, LIST, RECORD, TUPLE, NOTHING } Type;
+typedef struct { Type type; int owner; } Kind; /* owner: a cursor's text state, an index's list state, a record's or a list's record */
 
 typedef enum { T_EOF, T_NL, T_NUMBER, T_NAME, T_PUNCT, T_STRING } TokenKind;
 typedef struct {
@@ -92,7 +94,7 @@ typedef struct Expr {
 } Expr;
 
 typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
-               S_LET, S_COUNT, S_BREAK, S_RETURN, S_ASSIGNS, S_LETS, S_MATCH, S_ARM } StmtKind;
+               S_LET, S_COUNT, S_BREAK, S_RETURN, S_ASSIGNS, S_LETS, S_MATCH, S_ARM, S_CALL } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
@@ -154,14 +156,36 @@ typedef struct {
     bool variant, typed, flattened, flattening;
 } Record;
 
-/* A fn: one expression over its parameters, inlined where it is called. */
+/* A fn: one expression over its parameters, inlined where it is called; or, with a block (statements and returns) or
+ * calling itself, a function of Pure's (027's 2c), its results' types written after -> or given by its returns. */
 typedef struct {
     char name[NAME], params[PARAMS][NAME];
     unsigned param_count;
     int module, line, column;
     Expr *body;
+    Stmt *block;
+    struct { char name[NAME]; bool list; int line, column; } results[PARAMS];
+    unsigned result_count;
+    bool typed;  /* -> its results' types */
     bool active; /* being inlined: a call back into it is recursion */
+    bool called; /* run as a function (a block, or a cycle of calls through it) */
 } Fn;
+
+typedef struct { uint8_t op; uint32_t arg; union { double value; int64_t integer; }; } Op;
+
+/* A fn run as a function, once for each kinds of arguments it is called with (an item's as its record's value): Pure's
+ * function of the same number. Its results are known once declared or a return gave them; its code is its own (ops,
+ * count of them: the module's code after the handlers' and views', at start, its jumps moved with it). */
+enum { INSTANCES = 64 };
+typedef struct {
+    int fn;
+    Kind params[PARAMS], results[STACK];
+    unsigned param_count, result_count;
+    bool known;
+    Op *ops;
+    unsigned count, capacity;
+    uint32_t start;
+} Instance;
 
 /* The fn being inlined: where its arguments are on the stack and their kinds. */
 typedef struct Scope {
@@ -231,9 +255,12 @@ typedef struct {
     Scope *fold_scope;
     /* A handler's locals in scope (let), innermost last, and the slots it used. A let's list (list: its
      * state) has no slot; a for's count (counter) is read, never assigned. */
-    struct { char name[NAME]; unsigned slot; Kind kind; int list; bool counter; } locals[LOCALS];
+    /* (027's 2c) A record's value held by name: the name (its record its kind, no slot) and name.field for each of its
+     * fields; variant: a variant's case; alias: a match's name for a case's value (read, never assigned). */
+    struct { char name[NAME]; unsigned slot; Kind kind; int list; bool counter, variant, alias; } locals[LOCALS];
     unsigned local_count, local_slots, held_bytes, held_texts; /* held: the bytes' and texts' lets' slots */
     unsigned whiles; /* while loops so far: each counts by a name of its own */
+    unsigned settled; /* records' values calls gave, held by names of their own (027's 2c) */
     const struct Expr *given; /* the left side of the && or || whose right side faultless looks at */
     /* A match's bindings (027's 2b): a name for the item's field at path (the item an index in a local, of list), or
      * for its fields under path (prefix: a record's or a variant's). */
@@ -258,8 +285,12 @@ typedef struct {
     Scope *scope;         /* the fn being inlined, or NULL */
     unsigned joins;       /* branches ahead that carry a value */
     Type want;            /* what the expression value() compiles next is wanted as: an i64 makes a literal one */
-    struct { uint8_t op; uint32_t arg; union { double value; int64_t integer; }; } code[CODE];
-    unsigned code_count;
+    /* The code being made: the handlers' and views' (ops), or a function's (its instance's, growing). */
+    Op ops[CODE], *code;
+    unsigned code_count, code_capacity;
+    Instance instances[INSTANCES];
+    unsigned instance_count;
+    int current; /* the instance whose code is being made, or -1 */
     uint32_t view_code[VIEWS][2], handler_code[HANDLERS][2];
     int view_types[VIEWS];
     unsigned char constant_data[CONSTANT_BYTES];
@@ -407,7 +438,7 @@ static Token scan(Compiler *c) {
         token.kind = T_NAME;
         return token;
     }
-    static const char *const pairs[] = {"<=", ">=", "==", "!=", "&&", "||", "..", "<<", ">>"};
+    static const char *const pairs[] = {"<=", ">=", "==", "!=", "&&", "||", "..", "<<", ">>", "->"};
     for (size_t i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)
         if (ch == pairs[i][0] && peek_char(c, 1) == pairs[i][1]) {
             memcpy(token.text, pairs[i], 3);
@@ -540,11 +571,12 @@ static void index_key(Compiler *c) {
 
 /* (a, b, ...) after a fn name. */
 /* Arguments once the opening parenthesis is taken. */
+static Expr *inserted_value(Compiler *c, bool multiline);
 static Expr *arguments_after(Compiler *c, Expr *call) {
     newlines(c);
     while (!is(c, ")")) {
         if (call->count == PARAMS) fail_at(c, c->token.line, c->token.column, "a call takes at most 8 arguments");
-        call->args[call->count++] = expression(c, 0, true);
+        call->args[call->count++] = inserted_value(c, true); /* a record's value written out too (027's 2c) */
         newlines(c);
         if (!is(c, ",")) break;
         take(c);
@@ -886,7 +918,7 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     } else if (token.kind == T_NAME) {
         static const struct { const char *name; unsigned count; int op; } calls[] =
             {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM},
-             {"floor", 1, FLOOR}, {"i64", 1, I64_FROM}, {"number", 1, NUM_FROM}, {"byte", 1, BYTE}};
+             {"floor", 1, FLOOR}, {"i64", 1, I64_FROM}, {"number", 1, NUM_FROM}, {"byte", 1, BYTE}, {"char", 1, CHAR}};
         int call = -1, how = -1;
         for (int i = 0; i < (int)(sizeof(calls) / sizeof(*calls)); ++i) if (!strcmp(token.text, calls[i].name)) call = i;
         static const char *const folds[] = {"count", "sum", "max", "min", "first", "distinct"};
@@ -1157,14 +1189,14 @@ static void several(Compiler *c, Stmt *s, const char *first) {
     Expr **tail = &s->value;
     unsigned values = 0;
     for (;;) {
-        *tail = expression(c, 0, false);
+        *tail = inserted_value(c, false);
         tail = &(*tail)->next;
         ++values;
         if (!is(c, ",")) break;
         take(c);
         newlines(c); /* a line may end after a comma */
     }
-    if (values != s->name_count)
+    if (values != s->name_count && values != 1) /* one: a fn's call that gives them (027's 2c) */
         fail_at(c, s->line, s->column, "%u names take %u values, not %u", s->name_count, s->name_count, values);
 }
 
@@ -1238,7 +1270,7 @@ static Stmt *statement(Compiler *c, unsigned depth) {
             return s;
         }
         expect(c, "=", "'='");
-        s->value = expression(c, 0, false);
+        s->value = inserted_value(c, false);
         return s;
     }
     if (!strcmp(token.text, "match")) {
@@ -1305,9 +1337,17 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         s->kind = S_BREAK;
         return s;
     }
-    if (!strcmp(token.text, "return")) { /* a view's body's last line: its value */
+    if (!strcmp(token.text, "return")) { /* a view's body's last line: its value; in a fn's block, what it gives (none or several) */
         s->kind = S_RETURN;
-        s->value = expression(c, 0, false);
+        if (c->token.kind == T_NL || is(c, "}") || is(c, ";")) return s;
+        Expr **tail = &s->value;
+        for (;;) {
+            *tail = inserted_value(c, false);
+            tail = &(*tail)->next;
+            if (!is(c, ",")) break;
+            take(c);
+            newlines(c);
+        }
         return s;
     }
     if (!strcmp(token.text, "for")) {
@@ -1369,6 +1409,13 @@ static Stmt *statement(Compiler *c, unsigned depth) {
     }
     if (reserved_name(token.text)) fail_at(c, token.line, token.column, "expected a statement or '}'");
     memcpy(s->name, token.text, NAME);
+    if (is(c, "(")) { /* f(x): a fn's call for what it does (027's 2c) */
+        s->kind = S_CALL;
+        Expr *call = node(c, E_FN, token.line, token.column);
+        memcpy(call->name, token.text, NAME);
+        s->value = arguments(c, call);
+        return s;
+    }
     if (is(c, "[") && !(lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "key"))) {
         /* tasks[at].field = value */
         take(c);
@@ -1474,7 +1521,7 @@ static Stmt *statement(Compiler *c, unsigned depth) {
     }
     s->kind = S_ASSIGN;
     expect(c, "=", "'='");
-    s->value = expression(c, 0, false);
+    s->value = inserted_value(c, false);
     return s;
 }
 
@@ -1984,8 +2031,31 @@ static void fn_declaration(Compiler *c) {
         }
         expect(c, ")", "')'");
     }
-    expect(c, "=", "'='");
-    f->body = expression(c, 0, false);
+    if (is(c, "->")) { /* its results' types (027's 2c): number, i64, bool, text, bytes, a record or list of one */
+        take(c);
+        f->typed = true;
+        do {
+            if (f->result_count) take(c);
+            Token type = expect_name(c, "a type: number, i64, bool, text, bytes, a record or list of one");
+            bool list = !strcmp(type.text, "list");
+            if (list) {
+                expect_word(c, "of");
+                type = expect_name(c, "a record");
+            }
+            if (f->result_count == PARAMS) fail_at(c, type.line, type.column, "a fn gives at most 8 values");
+            memcpy(f->results[f->result_count].name, type.text, NAME);
+            f->results[f->result_count].list = list;
+            f->results[f->result_count].line = type.line, f->results[f->result_count].column = type.column;
+            ++f->result_count;
+        } while (is(c, ","));
+    }
+    if (is(c, "{")) { /* a block: statements, and returns (027's 2c) */
+        f->block = block(c, 1);
+        f->called = true;
+    } else {
+        expect(c, "=", f->typed ? "'=' or '{'" : "'=', '{' or '->'");
+        f->body = expression(c, 0, false);
+    }
     ++c->fn_count;
 }
 
@@ -2229,6 +2299,12 @@ static void declaration(Compiler *c) {
 
 static void emit(Compiler *c, int line, int column, uint8_t op, uint32_t arg, double value) {
     if (c->code_count == CODE) fail_at(c, line, column, "program exceeds 65535 instructions");
+    if (c->code_count == c->code_capacity) { /* a function's code grows */
+        Op *grown = realloc(c->code, 2 * c->code_capacity * sizeof(*grown));
+        if (!grown) fail_at(c, line, column, "out of memory");
+        c->code = grown, c->code_capacity *= 2;
+        c->instances[c->current].ops = grown;
+    }
     c->code[c->code_count].op = op;
     c->code[c->code_count].arg = arg;
     c->code[c->code_count++].value = value;
@@ -2242,7 +2318,7 @@ static void emit_integer(Compiler *c, int line, int column, int64_t value) {
 
 static const char *type_name(Type type) {
     static const char *const names[] = {"", "a number", "bytes", "text", "a cursor", "a distance", "an index", "a bool", "an i64",
-                                        "a list"};
+                                        "a list", "a record", "several values", "no value"};
     return names[type];
 }
 
@@ -2342,6 +2418,9 @@ static Type message_kind(int type) {
 static Kind value(Compiler *c, const Expr *e, bool handler, int height);
 
 static void expect_kind(Compiler *c, const Expr *e, Kind actual, Type type) {
+    const char *name = e->kind == E_MEMBER ? e->member : e->name;
+    if (actual.type != type && actual.type == RECORD && c->records[actual.owner].variant && *name)
+        fail_at(c, e->line, e->column, "'%s' holds a variant: match it, as in match %s { ... }", name, name);
     if (actual.type != type) fail_at(c, e->line, e->column, "expected %s, not %s", type_name(type), type_name(actual.type));
 }
 
@@ -2407,10 +2486,11 @@ static bool literal_only(const Expr *e) {
 
 /* The type e has, compiled and taken back: what literals beside it take. */
 static Type probe(Compiler *c, const Expr *e, bool handler, int height) {
-    unsigned code = c->code_count, constants = c->constants, joins = c->joins;
+    unsigned code = c->code_count, constants = c->constants, joins = c->joins, instances = c->instance_count;
     size_t used = c->constant_used;
     Type type = value(c, e, handler, height).type;
-    c->code_count = code, c->constants = constants, c->constant_used = used, c->joins = joins;
+    c->code_count = code, c->joins = joins;
+    if (c->instance_count == instances) c->constants = constants, c->constant_used = used; /* a function made keeps its own */
     return type;
 }
 
@@ -2530,6 +2610,10 @@ static int collection_index(const Compiler *c, const char *name) {
     return -1;
 }
 
+static Kind call_fn(Compiler *c, const Expr *e, int fn, bool handler, int height, Kind *kinds, unsigned given);
+static bool variant_case(Compiler *c, const Expr *e, int *variant, unsigned *index, const Expr **payload);
+static bool composite(const Record *r, const char *path);
+
 /* A fn inlined: its arguments go on the stack once, the body reads them with
  * PICK, and SLIDE leaves only the result. e names the call (E_FN), or is the
  * name of a fn without parameters. */
@@ -2547,7 +2631,14 @@ static Kind inline_fn(Compiler *c, const Expr *e, int module, const char *name, 
         fail_at(c, e->line, e->column, "%s expects %u argument%s", name, f->param_count, f->param_count == 1 ? "" : "s");
     if (f->active) fail_at(c, e->line, e->column, "fn '%s' calls itself", name);
     Scope scope = {.fn = index, .base = height, .line = e->line, .column = e->column};
-    for (unsigned i = 0; i < count; ++i) scope.kinds[i] = value(c, e->args[i], handler, height + (int)i);
+    for (unsigned i = 0; i < count; ++i) {
+        scope.kinds[i] = value(c, e->args[i], handler, height + (int)i);
+        if (scope.kinds[i].type == RECORD || scope.kinds[i].type == TUPLE || scope.kinds[i].type == NOTHING) {
+            if (scope.kinds[i].type != RECORD) fail_at(c, e->args[i]->line, e->args[i]->column, "an argument is one value");
+            /* a record's value: the fn runs as a function, its arguments so far on the stack (027's 2c) */
+            return call_fn(c, e, index, handler, height, scope.kinds, i + 1);
+        }
+    }
     Scope *outer = c->scope;
     int caller = c->module;
     c->scope = &scope;
@@ -2660,6 +2751,7 @@ static bool holds_walk(const Stmt *s) {
 static uint32_t local_arg(const Compiler *c, int local) {
     const Kind *kind = &c->locals[local].kind;
     return c->locals[local].slot | (kind->type == INDEX ? 1u << 8 | (uint32_t)kind->owner << 16 :
+                                    kind->type == LIST ? (uint32_t)LOCAL_LIST << 8 | (uint32_t)kind->owner << 16 :
                                     kind->type == BOOL ? (uint32_t)LOCAL_BOOL << 8 : kind->type == I64 ? (uint32_t)LOCAL_I64 << 8 : 0);
 }
 
@@ -2847,6 +2939,401 @@ static bool faultless(Compiler *c, const Expr *e) {
     }
 }
 
+/* ---- Fns run as Pure's functions, and records' values (027's 2c) */
+
+static void statements(Compiler *c, const Stmt *s);
+static int typed_record(Compiler *c, const char *type, bool list, int line, int column);
+static void record_values_of(Compiler *c, const Expr *e, const Record *r, const char *label, const Expr **values, int height);
+static void record_fields_of(Compiler *c, const Expr *e, const Record *r, const Expr **values, int height);
+static int scalar_record(Compiler *c, const char *name, int line, int column);
+
+/* The stack values a value of a kind takes: a record's fields, else one. */
+static unsigned cells(const Compiler *c, Kind kind) { return kind.type == RECORD ? c->records[kind.owner].fields : 1; }
+
+static bool same_kind(Kind a, Kind b) {
+    return a.type == b.type && (a.owner == b.owner || (a.type != RECORD && a.type != LIST && a.type != INDEX && a.type != CURSOR));
+}
+
+/* A kind as written: the name of a type (a record or a variant its value), or list of a record. */
+static Kind written_kind(Compiler *c, int module, const char *name, bool list, int line, int column) {
+    static const struct { const char *name; Type type; } scalars[] = {{"number", NUM}, {"i64", I64}, {"bool", BOOL}, {"text", TEXT},
+                                                                       {"bytes", BYTES}};
+    for (unsigned k = 0; !list && k < sizeof(scalars) / sizeof(*scalars); ++k)
+        if (!strcmp(name, scalars[k].name)) return (Kind){scalars[k].type, -1};
+    int record = module_record(c, module, name);
+    if (record < 0 && list) record = scalar_record(c, name, line, column);
+    if (record < 0) fail_at(c, line, column, "unknown type '%s': number, i64, bool, text, bytes, a record or list of one", name);
+    return (Kind){list ? LIST : RECORD, record};
+}
+
+/* The record or variant a record holds at a path of its fields as written (at, a.b, or a variant's case pt), or -1. */
+static int sub_record(Compiler *c, int record, const char *path) {
+    const Record *r = &c->records[record];
+    size_t n = strcspn(path, ".");
+    for (unsigned i = 0; i < r->declared_count; ++i)
+        if (strlen(r->declared[i].name) == n && !strncmp(r->declared[i].name, path, n) && *r->declared[i].type &&
+            !r->declared[i].list) {
+            int inner = typed_record(c, r->declared[i].type, false, r->declared[i].line, r->declared[i].column);
+            return path[n] ? sub_record(c, inner, path + n + 1) : inner;
+        }
+    return -1;
+}
+
+/* A slot of the block for a let of bytes or text (Pure's: 0-15 bytes, 16-31 texts). */
+static unsigned held_slot_at(Compiler *c, Type type, int line, int column) {
+    unsigned *count = type == BYTES ? &c->held_bytes : &c->held_texts;
+    if (*count == HELD) fail_at(c, line, column, "at most %d lets of %s are allowed in a handler", HELD, type_name(type));
+    return (type == TEXT ? HELD_TEXT : 0) + (*count)++;
+}
+
+/* A name for a value of a kind in the block's scope: a let's slot, held by name (bytes, text), or a record's: the name
+ * (its record its kind, no slot) and name.field for each field. */
+static void name_value(Compiler *c, const char *name, Kind kind, int line, int column) {
+    if (c->local_count == LOCALS) fail_at(c, line, column, "at most %d lets are allowed in a handler", LOCALS);
+    unsigned local = c->local_count++;
+    memset(&c->locals[local], 0, sizeof(c->locals[local]));
+    snprintf(c->locals[local].name, NAME, "%s", name);
+    c->locals[local].kind = kind;
+    c->locals[local].list = -1;
+    if (kind.type == RECORD) {
+        const Record *r = &c->records[kind.owner];
+        for (unsigned k = 0; k < r->fields; ++k) {
+            char field[2 * NAME + 2];
+            snprintf(field, sizeof(field), "%s.%s", name, r->field_names[k]);
+            if (strlen(field) >= NAME) fail_at(c, line, column, "'%s' passes 31 bytes: give '%s' a shorter name", field, name);
+            name_value(c, field, field_value(r, k), line, column);
+            c->locals[c->local_count - 1].variant = r->field_variant[k] != 0;
+        }
+    } else if (kind.type == BYTES || kind.type == TEXT) c->locals[local].slot = held_slot_at(c, kind.type, line, column);
+    else if (kind.type == NUM || kind.type == BOOL || kind.type == I64 || kind.type == LIST || kind.type == INDEX) {
+        if (c->local_slots == LOCALS) fail_at(c, line, column, "at most %d lets are allowed in a handler", LOCALS);
+        c->locals[local].slot = c->local_slots++;
+    } else fail_at(c, line, column, "a name holds a number, a bool, an i64, bytes, text, a list or a record, not %s", type_name(kind.type));
+}
+
+/* The local that holds field k of record r at base: a name's own record's (root: base.field), or a record under a
+ * name's (the variant's case is base itself, its other fields base.field). */
+static void field_path(const Record *r, unsigned k, const char *base, bool root, char out[2 * NAME + 2]) {
+    if (!root && r->field_variant[k] && !strcmp(r->field_names[k], "case")) snprintf(out, 2 * NAME + 2, "%s", base);
+    else snprintf(out, 2 * NAME + 2, "%s.%s", base, r->field_names[k]);
+}
+
+static void load_named(Compiler *c, int local, int line, int column) {
+    if (c->locals[local].kind.type == BYTES || c->locals[local].kind.type == TEXT)
+        emit(c, line, column, BYTES_LOAD, c->locals[local].slot, 0);
+    else emit(c, line, column, LOCAL_LOAD, local_arg(c, local), 0);
+}
+
+static void store_named(Compiler *c, int local, int line, int column) {
+    if (c->locals[local].alias) fail_at(c, line, column, "'%s' names what a case holds; it is not assigned", c->locals[local].name);
+    if (c->locals[local].kind.type == BYTES || c->locals[local].kind.type == TEXT)
+        emit(c, line, column, BYTES_STORE, c->locals[local].slot, 0);
+    else emit(c, line, column, LOCAL_STORE, local_arg(c, local), 0);
+}
+
+/* A record's value at base onto the stack, field by field (root: a name's own record), or taken off it into them. */
+static void push_record(Compiler *c, const char *base, bool root, int record, int line, int column) {
+    const Record *r = &c->records[record];
+    for (unsigned k = 0; k < r->fields; ++k) {
+        char path[2 * NAME + 2];
+        field_path(r, k, base, root, path);
+        load_named(c, local_named(c, path), line, column);
+    }
+}
+static void pop_record(Compiler *c, const char *base, bool root, int record, int line, int column) {
+    const Record *r = &c->records[record];
+    for (unsigned k = r->fields; k-- > 0;) {
+        char path[2 * NAME + 2];
+        field_path(r, k, base, root, path);
+        store_named(c, local_named(c, path), line, column);
+    }
+}
+
+/* A value off the stack into a name of the block (a record's into its fields'). */
+static void pop_named(Compiler *c, int local, int line, int column) {
+    if (c->locals[local].kind.type == RECORD) pop_record(c, c->locals[local].name, true, c->locals[local].kind.owner, line, column);
+    else store_named(c, local, line, column);
+}
+
+/* A path down a record's value a name holds (a let's, a parameter's, a match's name for a case's value): the path and
+ * the name's local, or -1 when e is none. */
+static int binding_path(Compiler *c, const Expr *e, char path[2 * NAME + 2]) {
+    if (e->kind == E_NAME) {
+        int local = c->scope ? -1 : local_named(c, e->name);
+        if (local < 0 || c->locals[local].kind.type != RECORD) return -1;
+        snprintf(path, 2 * NAME + 2, "%s", e->name);
+        return local;
+    }
+    if (e->kind != E_MEMBER) return -1;
+    int local = binding_path(c, e->args[0], path);
+    size_t n = strlen(path);
+    if (local >= 0) snprintf(path + n, 2 * NAME + 2 - n, ".%s", e->member);
+    return local;
+}
+
+/* The item whose index is on the stack as its record's value (or its record's at a path, prefix): its fields, by way
+ * of a local. A function has its own lists, so an item goes to one as a value. */
+static Kind item_record(Compiler *c, const Expr *e, int list, const char *prefix, int record) {
+    if (c->local_slots == LOCALS) fail_at(c, e->line, e->column, "at most %d lets are allowed in a handler", LOCALS);
+    uint32_t local = c->local_slots++ | 1u << 8 | (uint32_t)list << 16;
+    emit(c, e->line, e->column, LOCAL_STORE, local, 0);
+    const Record *r = &c->records[record], *in = record_of(c, list);
+    for (unsigned k = 0; k < r->fields; ++k) {
+        char path[2 * NAME + 2];
+        if (*prefix) field_path(r, k, prefix, false, path);
+        else snprintf(path, sizeof(path), "%s", r->field_names[k]);
+        emit(c, e->line, e->column, LOCAL_LOAD, local, 0);
+        emit(c, e->line, e->column, ITEM_GET, (uint32_t)list | (uint32_t)field_named(in, path) << 16, 0);
+    }
+    return (Kind){RECORD, record};
+}
+
+/* A value as a function takes it or gives it: an item's as its record's (its index on the stack). */
+static Kind as_value(Compiler *c, const Expr *e, Kind kind) {
+    if (kind.type == INDEX) {
+        int record = (int)(record_of(c, kind.owner) - c->records);
+        return item_record(c, e, kind.owner, "", record);
+    }
+    if (kind.type == CURSOR || kind.type == UNIT || kind.type == NOTHING)
+        fail_at(c, e->line, e->column, "%s does not go to a fn's call or come back from one", type_name(kind.type));
+    return kind;
+}
+
+/* Whether code that follows a statement in its block never runs (it returns or breaks on every way), and whether
+ * statements return on every way through them. */
+static bool stops(const Stmt *s, bool breaks);
+static bool stops_one(const Stmt *s, bool breaks) {
+    switch (s->kind) {
+    case S_RETURN: return true;
+    case S_BREAK: return breaks;
+    case S_IF: return s->otherwise && stops(s->then, breaks) && stops(s->otherwise, breaks);
+    case S_MATCH:
+        for (const Stmt *arm = s->then; arm; arm = arm->next) if (!stops(arm->then, breaks)) return false;
+        return s->then != NULL; /* a match is exhaustive (its compiling says so) */
+    default: return false;
+    }
+}
+static bool stops(const Stmt *s, bool breaks) {
+    if (!s) return false;
+    while (s->next) s = s->next;
+    return stops_one(s, breaks);
+}
+
+static bool gives_values(const Stmt *s) {
+    for (; s; s = s->next)
+        if ((s->kind == S_RETURN && s->value) || gives_values(s->then) || gives_values(s->otherwise)) return true;
+    return false;
+}
+
+/* The fns a fn's body names (calls, or names a fn without parameters), a bit each. */
+static void named_fns(const Compiler *c, int module, const Expr *e, uint64_t *out) {
+    for (; e; e = e->next) {
+        if ((e->kind == E_FN && !*e->member) || e->kind == E_NAME) {
+            int f = fn_index(c, module, e->name);
+            if (f >= 0) *out |= UINT64_C(1) << f;
+        }
+        if (e->kind == E_FN && *e->member) {
+            int library = used_library(c, module, e->member), f = library >= 0 ? fn_index(c, library, e->name) : -1;
+            if (f >= 0) *out |= UINT64_C(1) << f;
+        }
+        for (unsigned i = 0; i < PARAMS; ++i) if (e->args[i]) named_fns(c, module, e->args[i], out);
+    }
+}
+static void named_by(const Compiler *c, int module, const Stmt *s, uint64_t *out) {
+    for (; s; s = s->next) {
+        const Expr *parts[] = {s->value, s->first, s->last, s->low, s->high};
+        for (unsigned i = 0; i < 5; ++i) named_fns(c, module, parts[i], out);
+        named_by(c, module, s->then, out);
+        named_by(c, module, s->otherwise, out);
+    }
+}
+
+/* Which fns run as functions: those with a block, and those a cycle of calls goes through. */
+static void called_fns(Compiler *c) {
+    uint64_t reach[FNS] = {0};
+    for (unsigned i = 0; i < c->fn_count; ++i) {
+        named_fns(c, c->fns[i].module, c->fns[i].body, &reach[i]);
+        named_by(c, c->fns[i].module, c->fns[i].block, &reach[i]);
+    }
+    for (unsigned k = 0; k < c->fn_count; ++k)
+        for (unsigned i = 0; i < c->fn_count; ++i)
+            if (reach[i] >> k & 1) reach[i] |= reach[k];
+    for (unsigned i = 0; i < c->fn_count; ++i) c->fns[i].called = c->fns[i].block || (reach[i] >> i & 1);
+}
+
+/* What making a function's code puts aside of what was being made. */
+typedef struct {
+    int message, arguments, row, fold_list, module, current;
+    bool folding, filtering, handling, has_returned;
+    char fold_name[NAME];
+    Scope *fold_scope, *scope;
+    const Expr *given;
+    unsigned local_count, local_slots, held_bytes, held_texts, alias_count, loop_count, nested, joins, code_count, code_capacity;
+    Type want;
+    Kind returned;
+    Op *code;
+} Aside;
+
+static void put_aside(Compiler *c, Aside *a, void *locals, void *aliases, void *loops) {
+    *a = (Aside){c->message, c->arguments, c->row, c->fold_list, c->module, c->current, c->folding, c->filtering, c->handling,
+                 c->has_returned, {0}, c->fold_scope, c->scope, c->given, c->local_count, c->local_slots, c->held_bytes,
+                 c->held_texts, c->alias_count, c->loop_count, c->nested, c->joins, c->code_count, c->code_capacity, c->want,
+                 c->returned, c->code};
+    memcpy(a->fold_name, c->fold_name, NAME);
+    memcpy(locals, c->locals, sizeof(c->locals));
+    memcpy(aliases, c->aliases, sizeof(c->aliases));
+    memcpy(loops, c->loops, sizeof(c->loops));
+}
+
+static void take_back(Compiler *c, const Aside *a, const void *locals, const void *aliases, const void *loops) {
+    c->message = a->message, c->arguments = a->arguments, c->row = a->row, c->fold_list = a->fold_list, c->module = a->module;
+    c->current = a->current, c->folding = a->folding, c->filtering = a->filtering, c->handling = a->handling;
+    c->has_returned = a->has_returned, c->fold_scope = a->fold_scope, c->scope = a->scope, c->given = a->given;
+    c->local_count = a->local_count, c->local_slots = a->local_slots, c->held_bytes = a->held_bytes, c->held_texts = a->held_texts;
+    c->alias_count = a->alias_count, c->loop_count = a->loop_count, c->nested = a->nested, c->joins = a->joins;
+    c->code_count = a->code_count, c->code_capacity = a->code_capacity, c->want = a->want, c->returned = a->returned;
+    c->code = a->code;
+    memcpy(c->fold_name, a->fold_name, NAME);
+    memcpy(c->locals, locals, sizeof(c->locals));
+    memcpy(c->aliases, aliases, sizeof(c->aliases));
+    memcpy(c->loops, loops, sizeof(c->loops));
+}
+
+/* An instance's code, made in the functions' code: its parameters' values taken off the stack into names, its block
+ * (or its expression, returned), and a return at its end when its way may reach it (giving nothing). */
+static void make_instance(Compiler *c, int index) {
+    static __typeof__(c->locals) locals[INSTANCES];
+    static __typeof__(c->aliases) aliases[INSTANCES];
+    static __typeof__(c->loops) loops[INSTANCES];
+    static unsigned depth;
+    Aside aside;
+    put_aside(c, &aside, locals[depth], aliases[depth], loops[depth]);
+    ++depth;
+    Instance *in = &c->instances[index];
+    const Fn *f = &c->fns[in->fn];
+    if (!(in->ops = malloc(256 * sizeof(*in->ops)))) fail_at(c, f->line, f->column, "out of memory");
+    c->code = in->ops, c->code_count = 0, c->code_capacity = 256;
+    c->module = f->module, c->current = index, c->scope = NULL, c->handling = true, c->has_returned = false;
+    c->message = c->arguments = c->row = c->fold_list = -1;
+    c->folding = c->filtering = false, c->fold_scope = NULL, c->given = NULL, c->want = 0, c->joins = 0;
+    c->local_count = c->local_slots = c->held_bytes = c->held_texts = c->alias_count = c->loop_count = c->nested = 0;
+    for (unsigned i = 0; i < in->param_count; ++i) name_value(c, f->params[i], in->params[i], f->line, f->column);
+    for (unsigned i = in->param_count; i-- > 0;) pop_named(c, local_named(c, f->params[i]), f->line, f->column);
+    if (f->block) {
+        statements(c, f->block);
+        if (!stops(f->block, false)) {
+            if (in->known && in->result_count)
+                fail_at(c, f->line, f->column, "fn '%s' may end without giving its value: return it at the end", f->name);
+            in->known = true, in->result_count = 0;
+            emit(c, f->line, f->column, RETURN, (uint32_t)index, 0);
+        }
+    } else { /* an expression that calls itself, returned */
+        Kind kind = as_value(c, f->body, value(c, f->body, true, 0));
+        if (in->known && (in->result_count != 1 || !same_kind(in->results[0], kind)))
+            fail_at(c, f->body->line, f->body->column, "fn '%s' gives %s, not %s", f->name,
+                    in->result_count == 1 ? type_name(in->results[0].type) : "several values", type_name(kind.type));
+        in->results[0] = kind, in->result_count = 1, in->known = true;
+        emit(c, f->line, f->column, RETURN, (uint32_t)index, 0);
+    }
+    in->count = c->code_count, in->capacity = c->code_capacity;
+    --depth;
+    take_back(c, &aside, locals[depth], aliases[depth], loops[depth]);
+}
+
+/* The instance of fn for arguments of these kinds: one made already, or a new one (made now). */
+static int instance_of(Compiler *c, int fn, const Kind *kinds, unsigned count, const Expr *at) {
+    for (unsigned i = 0; i < c->instance_count; ++i) {
+        const Instance *in = &c->instances[i];
+        bool same = in->fn == fn && in->param_count == count;
+        for (unsigned k = 0; same && k < count; ++k) same = same_kind(in->params[k], kinds[k]);
+        if (same) return (int)i;
+    }
+    if (c->instance_count == INSTANCES)
+        fail_at(c, at->line, at->column, "at most %d functions (a fn's for each kinds of its arguments) are allowed", INSTANCES);
+    int index = (int)c->instance_count++;
+    Instance *in = &c->instances[index];
+    const Fn *f = &c->fns[fn];
+    memset(in, 0, sizeof(*in));
+    in->fn = fn, in->param_count = count;
+    memcpy(in->params, kinds, count * sizeof(*kinds));
+    if (f->typed) {
+        for (unsigned k = 0; k < f->result_count; ++k)
+            in->results[k] = written_kind(c, f->module, f->results[k].name, f->results[k].list, f->results[k].line, f->results[k].column);
+        in->result_count = f->result_count, in->known = true;
+    } else if (f->block && !gives_values(f->block)) in->known = true; /* it gives nothing */
+    make_instance(c, index);
+    return index;
+}
+
+/* A call of a fn run as a function: its arguments onto the stack (an item's as its record's value), the CALL, and
+ * what it gives (a value, several: TUPLE, or none). Arguments already given (count of them, kinds) are on the stack. */
+static Kind call_fn(Compiler *c, const Expr *e, int fn, bool handler, int height, Kind *kinds, unsigned given) {
+    const Fn *f = &c->fns[fn];
+    unsigned count = e->kind == E_FN ? e->count : 0;
+    if (count != f->param_count)
+        fail_at(c, e->line, e->column, "%s expects %u argument%s", f->name, f->param_count, f->param_count == 1 ? "" : "s");
+    if (c->folding) fail_at(c, e->line, e->column, "count, sum, max and min call no fn with a block, nor one that calls itself");
+    if (!handler && c->current < 0)
+        fail_at(c, e->line, e->column, "a view calls no fn with a block, nor one that calls itself: handlers do ('%s')", f->name);
+    int h = height;
+    Kind own[PARAMS];
+    if (!kinds) kinds = own;
+    for (unsigned i = 0; i < given; ++i) h += (int)cells(c, kinds[i]);
+    for (unsigned i = given; i < count; ++i) {
+        kinds[i] = as_value(c, e->args[i], value(c, e->args[i], handler, h));
+        h += (int)cells(c, kinds[i]);
+        if (h > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
+    }
+    int index = instance_of(c, fn, kinds, count, e);
+    const Instance *in = &c->instances[index];
+    if (!in->known)
+        fail_at(c, e->line, e->column, "fn '%s' calls itself before a return gives its value: write its type, as in fn %s(...) -> type",
+                f->name, f->name);
+    emit(c, e->line, e->column, CALL, (uint32_t)index, 0);
+    unsigned gives = 0;
+    for (unsigned k = 0; k < in->result_count; ++k) gives += cells(c, in->results[k]);
+    if (height + (int)gives > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
+    return in->result_count == 0 ? (Kind){NOTHING, -1} : in->result_count == 1 ? in->results[0] : (Kind){TUPLE, index};
+}
+
+/* A record's or a variant's value written out (R { ... }, V.case(x), V.case) onto the stack: its fields in order. */
+static Kind made_record(Compiler *c, const Expr *e, int record, int height) {
+    const Record *r = &c->records[record];
+    const Expr *values[FIELDS_PER_RECORD];
+    record_values_of(c, e, r, r->name, values, height);
+    record_fields_of(c, e, r, values, height);
+    return (Kind){RECORD, record};
+}
+
+/* A name's record's value, or a value under it (a field, a record's or variant's value at a path), onto the stack. */
+static Kind binding_value(Compiler *c, const Expr *e, int binding, char *path) {
+    int local = local_named(c, path);
+    size_t n = strlen(path);
+    if (local >= 0 && c->locals[local].kind.type == RECORD) {
+        push_record(c, path, true, c->locals[local].kind.owner, e->line, e->column);
+        return c->locals[local].kind;
+    }
+    if (local >= 0) {
+        if (c->locals[local].variant && !e->raw)
+            fail_at(c, e->line, e->column, "'%s' holds a variant: match it, as in match %s { ... }", path, path);
+        load_named(c, local, e->line, e->column);
+        return c->locals[local].kind;
+    }
+    if (n > 5 && !strcmp(path + n - 5, ".case")) { /* a variant's case under it, read as its own field */
+        path[n - 5] = 0;
+        local = local_named(c, path);
+        if (local >= 0 && c->locals[local].variant) {
+            load_named(c, local, e->line, e->column);
+            return c->locals[local].kind;
+        }
+        path[n - 5] = '.';
+    }
+    int record = sub_record(c, c->locals[binding].kind.owner, path + strlen(c->locals[binding].name) + 1);
+    if (record < 0) return (Kind){0, -1}; /* none here: what the expression reads of a field (name.text.bytes) */
+    push_record(c, path, false, record, e->line, e->column);
+    return (Kind){RECORD, record};
+}
+
 static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     Type want = c->want; /* set by wanted() for this expression alone */
     c->want = 0;
@@ -2905,9 +3392,15 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         }
         int alias = c->scope ? -1 : alias_named(c, e->name);
         if (alias >= 0) { /* a match's binding: its item's field */
-            if (c->aliases[alias].prefix)
-                fail_at(c, e->line, e->column, "'%s' holds a record or a variant: read its fields (%s.x) or match it", e->name, e->name);
             int list = c->aliases[alias].list;
+            if (c->aliases[alias].prefix) { /* a record's or a variant's value under the item (027's 2c) */
+                const Record *r = record_of(c, list);
+                int sub = sub_record(c, (int)(r - c->records), c->aliases[alias].path);
+                if (sub < 0)
+                    fail_at(c, e->line, e->column, "'%s' holds a record or a variant: read its fields (%s.x) or match it", e->name, e->name);
+                emit(c, e->line, e->column, LOCAL_LOAD, c->aliases[alias].slot | 1u << 8 | (uint32_t)list << 16, 0);
+                return item_record(c, e, list, c->aliases[alias].path, sub);
+            }
             emit(c, e->line, e->column, LOCAL_LOAD, c->aliases[alias].slot | 1u << 8 | (uint32_t)list << 16, 0);
             int field = field_named(record_of(c, list), c->aliases[alias].path);
             emit(c, e->line, e->column, ITEM_GET, (uint32_t)list | (uint32_t)field << 16, 0);
@@ -2921,15 +3414,25 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             emit(c, e->line, e->column, PICK, (uint32_t)(height - 1 - (c->scope->base + param)), 0);
             return c->scope->kinds[param];
         }
-        if (fn_index(c, c->module, e->name) >= 0) return inline_fn(c, e, c->module, e->name, handler, height);
-        if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
+        int fn = fn_index(c, c->module, e->name);
+        if (fn >= 0 && c->fns[fn].called) return call_fn(c, e, fn, handler, height, NULL, 0);
+        if (fn >= 0) return inline_fn(c, e, c->module, e->name, handler, height);
+        if (c->module && c->current < 0)
+            fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
         int local = c->scope ? -1 : local_named(c, e->name);
+        if (local >= 0 && c->locals[local].kind.type == RECORD) { /* a record's value held by name (027's 2c) */
+            push_record(c, e->name, true, c->locals[local].kind.owner, e->line, e->column);
+            return c->locals[local].kind;
+        }
+        if (local >= 0 && c->locals[local].variant && !e->raw)
+            fail_at(c, e->line, e->column, "'%s' holds a variant: match it, as in match %s { ... }", e->name, e->name);
         if (local >= 0) { /* a let in the handler */
             if (c->locals[local].kind.type == BYTES || c->locals[local].kind.type == TEXT)
                 emit(c, e->line, e->column, BYTES_LOAD, c->locals[local].slot, 0);
             else emit(c, e->line, e->column, LOCAL_LOAD, local_arg(c, local), 0);
             return c->locals[local].kind;
         }
+        if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", e->name);
         if (!c->scope && c->arguments >= 0) { /* an argument of the view (a table's, in its columns and filter) */
             const Input *in = &c->inputs[c->arguments];
             for (unsigned f = 0; f < in->fields; ++f)
@@ -2970,12 +3473,23 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         const Expr *base = e->args[0];
         int item_list;
         char item[2 * NAME + 2];
+        int binding = binding_path(c, e, item);
+        if (binding >= 0) { /* down a record's value held by name (027's 2c) */
+            Kind kind = binding_value(c, e, binding, item);
+            if (kind.type) return kind;
+        }
+        int variant;
+        unsigned which;
+        const Expr *payload;
+        if (variant_case(c, e, &variant, &which, &payload)) return made_record(c, e, variant, height); /* V.case */
         unsigned saved_code = c->code_count;
         if ((base->kind != E_NAME || alias_named(c, base->name) >= 0 || base->kind == E_ITEM) &&
             (base->kind == E_MEMBER || base->kind == E_ITEM || base->kind == E_INDEX || base->kind == E_NAME) &&
             item_path(c, e, handler, height, &item_list, item)) { /* item.at.x: a field down a path (027's 2b) */
             char *path = item;
             const Record *r = record_of(c, item_list);
+            int sub = composite(r, path) ? sub_record(c, (int)(r - c->records), path) : -1;
+            if (sub >= 0) return item_record(c, e, item_list, path, sub); /* a record's or a variant's value there (2c) */
             int field = field_named(r, path);
             size_t length = strlen(path);
             if (field < 0 && length > 5 && !strcmp(path + length - 5, ".case")) { /* a nested variant's case: its own field */
@@ -3095,8 +3609,10 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             fail_at(c, e->line, e->column, "a list has count, first and last, not '%s'", m);
         }
         if (inner.type == INDEX) {
-            /* at.title: a field of the item the index names. */
+            /* at.title: a field of the item the index names; a record's or a variant's value there (027's 2c). */
             const Record *r = record_of(c, inner.owner);
+            int sub = composite(r, m) ? sub_record(c, (int)(r - c->records), m) : -1;
+            if (sub >= 0) return item_record(c, e, inner.owner, m, sub);
             if (field_named(r, m) < 0 && holds_under(r, m))
                 fail_at(c, e->line, e->column, "'%s' holds a record or a variant: read its fields (%s.x) or match it", m, m);
             unsigned field = record_field(c, r, m, e->line, e->column);
@@ -3108,9 +3624,17 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         fail_at(c, e->line, e->column, "%s has no '%s'", type_name(inner.type), m);
     }
     case E_FN: {
+        int fn = fn_index(c, c->module, e->name);
+        if (!*e->member && fn >= 0 && c->fns[fn].called) return call_fn(c, e, fn, handler, height, NULL, 0);
         if (!*e->member) return inline_fn(c, e, c->module, e->name, handler, height);
         int library = parameter(c, e->member) < 0 ? used_library(c, c->module, e->member) : -1;
+        fn = library >= 0 ? fn_index(c, library, e->name) : -1;
+        if (fn >= 0 && c->fns[fn].called) return call_fn(c, e, fn, handler, height, NULL, 0);
         if (library >= 0) return inline_fn(c, e, library, e->name, handler, height);
+        int variant;
+        unsigned which;
+        const Expr *payload;
+        if (variant_case(c, e, &variant, &which, &payload)) return made_record(c, e, variant, height); /* V.case(x) */
         int list = state_index(c, e->member);
         if (!strcmp(e->name, "has") && list >= 0 && c->state_types[list] == STATE_LIST) {
             /* people.has("bob"): whether a keyed list holds that key. */
@@ -3307,7 +3831,13 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         return e->op == FOLD_FIRST ? (Kind){INDEX, list} :
                (Kind){values == I64 && e->op != FOLD_DISTINCT ? I64 : NUM, -1}; /* an i64's sum, most or least */
     }
-    case E_RECORD: case E_FIELD:
+    case E_RECORD: { /* R { ... }: its fields onto the stack (027's 2c) */
+        int from = e->member[0] ? used_library(c, c->module, e->member) : c->module;
+        int record = from >= 0 ? module_record(c, from, e->name) : -1;
+        if (record < 0) fail_at(c, e->line, e->column, "unknown record '%s'", e->name);
+        return made_record(c, e, record, height);
+    }
+    case E_FIELD:
         fail_at(c, e->line, e->column, "a record value goes into a list, as in list.append(%s { ... })", e->name);
     case E_UNIT:
         fail_at(c, e->line, e->column, "a distance moves a cursor, as in at + 1 char");
@@ -3413,6 +3943,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             integer(c, e->args[0], handler, height);
             emit(c, e->line, e->column, BYTE, 0, 0);
             return (Kind){BYTES, -1};
+        }
+        if (e->op == CHAR) { /* char(n): the text of a code point, n an i64 (027's 2c) */
+            integer(c, e->args[0], handler, height);
+            emit(c, e->line, e->column, CHAR, 0, 0);
+            return (Kind){TEXT, -1};
         }
         if (e->op == I64_FROM) { /* i64(x): a whole number in range; a literal is one exactly */
             if (loose(e->args[0])) integer(c, e->args[0], handler, height);
@@ -3535,13 +4070,13 @@ static bool variant_case(Compiler *c, const Expr *e, int *variant, unsigned *ind
     *payload = NULL;
     if (e->kind == E_FN && *e->member) {
         type = e->member, label = e->name;
-        if (e->count > 1) fail_at(c, e->line, e->column, "%s.%s takes one value", type, label);
         *payload = e->count ? e->args[0] : NULL;
     } else if (e->kind == E_MEMBER && e->args[0]->kind == E_NAME) {
         type = e->args[0]->name, label = e->member;
     } else return false;
     int found = c->module ? -1 : module_record(c, 0, type);
     if (found < 0 || !c->records[found].variant) return false;
+    if (e->kind == E_FN && e->count > 1) fail_at(c, e->line, e->column, "%s.%s takes one value", type, label);
     const Record *v = &c->records[found];
     for (unsigned i = 0; i < v->declared_count; ++i) {
         if (strcmp(v->declared[i].name, label)) continue;
@@ -3583,8 +4118,11 @@ static Expr *member_of(Compiler *c, const Expr *x, const char *path) {
 /* The values of r's fields under prefix ("": all of them; a variant's case is the field named prefix, or case) from x:
  * a record written out, a variant's case, or an item (an index, a match's binding) whose fields of those names give
  * them (027's 2b). label names where it goes, for messages. */
-static void values_under(Compiler *c, const Record *r, const char *prefix, const Expr *x, const Expr **values, const char *label) {
+static const Expr *settled(Compiler *c, const Expr *x, int height);
+static void values_under(Compiler *c, const Record *r, const char *prefix, const Expr *x, const Expr **values, const char *label,
+                         int height) {
     char at[2 * NAME + 2];
+    x = settled(c, x, height);
     int tag = field_named(r, *prefix ? prefix : "case");
     int variant = tag >= 0 ? r->field_variant[tag] - 1 : -1;
     int which;
@@ -3598,7 +4136,7 @@ static void values_under(Compiler *c, const Record *r, const char *prefix, const
         if (!payload) return;
         const char *name = c->records[which].declared[index].name;
         snprintf(at, sizeof(at), "%s%s%s", prefix, *prefix ? "." : "", name);
-        if (composite(r, at)) values_under(c, r, at, payload, values, label); /* a record's or a variant's fields */
+        if (composite(r, at)) values_under(c, r, at, payload, values, label, height); /* a record's or a variant's fields */
         else values[field_named(r, at)] = payload;
         return;
     }
@@ -3607,7 +4145,7 @@ static void values_under(Compiler *c, const Record *r, const char *prefix, const
             if (!f->member[0]) continue; /* the spread: below */
             snprintf(at, sizeof(at), "%s%s%s", prefix, *prefix ? "." : "", f->member);
             int field = field_named(r, at);
-            if (composite(r, at)) values_under(c, r, at, f->args[0], values, label);
+            if (composite(r, at)) values_under(c, r, at, f->args[0], values, label, height);
             else if (field >= 0) {
                 if (values[field]) fail_at(c, f->line, f->column, "field '%s' is given twice", f->member);
                 values[field] = f->args[0];
@@ -3625,28 +4163,56 @@ static void values_under(Compiler *c, const Record *r, const char *prefix, const
     }
 }
 
-static void record_values_of(Compiler *c, const Expr *e, const Record *r, const char *label, const Expr **values);
+static void record_values_of(Compiler *c, const Expr *e, const Record *r, const char *label, const Expr **values, int height);
 
-static void record_values(Compiler *c, const Expr *e, int list, const Expr **values) {
-    record_values_of(c, e, record_of(c, list), c->state_names[list], values);
+static void record_values(Compiler *c, const Expr *e, int list, const Expr **values, int height) {
+    record_values_of(c, e, record_of(c, list), c->state_names[list], values, height);
 }
 
-static void record_values_of(Compiler *c, const Expr *e, const Record *r, const char *label, const Expr **values) {
+/* Whether e is a call of a fn run as a function (027's 2c). */
+static bool called_call(const Compiler *c, const Expr *e) {
+    int module = e->kind == E_FN && *e->member ? used_library(c, c->module, e->member) : c->module;
+    int fn = (e->kind == E_FN || e->kind == E_NAME) && module >= 0 ? fn_index(c, module, e->name) : -1;
+    return fn >= 0 && c->fns[fn].called;
+}
+
+/* A record's value a call gives, held by a name of its own first (its fields are read one by one); e else. */
+static const Expr *settled(Compiler *c, const Expr *x, int height) {
+    if (!called_call(c, x)) return x;
+    Kind kind = value(c, x, c->handling, height);
+    if (kind.type != RECORD) fail_at(c, x->line, x->column, "'%s' gives %s, not a record's value", x->name, type_name(kind.type));
+    Expr *name = node(c, E_NAME, x->line, x->column);
+    snprintf(name->name, NAME, ":%u", c->settled++);
+    name_value(c, name->name, kind, x->line, x->column);
+    pop_named(c, local_named(c, name->name), x->line, x->column);
+    return name;
+}
+
+static void record_values_of(Compiler *c, const Expr *e, const Record *r, const char *label, const Expr **values, int height) {
     if (r->scalar && e->kind != E_RECORD) { /* xs.append(5): the value itself */
         values[0] = e;
         return;
     }
     for (unsigned k = 0; k < r->fields; ++k) values[k] = NULL;
+    e = settled(c, e, height);
     int which;
     unsigned index;
     const Expr *payload;
     if (r->variant && variant_case(c, e, &which, &index, &payload)) { /* xs.append(Json.num(3)) */
-        values_under(c, r, "", e, values, label);
+        values_under(c, r, "", e, values, label, height);
         return;
     }
     char shown[2 * NAME + 1];
     snprintf(shown, sizeof(shown), "%s", record_shown(c, c->module, r));
-    if (r->variant && e->kind != E_RECORD) { /* an item of the variant, or a variant in a field: its fields */
+    char path[2 * NAME + 2];
+    int binding = e->kind != E_RECORD ? binding_path(c, e, path) : -1;
+    if (binding >= 0) { /* a record's value held by name, or one under it (027's 2c): of r alone */
+        bool root = !strcmp(path, c->locals[binding].name);
+        int held = root ? c->locals[binding].kind.owner : sub_record(c, c->locals[binding].kind.owner, path + strlen(c->locals[binding].name) + 1);
+        if (held != (int)(r - c->records))
+            fail_at(c, e->line, e->column, "'%s' holds %s, not %s", label, shown, held >= 0 ? c->records[held].name : path);
+    }
+    if ((r->variant || binding >= 0) && e->kind != E_RECORD) { /* an item of the variant, a variant in a field, or a value held by name */
         for (unsigned k = 0; k < r->fields; ++k) values[k] = member_of(c, e, r->field_names[k]);
         return;
     }
@@ -3657,7 +4223,7 @@ static void record_values_of(Compiler *c, const Expr *e, const Record *r, const 
     int from = e->member[0] ? used_library(c, c->module, e->member) : c->module;
     if (from != r->module || strcmp(e->name, r->name))
         fail_at(c, e->line, e->column, "'%s' holds %s, not %s%s%s", label, shown, e->member, e->member[0] ? "." : "", e->name);
-    values_under(c, r, "", e, values, label);
+    values_under(c, r, "", e, values, label, height);
     const Expr *spreading = spread_of(e);
     for (unsigned k = 0; spreading && k < r->fields; ++k)
         if (!values[k]) values[k] = spread_field(c, spreading, r->field_names[k]);
@@ -3703,7 +4269,7 @@ static void record_fields_of(Compiler *c, const Expr *e, const Record *r, const 
 
 static void record_fields(Compiler *c, const Expr *e, int list, int height) {
     const Expr *values[FIELDS_PER_RECORD];
-    record_values(c, e, list, values);
+    record_values(c, e, list, values, height);
     record_fields_of(c, e, record_of(c, list), values, height);
 }
 
@@ -3745,8 +4311,9 @@ static void view_changes(Compiler *c, const Stmt *s, int list, const char *name)
 /* The list a for or a fold walks, written as its name (a list, a message's rows, a let's) or as a path to a list
  * value (item.items, a match's binding): a value is bound to a register first. */
 static int walked_list(Compiler *c, const char *path, int line, int column) {
-    int named = state_index(c, path);
-    if (named >= 0 || (c->module == 0 && strchr(path, '.') == NULL && alias_named(c, path) < 0 && loop_named(c, path) < 0))
+    int named = state_index(c, path), local = strchr(path, '.') ? -1 : local_named(c, path);
+    if (named >= 0 || (c->module == 0 && strchr(path, '.') == NULL && alias_named(c, path) < 0 && loop_named(c, path) < 0 &&
+                       (local < 0 || c->locals[local].kind.type != LIST)))
         return list_state(c, path, line, column, NULL);
     Expr *e = path_expr(c, path, line, column);
     Kind kind = value(c, e, c->handling, 0);
@@ -3761,36 +4328,57 @@ static unsigned held_slot(Compiler *c, const Stmt *s, Type type) {
     return (type == TEXT ? HELD_TEXT : 0) + (*count)++;
 }
 
+static void chars_loop(Compiler *c, const Stmt *s, const Expr *subject);
+static bool text_path(Compiler *c, const char *path);
+
 static void statements(Compiler *c, const Stmt *s) {
     unsigned scope = c->local_count; /* a block's lets end with it */
-    for (; s; s = s->next) {
+    for (const Stmt *before = NULL; s; before = s, s = s->next) {
+        if (before && stops_one(before, true))
+            fail_at(c, s->line, s->column, "this is never run: the line before it returns or breaks");
         switch (s->kind) {
         case S_ARM: break; /* a match's: compiled with it */
         case S_MATCH: {
-            /* The item's index in a local; then for each arm, if its case is the one held, the arm (its binding the
-             * case's value: a field, a list, or a record's or a variant's fields under it). */
-            int list;
-            char path[2 * NAME + 2] = "";
+            /* The item's index in a local, or a record's value held by name (027's 2c); then for each arm, if its case
+             * is the one held, the arm (its binding the case's value: a field, a list, or a record's or a variant's
+             * fields under it). The last arm of a match that names every case is taken without asking. */
+            int list = -1, tag = -1;
+            char path[2 * NAME + 2] = "", base[2 * NAME + 2];
             const Expr *subject = s->value;
-            if (!((subject->kind == E_MEMBER || subject->kind == E_ITEM ||
-                   (subject->kind == E_NAME && alias_named(c, subject->name) >= 0)) &&
-                  item_path(c, subject, c->handling, 0, &list, path))) {
-                Kind kind = value(c, subject, c->handling, 0);
-                if (kind.type != INDEX)
-                    fail_at(c, subject->line, subject->column, "match takes an item that holds a variant, not %s", type_name(kind.type));
-                list = kind.owner;
+            int binding = binding_path(c, subject, base);
+            bool root = binding >= 0 && !strcmp(base, c->locals[binding].name);
+            const Record *r = NULL, *v;
+            unsigned slot = 0;
+            if (binding >= 0) {
+                int held = root ? c->locals[binding].kind.owner
+                                : sub_record(c, c->locals[binding].kind.owner, base + strlen(c->locals[binding].name) + 1);
+                if (held < 0 || !c->records[held].variant)
+                    fail_at(c, subject->line, subject->column, "match takes a variant; '%s' holds none", base);
+                v = &c->records[held];
+            } else {
+                if (!((subject->kind == E_MEMBER || subject->kind == E_ITEM ||
+                       (subject->kind == E_NAME && alias_named(c, subject->name) >= 0)) &&
+                      item_path(c, subject, c->handling, 0, &list, path))) {
+                    Kind kind = value(c, subject, c->handling, 0);
+                    if (kind.type != INDEX)
+                        fail_at(c, subject->line, subject->column, "match takes an item that holds a variant, not %s", type_name(kind.type));
+                    list = kind.owner;
+                }
+                r = record_of(c, list);
+                tag = field_named(r, *path ? path : "case");
+                if (tag < 0 || !r->field_variant[tag])
+                    fail_at(c, subject->line, subject->column, "match takes an item that holds a variant; '%s' holds none",
+                            *path ? path : r->name);
+                v = &c->records[r->field_variant[tag] - 1];
+                if (c->local_slots == LOCALS || c->alias_count == 16)
+                    fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+                slot = c->local_slots++;
+                emit(c, s->line, s->column, LOCAL_STORE, slot | 1u << 8 | (uint32_t)list << 16, 0);
             }
-            const Record *r = record_of(c, list);
-            int tag = field_named(r, *path ? path : "case");
-            if (tag < 0 || !r->field_variant[tag])
-                fail_at(c, subject->line, subject->column, "match takes an item that holds a variant; '%s' holds none",
-                        *path ? path : r->name);
-            const Record *v = &c->records[r->field_variant[tag] - 1];
-            if (c->local_slots == LOCALS || c->alias_count == 16)
-                fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
-            unsigned slot = c->local_slots++, ends[FIELDS_PER_RECORD + 1], arms = 0;
-            emit(c, s->line, s->column, LOCAL_STORE, slot | 1u << 8 | (uint32_t)list << 16, 0);
-            bool seen[FIELDS_PER_RECORD] = {false}, rest = false;
+            unsigned ends[FIELDS_PER_RECORD + 1], arms = 0, count = 0;
+            bool seen[FIELDS_PER_RECORD] = {false}, rest = false, every = true;
+            for (const Stmt *arm = s->then; arm; arm = arm->next) every = every && strcmp(arm->name, "_"), ++count;
+            every = every && count == v->declared_count; /* the last arm then takes what is left */
             for (const Stmt *arm = s->then; arm; arm = arm->next) {
                 if (rest) fail_at(c, arm->line, arm->column, "an arm after _ is never taken");
                 bool other = !strcmp(arm->name, "_");
@@ -3801,40 +4389,79 @@ static void statements(Compiler *c, const Stmt *s) {
                         fail_at(c, arm->line, arm->column, "variant '%s' has no case '%s'", v->name, arm->name);
                     if (seen[index]) fail_at(c, arm->line, arm->column, "case '%s' is matched twice", arm->name);
                     seen[index] = true;
-                    emit(c, arm->line, arm->column, LOCAL_LOAD, slot | 1u << 8 | (uint32_t)list << 16, 0);
-                    emit(c, arm->line, arm->column, ITEM_GET, (uint32_t)list | (uint32_t)tag << 16, 0);
+                }
+                bool asks = !other && !(every && !arm->next);
+                if (asks) {
+                    if (binding >= 0) {
+                        char at[2 * NAME + 2];
+                        field_path(v, 0, base, root, at);
+                        load_named(c, local_named(c, at), arm->line, arm->column);
+                    } else {
+                        emit(c, arm->line, arm->column, LOCAL_LOAD, slot | 1u << 8 | (uint32_t)list << 16, 0);
+                        emit(c, arm->line, arm->column, ITEM_GET, (uint32_t)list | (uint32_t)tag << 16, 0);
+                    }
                     emit_integer(c, arm->line, arm->column, index);
                     emit(c, arm->line, arm->column, I64_COMPARE, EQ - LT, 0);
                     skip = c->code_count;
                     emit(c, arm->line, arm->column, JZ, 0, 0);
                 }
                 bool bound = *arm->member;
+                unsigned names = c->local_count;
                 if (bound) {
                     if (other) fail_at(c, arm->key_line, arm->key_column, "_ holds no value to name");
                     if (!v->declared[index].kind && !*v->declared[index].type)
                         fail_at(c, arm->key_line, arm->key_column, "case '%s' holds no value to name", arm->name);
                     if (declared_kind(c, arm->member) || let_named(c, arm->member) >= 0 || loop_named(c, arm->member) >= 0)
                         fail_at(c, arm->key_line, arm->key_column, "'%s' is already a name here", arm->member);
-                    unsigned a = c->alias_count++;
-                    memcpy(c->aliases[a].name, arm->member, NAME);
-                    char at[2 * NAME + 2];
-                    snprintf(at, sizeof(at), "%s%s%s", path, *path ? "." : "", arm->name);
+                    char at[4 * NAME];
+                    snprintf(at, sizeof(at), "%s%s%s", binding >= 0 ? base : path, binding >= 0 || *path ? "." : "", arm->name);
                     if (strlen(at) >= NAME) fail_at(c, arm->line, arm->column, "a field's path '%s' passes 31 bytes", at);
-                    memcpy(c->aliases[a].path, at, strlen(at) + 1);
-                    c->aliases[a].list = list;
-                    c->aliases[a].slot = slot;
-                    c->aliases[a].prefix = composite(r, c->aliases[a].path);
+                    if (binding >= 0) { /* names for what the case holds: its fields' locals, under the name */
+                        int field = local_named(c, at);
+                        int held = field >= 0 ? -1 : sub_record(c, (int)(v - c->records), arm->name);
+                        if (field < 0 && held < 0) fail_at(c, arm->line, arm->column, "case '%s' holds nothing here", arm->name);
+                        if (c->local_count == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+                        unsigned local = c->local_count++;
+                        if (field >= 0) c->locals[local] = c->locals[field];
+                        else {
+                            memset(&c->locals[local], 0, sizeof(c->locals[local]));
+                            c->locals[local].kind = (Kind){RECORD, held};
+                            c->locals[local].list = -1;
+                        }
+                        memcpy(c->locals[local].name, arm->member, NAME);
+                        c->locals[local].alias = true;
+                        const Record *inner = held >= 0 ? &c->records[held] : NULL;
+                        for (unsigned k = 0; inner && k < inner->fields; ++k) {
+                            char from[2 * NAME + 2], name[2 * NAME + 2];
+                            field_path(inner, k, at, false, from);
+                            snprintf(name, sizeof(name), "%s.%s", arm->member, inner->field_names[k]);
+                            if (strlen(name) >= NAME) fail_at(c, arm->line, arm->column, "'%s' passes 31 bytes", name);
+                            if (c->local_count == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
+                            unsigned each = c->local_count++;
+                            c->locals[each] = c->locals[local_named(c, from)];
+                            memcpy(c->locals[each].name, name, strlen(name) + 1);
+                            c->locals[each].alias = true;
+                        }
+                    } else {
+                        unsigned a = c->alias_count++;
+                        memcpy(c->aliases[a].name, arm->member, NAME);
+                        memcpy(c->aliases[a].path, at, strlen(at) + 1);
+                        c->aliases[a].list = list;
+                        c->aliases[a].slot = slot;
+                        c->aliases[a].prefix = composite(r, c->aliases[a].path);
+                    }
                 }
                 ++c->nested;
                 statements(c, arm->then);
                 --c->nested;
-                if (bound) --c->alias_count;
+                if (bound && binding < 0) --c->alias_count;
+                c->local_count = names;
                 if (other) rest = true;
-                else {
+                if (arm->next && !stops(arm->then, true)) {
                     ends[arms++] = c->code_count;
                     emit(c, arm->line, arm->column, JMP, 0, 0);
-                    c->code[skip].arg = c->code_count;
                 }
+                if (asks) c->code[skip].arg = c->code_count;
             }
             for (unsigned i = 0; !rest && i < v->declared_count; ++i)
                 if (!seen[i]) fail_at(c, s->line, s->column, "match misses case '%s': add it, or _ for the rest", v->declared[i].name);
@@ -3870,6 +4497,13 @@ static void statements(Compiler *c, const Stmt *s) {
             }
             if (c->local_slots == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
             Kind held = value(c, s->value, c->handling, 0);
+            if (held.type == TUPLE)
+                fail_at(c, s->value->line, s->value->column, "this gives several values: name each, as in let a, b = ...");
+            if (held.type == RECORD || held.type == LIST) { /* a record's value, a list's (027's 2c) */
+                name_value(c, s->name, held, s->line, s->column);
+                pop_named(c, local_named(c, s->name), s->line, s->column);
+                break;
+            }
             if (held.type == BYTES || held.type == TEXT) { /* held by name in Pure: a slot of its own */
                 unsigned slot = held_slot(c, s, held.type);
                 unsigned local = c->local_count++;
@@ -3896,12 +4530,20 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_LETS: {
             const Expr *v = s->value;
             Kind kinds[STACK];
-            for (unsigned i = 0; i < s->name_count; ++i, v = v->next) {
-                kinds[i] = value(c, v, c->handling, (int)i);
+            if (!v->next) { /* one value: a fn's call that gives them all (027's 2c) */
+                Kind given = value(c, v, c->handling, 0);
+                const Instance *in = given.type == TUPLE ? &c->instances[given.owner] : NULL;
+                if (!in || in->result_count != s->name_count)
+                    fail_at(c, in ? v->line : s->line, in ? v->column : s->column, "%u names take %u values, not %u", s->name_count,
+                            s->name_count, in ? in->result_count : 1);
+                memcpy(kinds, in->results, s->name_count * sizeof(*kinds));
+            } else for (unsigned i = 0, height = 0; i < s->name_count; ++i, v = v->next) {
+                kinds[i] = value(c, v, c->handling, (int)height);
+                height += cells(c, kinds[i]);
                 if (kinds[i].type != NUM && kinds[i].type != BOOL && kinds[i].type != I64 && kinds[i].type != INDEX &&
-                    kinds[i].type != BYTES && kinds[i].type != TEXT)
-                    fail_at(c, v->line, v->column, "a let holds a number, a bool, an i64, an index, bytes or text, not %s",
-                            type_name(kinds[i].type));
+                    kinds[i].type != BYTES && kinds[i].type != TEXT && kinds[i].type != RECORD && kinds[i].type != LIST)
+                    fail_at(c, v->line, v->column, "a let holds a number, a bool, an i64, an index, bytes, text, a list or a record, "
+                            "not %s", type_name(kinds[i].type));
             }
             unsigned first = c->local_count;
             for (unsigned i = 0; i < s->name_count; ++i) {
@@ -3910,26 +4552,37 @@ static void statements(Compiler *c, const Stmt *s) {
                 const char *kind = declared_kind(c, name);
                 if (kind) fail_at(c, s->line, s->column, "'%s' is already declared as %s", name, kind);
                 if (loop_named(c, name) >= 0) fail_at(c, s->line, s->column, "'%s' is named by a for around it", name);
-                if (c->local_count == LOCALS || c->local_slots == LOCALS)
-                    fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
-                unsigned local = c->local_count++;
-                memset(&c->locals[local], 0, sizeof(c->locals[local]));
-                memcpy(c->locals[local].name, name, NAME);
-                bool held = kinds[i].type == BYTES || kinds[i].type == TEXT;
-                c->locals[local].slot = held ? held_slot(c, s, kinds[i].type) : c->local_slots++;
-                c->locals[local].kind = kinds[i];
-                c->locals[local].list = -1;
+                name_value(c, name, kinds[i], s->line, s->column);
             }
-            for (unsigned i = s->name_count; i-- > 0;) {
-                const Kind *kind = &c->locals[first + i].kind;
-                if (kind->type == BYTES || kind->type == TEXT) emit(c, s->line, s->column, BYTES_STORE, c->locals[first + i].slot, 0);
-                else emit(c, s->line, s->column, LOCAL_STORE, local_arg(c, (int)(first + i)), 0);
-            }
+            (void)first;
+            for (unsigned i = s->name_count; i-- > 0;) pop_named(c, local_named(c, s->names[i]), s->line, s->column);
             break;
         }
         case S_ASSIGNS: {
             const Expr *v = s->value;
             int locals[STACK], states[STACK];
+            if (!v->next) { /* a fn's call that gives them all (027's 2c): each into a let of its kind */
+                Kind given = value(c, v, c->handling, 0);
+                const Instance *in = given.type == TUPLE ? &c->instances[given.owner] : NULL;
+                if (!in || in->result_count != s->name_count)
+                    fail_at(c, in ? v->line : s->line, in ? v->column : s->column, "%u names take %u values, not %u", s->name_count,
+                            s->name_count, in ? in->result_count : 1);
+                for (unsigned i = 0; i < s->name_count; ++i) { /* a let of its kind, or a number's, bool's or i64's state */
+                    locals[i] = local_named(c, s->names[i]);
+                    states[i] = locals[i] < 0 ? state_index(c, s->names[i]) : -1;
+                    int type = states[i] >= 0 ? c->state_types[states[i]] : -1;
+                    Kind held = locals[i] >= 0 ? c->locals[locals[i]].kind :
+                                (Kind){type == STATE_NUM ? NUM : type == STATE_BOOL ? BOOL : type == STATE_I64 ? I64 : 0, -1};
+                    if ((locals[i] < 0 && !held.type) || (locals[i] >= 0 && c->locals[locals[i]].counter) || !same_kind(held, in->results[i]))
+                        fail_at(c, s->line, s->column, "'%s' takes %s here: a let or a state of that kind", s->names[i],
+                                type_name(in->results[i].type));
+                    if (states[i] >= 0) view_changes(c, s, -1, s->names[i]);
+                }
+                for (unsigned i = s->name_count; i-- > 0;)
+                    if (locals[i] >= 0) pop_named(c, locals[i], s->line, s->column);
+                    else emit(c, s->line, s->column, STORE, (uint32_t)states[i], 0);
+                break;
+            }
             for (unsigned i = 0; i < s->name_count; ++i, v = v->next) {
                 const char *name = s->names[i];
                 locals[i] = local_named(c, name);
@@ -3977,6 +4630,16 @@ static void statements(Compiler *c, const Stmt *s) {
                 emit(c, s->line, s->column, BYTES_STORE, c->locals[local].slot | (append ? HELD_APPEND : 0), 0);
                 break;
             }
+            if (local >= 0 && (c->locals[local].kind.type == RECORD || c->locals[local].kind.type == LIST)) { /* (027's 2c) */
+                Kind kind = value(c, s->value, c->handling, 0);
+                if (!same_kind(kind, c->locals[local].kind))
+                    fail_at(c, s->value->line, s->value->column, "'%s' holds %s of %s", s->name, type_name(c->locals[local].kind.type),
+                            c->records[c->locals[local].kind.owner].name);
+                pop_named(c, local, s->line, s->column);
+                break;
+            }
+            if (local >= 0 && c->locals[local].alias)
+                fail_at(c, s->line, s->column, "'%s' names what a case holds; it is not assigned", s->name);
             if (local >= 0) { /* a let takes a new value of its kind */
                 Kind kind = wanted(c, s->value, c->handling, 0, c->locals[local].kind.type);
                 if (kind.type != c->locals[local].kind.type || (kind.type == INDEX && kind.owner != c->locals[local].kind.owner))
@@ -4059,7 +4722,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 view_changes(c, s, list, c->state_names[list]);
                 const Record *inner = &c->records[r->field_record[field]];
                 const Expr *values[FIELDS_PER_RECORD];
-                record_values_of(c, s->value, inner, path, values);
+                record_values_of(c, s->value, inner, path, values, 1);
                 record_fields_of(c, s->value, inner, values, 1);
                 emit(c, s->line, s->column, APPEND_IN, (uint32_t)list | (uint32_t)field << 16, 0);
                 break;
@@ -4086,7 +4749,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 view_changes(c, s, list, s->name);
                 const Record *r = record_of(c, list);
                 const Expr *values[FIELDS_PER_RECORD];
-                record_values(c, s->value, list, values);
+                record_values(c, s->value, list, values, 0);
                 int key = c->list_key[list] - 1;
                 for (unsigned k = 0; k < r->fields; ++k)
                     if (!values[k]) fail_at(c, s->value->line, s->value->column, "%s[...] = %s { ... } needs '%s'", s->name,
@@ -4175,6 +4838,10 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_FOR: {
             /* EACH and the block after it, run once for every item the list has, with the item as ROW. */
             if (c->loop_count == NESTING) fail_at(c, s->line, s->column, "fors nest at most %d deep", NESTING);
+            if (!s->low && !s->value && text_path(c, s->member)) { /* for ch in t: its characters (027's 2c) */
+                chars_loop(c, s, path_expr(c, s->member, s->first->line, s->first->column));
+                break;
+            }
             int list = walked_list(c, s->member, s->first->line, s->first->column);
             const char *kind = declared_kind(c, s->name);
             if (kind) fail_at(c, s->last->line, s->last->column, "'%s' is already declared as %s", s->name, kind);
@@ -4228,11 +4895,12 @@ static void statements(Compiler *c, const Stmt *s) {
             ++c->nested;
             statements(c, s->then);
             if (s->otherwise) {
+                bool past = !stops(s->then, true); /* (a then that returns or breaks has no way past the else) */
                 unsigned skip = c->code_count;
-                emit(c, s->line, s->column, JMP, 0, 0);
+                if (past) emit(c, s->line, s->column, JMP, 0, 0);
                 c->code[jump].arg = c->code_count;
                 statements(c, s->otherwise);
-                c->code[skip].arg = c->code_count;
+                if (past) c->code[skip].arg = c->code_count;
             } else c->code[jump].arg = c->code_count;
             --c->nested;
             break;
@@ -4274,7 +4942,48 @@ static void statements(Compiler *c, const Stmt *s) {
             if (!c->loop_count) fail_at(c, s->line, s->column, "break ends a for; this one is outside any");
             emit(c, s->line, s->column, BREAK, 0, 0);
             break;
-        case S_RETURN: /* a view's body's value, its last line */
+        case S_CALL: {
+            Kind kind = value(c, s->value, c->handling, 0);
+            if (kind.type != NOTHING)
+                fail_at(c, s->line, s->column, "'%s' gives %s: name it, as in let x = %s(...)", s->value->name,
+                        kind.type == TUPLE ? "several values" : type_name(kind.type), s->value->name);
+            break;
+        }
+        case S_RETURN:
+            if (c->current >= 0) { /* what a fn's call gives (027's 2c) */
+                Instance *in = &c->instances[c->current];
+                const char *name = c->fns[in->fn].name;
+                Kind kinds[STACK];
+                unsigned count = 0;
+                int height = 0;
+                for (const Expr *v = s->value; v; v = v->next) { /* each as its type, once known (a literal an i64's) */
+                    Type want = in->known && count < in->result_count ? in->results[count].type : 0;
+                    Kind kind = as_value(c, v, want == NUM || want == I64 ? wanted(c, v, true, height, want) : value(c, v, true, height));
+                    if (kind.type == TUPLE) { /* return f(x): what it gives */
+                        if (v != s->value || v->next) fail_at(c, v->line, v->column, "a call that gives several values returns alone");
+                        memcpy(kinds, c->instances[kind.owner].results, c->instances[kind.owner].result_count * sizeof(*kinds));
+                        count = c->instances[kind.owner].result_count;
+                        break;
+                    }
+                    if (count == STACK) fail_at(c, v->line, v->column, "a fn gives at most %d values", STACK);
+                    kinds[count++] = kind;
+                    height += (int)cells(c, kind);
+                    if (height > STACK) fail_at(c, v->line, v->column, "expression needs more than 64 stack values");
+                }
+                if (!in->known) {
+                    memcpy(in->results, kinds, count * sizeof(*kinds));
+                    in->result_count = count, in->known = true;
+                }
+                bool same = count == in->result_count;
+                for (unsigned k = 0; same && k < count; ++k) same = same_kind(kinds[k], in->results[k]);
+                if (!same)
+                    fail_at(c, s->line, s->column, "fn '%s' gives %u value%s here (%s first), and %u before (%s first)", name, count,
+                            count == 1 ? "" : "s", count ? type_name(kinds[0].type) : "none", in->result_count,
+                            in->result_count ? type_name(in->results[0].type) : "none");
+                emit(c, s->line, s->column, RETURN, (uint32_t)c->current, 0);
+                break;
+            }
+            /* a view's body's value, its last line */
             if (c->handling) fail_at(c, s->line, s->column, "return gives a view's body its value; a handler returns nothing");
             if (s->next || c->nested) fail_at(c, s->line, s->column, "return is the last line of a view's body");
             c->returned = value(c, s->value, false, 0);
@@ -4282,6 +4991,98 @@ static void statements(Compiler *c, const Stmt *s) {
             break;
         }
     }
+    c->local_count = scope;
+}
+
+/* Whether a for's list names a text (027's 2c): a let's, a parameter's, a state's, or a text field of a record's value
+ * held by name. */
+static bool text_path(Compiler *c, const char *path) {
+    if (strchr(path, '.')) { /* a record's text field, or a message's */
+        char bound[2 * NAME + 2], field[NAME];
+        Expr *e = path_expr(c, path, 0, 0);
+        int binding = binding_path(c, e, bound), local = binding >= 0 ? local_named(c, bound) : -1, input;
+        if (binding < 0 && message_path(c, e, &input, field))
+            for (unsigned f = 0; f < c->inputs[input].fields; ++f)
+                if (!strcmp(c->inputs[input].field_names[f], field)) return c->inputs[input].field_types[f] == FIELD_TEXT;
+        return local >= 0 && c->locals[local].kind.type == TEXT;
+    }
+    int param = parameter(c, path), local = c->scope ? -1 : local_named(c, path), state = c->module ? -1 : state_index(c, path);
+    if (param >= 0) return c->scope->kinds[param].type == TEXT;
+    if (local >= 0) return c->locals[local].kind.type == TEXT;
+    return state >= 0 && c->state_types[state] == STATE_TEXT;
+}
+
+/* for ch in t: t held by a name of its own, then a count whose block begins if at >= end { break }, takes the character
+ * at at (its code point, an i64 named ch, read only) and moves at past it (1 to 4 bytes, by the code point). */
+static void chars_loop(Compiler *c, const Stmt *s, const Expr *subject) {
+    int line = s->line, column = s->column;
+    const char *kind = declared_kind(c, s->name);
+    if (kind) fail_at(c, s->last->line, s->last->column, "'%s' is already declared as %s", s->name, kind);
+    if (let_named(c, s->name) >= 0 || loop_named(c, s->name) >= 0)
+        fail_at(c, s->last->line, s->last->column, "'%s' is already a let or a for's name here", s->name);
+    unsigned scope = c->local_count;
+    expect_kind(c, subject, value(c, subject, c->handling, 0), TEXT);
+    char name[NAME];
+    int locals[4];
+    static const char *const parts[] = {"text", "at", "end", "n"};
+    static const Type types[] = {TEXT, I64, I64, NUM};
+    for (unsigned k = 0; k < 4; ++k) {
+        snprintf(name, sizeof(name), ":%.24s.%s", s->name, parts[k]);
+        name_value(c, name, (Kind){types[k], -1}, line, column);
+        locals[k] = (int)c->local_count - 1;
+    }
+    name_value(c, s->name, (Kind){I64, -1}, line, column);
+    int ch = (int)c->local_count - 1;
+    c->locals[ch].counter = true;
+    store_named(c, locals[0], line, column);
+    load_named(c, locals[0], line, column);
+    emit(c, line, column, TEXT_BYTES, 0, 0);
+    emit(c, line, column, I64_FROM, 0, 0);
+    store_named(c, locals[2], line, column);
+    emit_integer(c, line, column, 0);
+    store_named(c, locals[1], line, column);
+    emit(c, line, column, CONST, 0, 0);
+    emit(c, line, column, CONST, 0, 9007199254740992.0);
+    unsigned loop = c->loop_count++, at = c->code_count;
+    memcpy(c->loops[loop].name, s->name, NAME);
+    c->loops[loop].list = -1;
+    c->loops[loop].item = -1;
+    c->loops[loop].scope = c->scope;
+    emit(c, line, column, LOOP, 0, 0);
+    load_named(c, locals[1], line, column); /* if at >= end { break } */
+    load_named(c, locals[2], line, column);
+    emit(c, line, column, I64_COMPARE, GE - LT, 0);
+    unsigned skip = c->code_count;
+    emit(c, line, column, JZ, 0, 0);
+    emit(c, line, column, BREAK, 0, 0);
+    c->code[skip].arg = c->code_count;
+    load_named(c, locals[0], line, column); /* ch = the character at at */
+    load_named(c, locals[1], line, column);
+    emit(c, line, column, CHAR_AT, 0, 0);
+    emit(c, line, column, LOCAL_STORE, local_arg(c, ch), 0);
+    load_named(c, locals[1], line, column); /* at = at + its bytes */
+    static const int64_t below[] = {0x80, 0x800, 0x10000};
+    unsigned exits[3];
+    for (unsigned k = 0; k < 3; ++k) {
+        emit(c, line, column, LOCAL_LOAD, local_arg(c, ch), 0);
+        emit_integer(c, line, column, below[k]);
+        emit(c, line, column, I64_COMPARE, 0, 0);
+        unsigned next = c->code_count;
+        emit(c, line, column, JZ, 0, 0);
+        emit_integer(c, line, column, (int64_t)k + 1);
+        exits[k] = c->code_count;
+        emit(c, line, column, JMP, 0, 0);
+        c->code[next].arg = c->code_count;
+    }
+    emit_integer(c, line, column, 4);
+    for (unsigned k = 0; k < 3; ++k) c->code[exits[k]].arg = c->code_count;
+    emit(c, line, column, I64_ADD, 0, 0);
+    store_named(c, locals[1], line, column);
+    ++c->nested;
+    statements(c, s->then);
+    --c->nested;
+    c->code[at].arg = c->locals[locals[3]].slot | (c->code_count - at - 1) << 16;
+    --c->loop_count;
     c->local_count = scope;
 }
 
@@ -4327,8 +5128,9 @@ static uint32_t intern(unsigned char *strings, size_t *used, const char *text) {
  * blocks, which hold one record keyed one way; no two handlers of one event
  * have one, so each begins empty. */
 static void event_lists(Compiler *c) {
-    for (unsigned h = 0; h < c->handler_count + c->views; ++h) /* the handlers', then the views' bodies' */
-        for (const Stmt *s = h < c->handler_count ? c->handlers[h].body : c->view_body[h - c->handler_count]; s; s = s->next) {
+    for (unsigned h = 0; h < c->handler_count + c->views + c->fn_count; ++h) /* the handlers', the views' bodies', the fns' */
+        for (const Stmt *s = h < c->handler_count ? c->handlers[h].body : h < c->handler_count + c->views ?
+                             c->view_body[h - c->handler_count] : c->fns[h - c->handler_count - c->views].block; s; s = s->next) {
             if (s->kind != S_LET || !s->listed) continue;
             char path[2 * NAME];
             snprintf(path, sizeof(path), "let.%s", s->name);
@@ -4533,6 +5335,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     event_lists(c);
     pull_records(c);
     flatten_records(c);
+    called_fns(c);
     for (unsigned i = 0; i < c->states; ++i) {
         if (c->state_types[i] == STATE_TEXT) {
             Expr empty = {.kind = E_TEXT, .line = c->state_line[i], .column = c->state_column[i]};
@@ -4665,6 +5468,24 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         statements(c, c->handlers[i].body);
         c->handler_code[i][1] = c->code_count - c->handler_code[i][0];
     }
+    /* The functions' code after the handlers' and views' (027's 2c), each one's jumps moved with it. */
+    unsigned signature_items = 0;
+    for (unsigned i = 0; i < c->instance_count; ++i) {
+        Instance *in = &c->instances[i];
+        if (c->code_count + in->count > CODE) fail_at(c, 1, 1, "program exceeds 65535 instructions");
+        in->start = c->code_count;
+        for (unsigned k = 0; k < in->count; ++k) {
+            Op op = in->ops[k];
+            if (op.op == JZ || op.op == JMP) op.arg += in->start;
+            c->ops[c->code_count++] = op;
+        }
+        unsigned taken = 0, given = 0;
+        for (unsigned k = 0; k < in->param_count; ++k) taken += cells(c, in->params[k]);
+        for (unsigned k = 0; k < in->result_count; ++k) given += cells(c, in->results[k]);
+        if (taken > STACK || given > STACK)
+            fail_at(c, c->fns[in->fn].line, c->fns[in->fn].column, "fn '%s' takes or gives more than 64 values", c->fns[in->fn].name);
+        signature_items += taken + given;
+    }
     static unsigned char strings[(STATES + COLLECTIONS + 2 * INPUTS + FIELDS + VIEWS + RECORDS + RECORD_FIELDS) * NAME];
     size_t used = 0;
     uint32_t state_name[STATES] = {0}, collection_name[COLLECTIONS] = {0}, input_name[INPUTS] = {0}, input_key[INPUTS] = {0};
@@ -4689,7 +5510,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             record_field_name[i][k] = intern(strings, &used, c->records[i].field_names[k]);
     }
     *size = 40 + 16u * c->states + 12u * c->collections + 16u * c->input_count + 8u * fields + 8u * c->constants +
-            8u * c->record_count + 16u * c->record_fields + 16u * c->views + 12u * c->handler_count + 16u * c->code_count + used + c->constant_used;
+            8u * c->record_count + 16u * c->record_fields + 16u * c->views + 12u * c->handler_count + 12u * c->instance_count +
+            4u * signature_items + 16u * c->code_count + used + c->constant_used;
     unsigned char *p = *module = allocate(c, *size);
     memcpy(p, "PUREMOD6", 8);
     put16(p + 8, c->states);
@@ -4704,6 +5526,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     put16(p + 30, c->record_count);
     put32(p + 32, (uint32_t)c->constant_used);
     put16(p + 36, c->record_fields);
+    put16(p + 38, c->instance_count);
     p += 40;
     for (unsigned i = 0; i < c->states; ++i) {
         p = put32(p, state_name[i]);
@@ -4770,6 +5593,32 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         p = put32(p, c->handler_code[i][0]);
         p = put32(p, c->handler_code[i][1]);
     }
+    for (unsigned i = 0; i < c->instance_count; ++i) { /* functions: a block, how many values it takes and gives */
+        const Instance *in = &c->instances[i];
+        unsigned taken = 0, given = 0;
+        for (unsigned k = 0; k < in->param_count; ++k) taken += cells(c, in->params[k]);
+        for (unsigned k = 0; k < in->result_count; ++k) given += cells(c, in->results[k]);
+        p = put32(p, in->start);
+        p = put32(p, in->count);
+        *p++ = (unsigned char)taken, *p++ = (unsigned char)given;
+        p = put16(p, 0);
+    }
+    for (unsigned i = 0; i < c->instance_count; ++i) /* their values' types, those taken then those given */
+        for (unsigned k = 0; k < c->instances[i].param_count + c->instances[i].result_count; ++k) {
+            const Instance *in = &c->instances[i];
+            Kind kind = k < in->param_count ? in->params[k] : in->results[k - in->param_count];
+            static const uint8_t types[] = {[NUM] = 0, [TEXT] = 1, [BOOL] = 2, [I64] = 3, [LIST] = 4, [BYTES] = 5};
+            if (kind.type != RECORD) {
+                *p++ = types[kind.type], *p++ = 0;
+                p = put16(p, kind.type == LIST ? (uint32_t)kind.owner : 0);
+                continue;
+            }
+            const Record *r = &c->records[kind.owner];
+            for (unsigned f = 0; f < r->fields; ++f) {
+                *p++ = types[r->field_kinds[f]], *p++ = 0;
+                p = put16(p, r->field_kinds[f] == LIST ? (uint32_t)r->field_record[f] : 0);
+            }
+        }
     for (unsigned i = 0; i < c->code_count; ++i) {
         *p++ = c->code[i].op; *p++ = 0; *p++ = 0; *p++ = 0;
         p = put32(p, c->code[i].arg);
@@ -4793,6 +5642,9 @@ bool aup_compile(const char *source, size_t length, AupLoad load, void *context,
     c->row = -1;
     c->arguments = -1;
     c->fold_list = -1;
+    c->code = c->ops;
+    c->code_capacity = CODE;
+    c->current = -1;
     c->load = load;
     c->load_context = context;
     c->module_count = 1; /* the main source */
@@ -4812,6 +5664,7 @@ bool aup_compile(const char *source, size_t length, AupLoad load, void *context,
         *size = 0;
     }
     for (size_t i = 0; i < c->block_count; ++i) free(c->blocks[i]);
+    for (unsigned i = 0; i < c->instance_count; ++i) free(c->instances[i].ops);
     free(c->blocks);
     free(c);
     return *module != NULL;
