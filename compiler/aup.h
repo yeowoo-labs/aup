@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 /* aup: source text to a Pure module (Pure docs/design/008-module-format.md). */
-enum { AUP_SOURCE_LIMIT = 32768, AUP_MESSAGE = 256, AUP_PATH = 256 };
+enum { AUP_MESSAGE = 256, AUP_PATH = 256 };
 
 typedef struct {
     char path[AUP_PATH]; /* the library the error is in, or "" for the main source */

@@ -14,16 +14,28 @@ static int usage(void) {
     return 2;
 }
 
-/* Read a whole source (up to one byte past the limit, which the compiler
- * reports); NULL if it cannot be read. */
+/* All of a file's bytes, of any size (Pure 027's 4f-4); NULL if they cannot be read. */
+static char *read_all(FILE *file, size_t *length) {
+    size_t room = 1 << 15, used = 0;
+    char *bytes = malloc(room);
+    while (bytes) {
+        used += fread(bytes + used, 1, room - used, file);
+        if (used < room || ferror(file)) break;
+        char *grown = room <= SIZE_MAX / 2 ? realloc(bytes, room *= 2) : NULL;
+        if (!grown) { free(bytes); bytes = NULL; }
+        else bytes = grown;
+    }
+    if (bytes && ferror(file)) { free(bytes); bytes = NULL; }
+    *length = bytes ? used : 0;
+    return bytes;
+}
+
+/* Read a whole source; NULL if it cannot be read. */
 static char *read_source(const char *path, size_t *length) {
     FILE *file = fopen(path, "rb");
     if (!file) return NULL;
-    char *source = malloc(AUP_SOURCE_LIMIT + 1);
-    *length = source ? fread(source, 1, AUP_SOURCE_LIMIT + 1, file) : 0;
-    bool failed = !source || ferror(file);
+    char *source = read_all(file, length);
     fclose(file);
-    if (failed) { free(source); return NULL; }
     return source;
 }
 
@@ -137,8 +149,7 @@ static int query(const char *app, const char *query_path, const char *out) {
     if (!app_source) { perror(app); return 2; }
     char *query_source = NULL;
     if (strcmp(query_path, "-")) query_source = read_input(&inputs, query_path, &query_length);
-    else if ((query_source = malloc(AUP_SOURCE_LIMIT + 1)))
-        query_length = fread(query_source, 1, AUP_SOURCE_LIMIT + 1, stdin);
+    else query_source = read_all(stdin, &query_length);
     char *source = query_source ? malloc(app_length + 1 + query_length) : NULL;
     if (!source) {
         perror(query_path);

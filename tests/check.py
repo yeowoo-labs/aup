@@ -185,7 +185,7 @@ DIAGNOSTICS = [
     ('\n'.join(['fn f0(x) = x + 1'] + [f'fn f{i}(x) = f{i - 1}(f{i - 1}(x))' for i in range(1, 15)] + ['view v = f14(1)']) + '\n',
      '1:14', "program exceeds 65535 instructions (in fn 'f0' called at 2:15)"),
     ('view v = ' + '(' * 70 + '1' + ')' * 70 + '\n', '1:', 'expression nesting exceeds 64'),
-    ('state s = 0\n' * 1 + ''.join(f'state s{i} = 0\n' for i in range(32)), '33:7', 'at most 32 states are allowed'),
+    ('state s = 0\n' * 1 + ''.join(f'state s{i} = 0\n' for i in range(4096)), '4097:7', 'at most 4096 states are allowed'),
     # v0b: messages and types
     ('input m = message { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'reply takes bytes or text, not a number'),
     ('input m = message {\n  a: float\n}\n', '2:6', 'field types are u32, i64, number, bool, bytes, text and list of a record'),
@@ -2415,6 +2415,20 @@ def main():
             assert json.loads(run(pure_run, work / f'good{number}.pmod', stdin='frame\nshow\n').stdout.splitlines()[-1])['error'] is None
         report['diagnostics'] = len(DIAGNOSTICS)
         report['accepted_forms'] = len(ACCEPTED)
+
+        # No fixed counts but Pure's widths (Pure 027's 4f): 300 states, 40 inputs, 70 views and 20 records, in a source past
+        # 32 KB (40 KB of comments), compiled and run to the last of each.
+        wide = ''.join(f'record R{r} {{\n  a = 0\n}}\n' for r in range(20)) + 'state items: list of R19\n'
+        wide += ''.join(f'state s{i} = 0\n' for i in range(300)) + ''.join(f'input m{i} = message {{ n: u32 }}\n' for i in range(40))
+        wide += 'on m39 {\n  s299 = s299 + m39.n\n  items.append(R19 { a: m39.n })\n}\n'
+        wide += ''.join(f'view v{i} = s{i}\n' for i in range(69)) + 'view v69 = items.count\n'
+        wide += ''.join(f'# {i:05} ' + 'x' * 60 + '\n' for i in range(600))
+        assert len(wide) > 40000
+        (work / 'wide.aup').write_text(wide)
+        compile_module(aup, work / 'wide.aup', work / 'wide.pmod')
+        shown = json.loads(run(pure_run, work / 'wide.pmod', stdin='message m39 05000000\nmessage m39 02000000\n').stdout.splitlines()[-1])
+        assert shown['error'] is None and shown['states']['s299'] == 7 and shown['views']['v69'] == 2, shown['states']['s299']
+        report['wide_program'] = {'states': 301, 'inputs': 40, 'views': 70, 'records': 20, 'source_bytes': len(wide)}
 
         # message like X is X's fields, written once: the same module, byte for byte.
         fields = '  title: text\n  lane: u32\n  to: {\n    city: text\n  }\n'

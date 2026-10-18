@@ -8,11 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Limits and opcodes of Pure module format v6. */
-enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK = 64, NAME = 32, JOINS = 8,
+/* Limits and opcodes of Pure module format v7. Pure counts its states, inputs, views, handlers, records and record fields
+ * in u16s alone (027's 4f): the compiler's tables hold these many (their rooms unused but by what a program declares). A
+ * message's fields (FIELDS) and a record's (FIELDS_PER_RECORD) are Pure's widths; functions Pure's 64. */
+enum { STATES = 4096, INPUTS = 1024, VIEWS = 4096, HANDLERS = 4096, CODE = 65535, STACK = 64, NAME = 32, JOINS = 8,
        DEPTH = 64, FIELDS = 64, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
-       RECORDS = 16, RECORD_FIELDS = 128, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9,
-       LIBRARY_RECORDS = 64 };
+       RECORDS = 1024, RECORD_FIELDS = 16384, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9,
+       LIBRARY_RECORDS = 1024, OUTPUTS = 255 };
 enum { CONST, LOAD, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, LEN, REPLY, REQUIRE,
        TEXT_CONST, TEXT_LOAD, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
@@ -1740,7 +1742,7 @@ static void record_declaration(Compiler *c) {
     Token name = expect_name(c, "record name");
     declare(c, &name);
     bool library = c->module != 0; /* a library's: into the module once the app holds it in a list */
-    if (!library && c->record_count == RECORDS) fail_at(c, name.line, name.column, "at most 16 records are allowed");
+    if (!library && c->record_count == RECORDS) fail_at(c, name.line, name.column, "at most %d records are allowed", RECORDS);
     if (library && c->library_record_count == LIBRARY_RECORDS)
         fail_at(c, name.line, name.column, "the libraries declare at most %d records", LIBRARY_RECORDS);
     Record *r = library ? &c->library_records[c->library_record_count] : &c->records[c->record_count];
@@ -1791,7 +1793,7 @@ static void record_declaration(Compiler *c) {
     if (!r->typed) { /* plain: its fields as written */
         for (unsigned i = 0; i < r->declared_count; ++i) {
             if (!library && c->record_fields == RECORD_FIELDS)
-                fail_at(c, r->declared[i].line, r->declared[i].column, "at most 128 record fields are allowed");
+                fail_at(c, r->declared[i].line, r->declared[i].column, "at most %d record fields are allowed", RECORD_FIELDS);
             memcpy(r->field_names[i], r->declared[i].name, NAME);
             r->field_kinds[i] = r->declared[i].kind;
             r->field_number[i] = r->declared[i].number;
@@ -1811,7 +1813,7 @@ static void variant_declaration(Compiler *c) {
     Token name = expect_name(c, "variant name");
     declare(c, &name);
     if (c->module) fail_at(c, name.line, name.column, "a library declares no variant, for now");
-    if (c->record_count == RECORDS) fail_at(c, name.line, name.column, "at most 16 records are allowed, variants among them");
+    if (c->record_count == RECORDS) fail_at(c, name.line, name.column, "at most %d records are allowed, variants among them", RECORDS);
     Record *r = &c->records[c->record_count];
     memset(r, 0, sizeof(*r));
     memcpy(r->name, name.text, NAME);
@@ -1865,7 +1867,7 @@ static Token held_record(Compiler *c, char name[NAME], int *library) {
 static void state_declaration(Compiler *c, bool transient) {
     Token name = expect_name(c, "state name");
     declare(c, &name);
-    if (c->states == STATES) fail_at(c, name.line, name.column, "at most 32 states are allowed");
+    if (c->states == STATES) fail_at(c, name.line, name.column, "at most %d states are allowed", STATES);
     unsigned index = c->states;
     memcpy(c->state_names[index], name.text, NAME);
     c->state_transient[index] = transient;
@@ -1952,7 +1954,7 @@ static void table_declaration(Compiler *c, unsigned table) {
         for (unsigned i = table + 1; i < c->views; ++i)
             if (!strcmp(c->view_names[i], column.text))
                 fail_at(c, column.line, column.column, "duplicate column '%s'", column.text);
-        if (c->views == VIEWS) fail_at(c, column.line, column.column, "at most 64 views are allowed");
+        if (c->views == VIEWS) fail_at(c, column.line, column.column, "at most %d views are allowed", VIEWS);
         expect(c, "=", "'='");
         unsigned index = c->views++;
         memcpy(c->view_names[index], column.text, NAME);
@@ -2040,7 +2042,6 @@ static void use_declaration(Compiler *c) {
         char path[AUP_PATH] = "";
         if (!c->load || !c->load(c->load_context, name.text, &source, &length, path))
             fail_at(c, name.line, name.column, "cannot find library '%s' (%s.aup)", name.text, name.text);
-        if (length > AUP_SOURCE_LIMIT) fail_at(c, name.line, name.column, "library '%s' exceeds 32768 bytes", name.text);
         library = (int)c->module_count++;
         memcpy(c->modules[library].name, name.text, NAME);
         snprintf(c->modules[library].path, AUP_PATH, "%s", *path ? path : name.text);
@@ -2088,7 +2089,7 @@ static void library_declaration(Compiler *c) {
  * input of their own named view.args, which a request gives (?name=value). */
 static void view_arguments(Compiler *c, unsigned view, const Token *name) {
     take(c); /* ( */
-    if (c->input_count == INPUTS) fail_at(c, name->line, name->column, "at most 32 inputs are allowed (a view's arguments take one)");
+    if (c->input_count == INPUTS) fail_at(c, name->line, name->column, "at most %d inputs are allowed (a view's arguments take one)", INPUTS);
     Input *in = &c->inputs[c->input_count];
     memset(in, 0, sizeof(*in));
     if (strlen(name->text) + 5 >= NAME)
@@ -2150,7 +2151,7 @@ static void declaration(Compiler *c) {
     } else if (!strcmp(kind.text, "input")) {
         Token name = expect_name(c, "input name");
         declare(c, &name);
-        if (c->input_count == INPUTS) fail_at(c, name.line, name.column, "at most 32 inputs are allowed");
+        if (c->input_count == INPUTS) fail_at(c, name.line, name.column, "at most %d inputs are allowed", INPUTS);
         expect(c, "=", "'='");
         Input *in = &c->inputs[c->input_count];
         memset(in, 0, sizeof(*in));
@@ -2206,7 +2207,10 @@ static void declaration(Compiler *c) {
         /* output ordered = message { ... }: what the app sends; its receiver is the host's wiring. */
         Token name = expect_name(c, "output name");
         declare(c, &name);
-        if (c->input_count == INPUTS) fail_at(c, name.line, name.column, "at most 32 inputs and outputs are allowed");
+        if (c->input_count == INPUTS) fail_at(c, name.line, name.column, "at most %d inputs and outputs are allowed", INPUTS);
+        unsigned outputs = 0; /* Pure's store names them in a byte's count */
+        for (unsigned i = 0; i < c->input_count; ++i) outputs += c->inputs[i].kind == KIND_OUTPUT;
+        if (outputs == OUTPUTS) fail_at(c, name.line, name.column, "at most %d outputs are allowed", OUTPUTS);
         expect(c, "=", "'='");
         Input *in = &c->inputs[c->input_count];
         memset(in, 0, sizeof(*in));
@@ -2222,7 +2226,7 @@ static void declaration(Compiler *c) {
     } else if (!strcmp(kind.text, "view")) {
         Token name = expect_name(c, "view name");
         declare(c, &name);
-        if (c->views == VIEWS) fail_at(c, name.line, name.column, "at most 64 views are allowed");
+        if (c->views == VIEWS) fail_at(c, name.line, name.column, "at most %d views are allowed", VIEWS);
         unsigned index = c->views++;
         if (is(c, "(")) view_arguments(c, index, &name);
         memcpy(c->view_names[index], name.text, NAME);
@@ -2239,7 +2243,7 @@ static void declaration(Compiler *c) {
             else table_declaration(c, index);
         }
     } else if (!strcmp(kind.text, "on")) {
-        if (c->handler_count == HANDLERS) fail_at(c, kind.line, kind.column, "at most 64 handlers are allowed");
+        if (c->handler_count == HANDLERS) fail_at(c, kind.line, kind.column, "at most %d handlers are allowed", HANDLERS);
         Token event = expect_name(c, "frame or an input");
         unsigned index = c->handler_count++;
         c->handlers[index].line = event.line;
@@ -2713,7 +2717,7 @@ static int hidden_list(Compiler *c, int record, bool bound, int line, int column
     for (unsigned i = 0; !bound && i < c->states; ++i)
         if (c->state_hidden[i] && !c->state_bound[i] && c->state_record[i] == record) return (int)i;
     if (c->states == STATES)
-        fail_at(c, line, column, "at most 32 states are allowed, the lists the code reads in records among them");
+        fail_at(c, line, column, "at most %d states are allowed, the lists the code reads in records among them", STATES);
     unsigned i = c->states++;
     snprintf(c->state_names[i], NAME, "%s.r%u", bound ? "bound" : "empty", i);
     c->state_types[i] = STATE_LIST;
@@ -3759,6 +3763,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             expect_kind(c, e->args[2], wanted(c, e->args[2], handler, height, key), key);
             expect_kind(c, e->args[3], wanted(c, e->args[3], handler, height + 1, key), key);
         }
+        if (list > 0xFF) /* a fold names its list in a byte of its argument (Pure's FOLD) */
+            fail_at(c, e->line, e->column, "a folded list is among the first 256 states; '%s' is state %d", e->member, list);
         unsigned at = c->code_count, joins = c->joins;
         emit(c, e->line, e->column, FOLD, 0, 0);
         c->folding = true;
@@ -4812,6 +4818,8 @@ static void statements(Compiler *c, const Stmt *s) {
                 expect_kind(c, s->low, wanted(c, s->low, c->handling, 0, key), key);
                 expect_kind(c, s->high, wanted(c, s->high, c->handling, 1, key), key);
             }
+            if (list > 0xFF) /* a walk names its list in a byte of its argument (Pure's EACH) */
+                fail_at(c, s->line, s->column, "a walked list is among the first 256 states; '%s' is state %d", s->member, list);
             unsigned at = c->code_count, jump = 0, loop = c->loop_count++;
             emit(c, s->line, s->column, EACH, 0, 0);
             memcpy(c->loops[loop].name, s->name, NAME);
@@ -5119,7 +5127,7 @@ static void event_lists(Compiler *c) {
                 }
                 continue;
             }
-            if (c->states == STATES) fail_at(c, s->line, s->column, "at most 32 states are allowed, a let's list among them");
+            if (c->states == STATES) fail_at(c, s->line, s->column, "at most %d states are allowed, a let's list among them", STATES);
             unsigned i = c->states++;
             memcpy(c->state_names[i], path, strlen(path) + 1);
             c->state_types[i] = STATE_LIST;
@@ -5144,7 +5152,7 @@ static void rows_lists(Compiler *c) {
             if (length < 0 || length >= NAME)
                 fail_at(c, in->field_line[f], in->field_column[f], "'%s' is longer than %d characters", name, NAME - 1);
             if (c->states == STATES)
-                fail_at(c, in->field_line[f], in->field_column[f], "at most 32 states are allowed (a message's rows take one)");
+                fail_at(c, in->field_line[f], in->field_column[f], "at most %d states are allowed (a message's rows take one)", STATES);
             unsigned index = c->states++;
             memcpy(c->state_names[index], name, (size_t)length + 1);
             memcpy(c->state_target[index], in->field_record[f], NAME);
@@ -5181,9 +5189,9 @@ static void pull_records(Compiler *c) {
             fail_at(c, r->used_line, r->used_column, "%s.%s is '%s' in the module, and '%s' is %s here", library, r->name,
                     r->name, r->name, taken);
         if (c->record_count == RECORDS)
-            fail_at(c, r->used_line, r->used_column, "at most 16 records are allowed (%s.%s is one more)", library, r->name);
+            fail_at(c, r->used_line, r->used_column, "at most %d records are allowed (%s.%s is one more)", RECORDS, library, r->name);
         if (c->record_fields + r->fields > RECORD_FIELDS)
-            fail_at(c, r->used_line, r->used_column, "at most 128 record fields are allowed (%s.%s has %u more)", library,
+            fail_at(c, r->used_line, r->used_column, "at most %d record fields are allowed (%s.%s has %u more)", RECORD_FIELDS, library,
                     r->name, r->fields);
         c->records[c->record_count++] = *r;
         c->record_fields += r->fields;
@@ -5258,7 +5266,7 @@ static void flatten(Compiler *c, unsigned index) {
         if (!r->variant || r->declared[i].kind || *r->declared[i].type)
             add_flat(c, r, r->declared[i].name, r->declared[i].kind ? r->declared[i].kind : NUM, r->declared[i].type,
                      r->declared[i].number, r->declared[i].integer, r->declared[i].string, r->declared[i].line, r->declared[i].column);
-    if (c->record_fields + r->fields > RECORD_FIELDS) fail_at(c, r->line, r->column, "at most 128 record fields are allowed");
+    if (c->record_fields + r->fields > RECORD_FIELDS) fail_at(c, r->line, r->column, "at most %d record fields are allowed", RECORD_FIELDS);
     c->record_fields += r->fields;
     r->flattening = false;
     r->flattened = true;
@@ -5276,8 +5284,8 @@ static int scalar_record(Compiler *c, const char *name, int line, int column) {
         if (strcmp(name, scalars[k].name)) continue;
         int found = module_record(c, 0, name);
         if (found >= 0) return found;
-        if (c->record_count == RECORDS) fail_at(c, line, column, "at most 16 records are allowed, a list of %s among them", name);
-        if (c->record_fields == RECORD_FIELDS) fail_at(c, line, column, "at most 128 record fields are allowed");
+        if (c->record_count == RECORDS) fail_at(c, line, column, "at most %d records are allowed, a list of %s among them", RECORDS, name);
+        if (c->record_fields == RECORD_FIELDS) fail_at(c, line, column, "at most %d record fields are allowed", RECORD_FIELDS);
         Record *r = &c->records[c->record_count];
         memset(r, 0, sizeof(*r));
         memcpy(r->name, name, strlen(name) + 1);
@@ -5353,7 +5361,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         char name[NAME];
         snprintf(name, sizeof(name), release ? "%s.up" : "frame", c->handlers[i].input);
         if (input_index(c, name) < 0) {
-            if (c->input_count == INPUTS) fail_at(c, c->handlers[i].line, c->handlers[i].column, "at most 32 inputs are allowed");
+            if (c->input_count == INPUTS) fail_at(c, c->handlers[i].line, c->handlers[i].column, "at most %d inputs are allowed", INPUTS);
             Input *in = &c->inputs[c->input_count++];
             memset(in, 0, sizeof(*in));
             memcpy(in->name, name, NAME);
@@ -5378,8 +5386,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                 table = (int)t;
         }
         if (anchor < 0 || c->state_types[anchor] != STATE_INDEX || table < 0) continue;
-        if (c->input_count == INPUTS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most 32 inputs are allowed");
-        if (c->handler_count == HANDLERS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most 64 handlers are allowed");
+        if (c->input_count == INPUTS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most %d inputs are allowed", INPUTS);
+        if (c->handler_count == HANDLERS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most %d handlers are allowed", HANDLERS);
         Input *in = &c->inputs[c->input_count++];
         memset(in, 0, sizeof(*in));
         char point[NAME + 8];
@@ -5692,7 +5700,6 @@ bool aup_compile(const char *source, size_t length, AupLoad load, void *context,
     c->module_count = 1; /* the main source */
     unsigned char *result = NULL;
     if (!setjmp(c->fail)) {
-        if (length > AUP_SOURCE_LIMIT) fail_at(c, 1, 1, "source exceeds 32768 bytes");
         c->token = scan(c);
         separators(c);
         while (c->token.kind != T_EOF) declaration(c);
