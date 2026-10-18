@@ -13,9 +13,9 @@ enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK 
        DEPTH = 64, FIELDS = 64, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
        RECORDS = 16, RECORD_FIELDS = 128, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9,
        LIBRARY_RECORDS = 64 };
-enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
+enum { CONST, LOAD, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, LEN, REPLY, REQUIRE,
-       TEXT_CONST, TEXT_LOAD, TEXT_INPUT, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
+       TEXT_CONST, TEXT_LOAD, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
        ANCHOR_LOAD, ANCHOR_START, ANCHOR_END, ANCHOR_MOVE, ANCHOR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, ANCHOR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
        ITEM_GET, ITEM_SET, ROW,
@@ -38,7 +38,12 @@ enum { BIT_AND = 0x100, BIT_OR, BIT_XOR, BIT_LEFT, BIT_RIGHT, BIT_NOT };
 enum { LOCALS = 64 }; /* an event's locals (Pure's) */
 enum { NESTING = 8, LOOP_INTEGER = 256 }; /* loops (for) nest 8 deep; an i64's count (Pure 018) */
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT, FOLD_INTEGER = 0x40 };
-enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6,
+/* An input as the app writes it; in Pure's module (027's 4d) each of them but an output and a view's arguments is a
+ * message, its binding what makes it: a key's press (KIND_KEY) and its release (KIND_RELEASE, an `on k.up`'s, k.up), a
+ * text's (one field, text), a timer's tick, a frame (one field, dt: frame, an `on frame`'s) or a pointing at a table's
+ * row (one field, position: T.point, a T_focus view's). */
+enum { KIND_KEY = 1, KIND_MESSAGE = 2, KIND_TEXT = 3, KIND_TIMER = 4, KIND_OUTPUT = 5, KIND_ARGUMENTS = 6, KIND_RELEASE = 7,
+       KIND_FRAME = 8, KIND_POINT = 9,
        FIELD_U32 = 1, FIELD_BYTES = 2, FIELD_NUMBER = 3, FIELD_TEXT = 4,
        FIELD_ROWS = 5, FIELD_BOOL = 6, FIELD_I64 = 7 };
 /* An event's list: a message's rows, filled as the message arrives, or a
@@ -128,7 +133,8 @@ typedef struct {
     char field_record[FIELDS][NAME];
     int field_library[FIELDS], field_line[FIELDS], field_column[FIELDS], field_list[FIELDS];
     unsigned fields;
-    unsigned view; /* arguments: the view they are for */
+    unsigned view; /* arguments: the view they are for; a pointing's: its table */
+    int list, anchor; /* a pointing's: the list its table shows and the index it moves */
 } Input;
 
 /* A record: fields in order, each a number, a bool, an i64 or text with its
@@ -242,7 +248,7 @@ typedef struct {
     int view_arguments[VIEWS];                        /* the input of a view's arguments + 1, or 0 */
     int view_line[VIEWS][2], view_column[VIEWS][2];   /* a table's row name and list name */
     unsigned views;
-    struct { char input[NAME]; int edge, line, column; Stmt *body; } handlers[HANDLERS];
+    struct { char input[NAME]; int edge, line, column; Stmt *body; } handlers[HANDLERS]; /* body NULL: a pointing's */
     unsigned handler_count;
     /* Code generation. */
     int message;          /* message or text input of the handler being generated, or -1 */
@@ -2152,6 +2158,9 @@ static void declaration(Compiler *c) {
         } else if (word(c, "text")) {
             take(c);
             in->kind = KIND_TEXT;
+            memcpy(in->field_names[0], "text", 5); /* its text, read as the input's name */
+            in->field_types[0] = FIELD_TEXT;
+            in->fields = 1;
             ++c->input_count;
         } else if (word(c, "every")) {
             /* input tick = every 1 second: ticks while a host runs the app. */
@@ -3282,7 +3291,10 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (!handler)
             fail_at(c, e->line, e->column, e->kind == E_DT ? "dt is only available in handlers" :
                     "now is only available in handlers; a view shows a state that a timer or an event sets");
-        emit(c, e->line, e->column, e->kind == E_DT ? DT : NOW, 0, 0);
+        if (e->kind == E_DT && c->message >= 0 && c->inputs[c->message].kind == KIND_FRAME)
+            emit(c, e->line, e->column, FIELD, 0, 0); /* the frame's dt */
+        else if (e->kind == E_DT) emit(c, e->line, e->column, CONST, 0, 0); /* no frame: none passed */
+        else emit(c, e->line, e->column, NOW, 0, 0);
         return (Kind){NUM, -1};
     }
     case E_TEXT: emit(c, e->line, e->column, TEXT_CONST, constant(c, e), 0); return (Kind){TEXT, -1};
@@ -3390,7 +3402,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         int input = input_index(c, e->name);
         if (input >= 0 && c->inputs[input].kind == KIND_TEXT) {
             if (input != c->message) fail_at(c, e->line, e->column, "'%s' is only available in its handler", e->name);
-            emit(c, e->line, e->column, TEXT_INPUT, 0, 0);
+            emit(c, e->line, e->column, FIELD, 0, 0); /* its one field */
             return (Kind){TEXT, -1};
         }
         const char *kind = declared_kind(c, e->name);
@@ -5313,12 +5325,62 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                 r->field_constant[k] = constant(c, r->field_string[k] ? r->field_string[k] : &empty);
         }
     }
+    /* The messages a module has where the app wrote none (027's 4d): a key's release for an on k.up, a frame for an
+     * on frame, and a pointing for a T_focus view showing an index's position, its handler moving the index. */
+    unsigned written = c->input_count;
+    for (unsigned i = 0, count = c->handler_count; i < count; ++i) {
+        int input = *c->handlers[i].input ? input_index(c, c->handlers[i].input) : -1;
+        bool release = input >= 0 && c->inputs[input].kind == KIND_KEY && c->handlers[i].edge > 0;
+        if (!release && *c->handlers[i].input) continue;
+        char name[NAME];
+        snprintf(name, sizeof(name), release ? "%s.up" : "frame", c->handlers[i].input);
+        if (input_index(c, name) < 0) {
+            if (c->input_count == INPUTS) fail_at(c, c->handlers[i].line, c->handlers[i].column, "at most 32 inputs are allowed");
+            Input *in = &c->inputs[c->input_count++];
+            memset(in, 0, sizeof(*in));
+            memcpy(in->name, name, NAME);
+            in->kind = release ? KIND_RELEASE : KIND_FRAME;
+            if (release) memcpy(in->key, c->inputs[input].key, NAME);
+            else memcpy(in->field_names[0], "dt", 3), in->field_types[0] = FIELD_NUMBER, in->fields = 1;
+        }
+        memcpy(c->handlers[i].input, name, NAME);
+        c->handlers[i].edge = -1;
+    }
+    for (unsigned v = 0; v < c->views; ++v) {
+        size_t length = strlen(c->view_names[v]);
+        const Expr *e = c->view_value[v];
+        if (c->view_table[v] || length <= 6 || strcmp(c->view_names[v] + length - 6, "_focus") || !e || e->kind != E_MEMBER ||
+            strcmp(e->member, "position") || e->args[0]->kind != E_NAME) continue;
+        int anchor = state_index(c, e->args[0]->name), table = -1;
+        for (unsigned t = 0; t < c->views; ++t)
+            if (!c->view_table[t] && *c->view_list[t] && strlen(c->view_names[t]) == length - 6 &&
+                !memcmp(c->view_names[t], c->view_names[v], length - 6)) table = (int)t;
+        if (anchor < 0 || c->state_types[anchor] != STATE_INDEX || table < 0) continue;
+        if (c->input_count == INPUTS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most 32 inputs are allowed");
+        if (c->handler_count == HANDLERS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most 64 handlers are allowed");
+        Input *in = &c->inputs[c->input_count++];
+        memset(in, 0, sizeof(*in));
+        char point[NAME + 8];
+        snprintf(point, sizeof(point), "%s.point", c->view_names[table]);
+        if (strlen(point) >= NAME) fail_at(c, c->view_line[v][0], c->view_column[v][0], "'%s' passes 31 bytes", point);
+        memcpy(in->name, point, strlen(point) + 1);
+        in->kind = KIND_POINT;
+        in->view = (unsigned)table;
+        in->list = cursor_owner(c, anchor);
+        in->anchor = anchor;
+        memcpy(in->field_names[0], "position", 9);
+        in->field_types[0] = FIELD_U32;
+        in->fields = 1;
+        unsigned h = c->handler_count++;
+        memcpy(c->handlers[h].input, in->name, NAME);
+        c->handlers[h].edge = -1;
+        c->handlers[h].line = c->view_line[v][0], c->handlers[h].column = c->view_column[v][0];
+        c->handlers[h].body = NULL;
+    }
+    (void)written;
     for (unsigned i = 0; i < c->handler_count; ++i) {
         const char *name = c->handlers[i].input;
         int line = c->handlers[i].line, column = c->handlers[i].column;
-        events[i] = 0; /* frame */
-        handler_input[i] = -1;
-        if (!*name) continue;
         int input = input_index(c, name);
         if (input < 0) {
             const char *kind = declared_kind(c, name);
@@ -5329,12 +5391,14 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             fail_at(c, line, column, "'%s' is an output: the app sends it (send %s { ... }) and does not handle it", name, name);
         const char *what = c->inputs[input].kind == KIND_MESSAGE ? "message" :
                            c->inputs[input].kind == KIND_TIMER ? "timer" : "text input";
-        if (c->inputs[input].kind != KIND_KEY && c->handlers[i].edge >= 0)
+        bool device = c->inputs[input].kind == KIND_RELEASE || c->inputs[input].kind == KIND_FRAME ||
+                      c->inputs[input].kind == KIND_POINT; /* made above */
+        if (c->inputs[input].kind != KIND_KEY && !device && c->handlers[i].edge >= 0)
             fail_at(c, line, column, "'%s' is a %s; write on %s { }", name, what, name);
         if (c->inputs[input].kind == KIND_KEY && c->handlers[i].edge < 0)
             fail_at(c, line, column, "'%s' is a key input; write on %s.down or on %s.up", name, name, name);
         handler_input[i] = input;
-        events[i] = 1u + 2u * (uint32_t)input + (c->handlers[i].edge > 0);
+        events[i] = (uint32_t)input; /* Pure's handler takes its input's messages (027's 4d) */
     }
     /* A view's argument names nothing else the view reads: not a state or
      * another declaration, not its table's row. */
@@ -5394,10 +5458,15 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     c->handling = true;
     for (unsigned i = 0; i < c->handler_count; ++i) {
         int input = handler_input[i];
-        c->message = input >= 0 && c->inputs[input].kind != KIND_KEY ? input : -1;
+        c->message = input >= 0 && c->inputs[input].kind != KIND_KEY && c->inputs[input].kind != KIND_RELEASE ? input : -1;
         c->local_count = c->local_slots = c->loop_count = c->nested = c->held_bytes = c->held_texts = 0;
         c->handler_code[i][0] = c->code_count;
-        statements(c, c->handlers[i].body);
+        if (c->inputs[input].kind == KIND_POINT) { /* a pointing: its list's item at the row's position, the index's */
+            const Input *in = &c->inputs[input];
+            emit(c, c->handlers[i].line, c->handlers[i].column, FIELD, 0, 0);
+            emit(c, c->handlers[i].line, c->handlers[i].column, INDEX_AT, (uint32_t)in->list, 0);
+            emit(c, c->handlers[i].line, c->handlers[i].column, INDEX_STORE, (uint32_t)in->anchor, 0);
+        } else statements(c, c->handlers[i].body);
         c->handler_code[i][1] = c->code_count - c->handler_code[i][0];
     }
     /* The functions' code after the handlers' and views' (027's 2c), each one's jumps moved with it. */
@@ -5430,7 +5499,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     }
     for (unsigned i = 0; i < c->input_count; ++i) {
         input_name[i] = intern(strings, &used, c->inputs[i].name);
-        input_key[i] = c->inputs[i].kind == KIND_KEY ? intern(strings, &used, c->inputs[i].key) : 0;
+        input_key[i] = c->inputs[i].kind == KIND_KEY || c->inputs[i].kind == KIND_RELEASE ? intern(strings, &used, c->inputs[i].key) : 0;
         for (unsigned f = 0; f < c->inputs[i].fields; ++f)
             field_name[fields++] = intern(strings, &used, c->inputs[i].field_names[f]);
     }
@@ -5477,11 +5546,18 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     for (unsigned i = 0; i < c->input_count; ++i) {
         const Input *in = &c->inputs[i];
         p = put32(p, input_name[i]);
-        *p++ = (unsigned char)in->kind;
-        *p++ = 0;
+        /* Pure's kinds (1 a message, 2 an output, 3 arguments) and bindings (1 a press, 2 a release, 3 text, 4 a timer,
+         * 5 a frame, 6 a pointing), and what a binding names: a key, a period, a table. */
+        static const unsigned char kinds[] = {[KIND_KEY] = 1, [KIND_MESSAGE] = 1, [KIND_TEXT] = 1, [KIND_TIMER] = 1,
+                                              [KIND_OUTPUT] = 2, [KIND_ARGUMENTS] = 3, [KIND_RELEASE] = 1, [KIND_FRAME] = 1,
+                                              [KIND_POINT] = 1};
+        static const unsigned char bindings[] = {[KIND_KEY] = 1, [KIND_RELEASE] = 2, [KIND_TEXT] = 3, [KIND_TIMER] = 4,
+                                                 [KIND_FRAME] = 5, [KIND_POINT] = 6};
+        *p++ = kinds[in->kind];
+        *p++ = bindings[in->kind];
         p = put16(p, 0);
-        p = put32(p, in->kind == KIND_TIMER ? in->period : in->kind == KIND_ARGUMENTS ? in->view : input_key[i]);
-        p = put16(p, in->kind == KIND_MESSAGE || in->kind == KIND_OUTPUT || in->kind == KIND_ARGUMENTS ? first : 0);
+        p = put32(p, in->kind == KIND_TIMER ? in->period : in->kind == KIND_ARGUMENTS || in->kind == KIND_POINT ? in->view : input_key[i]);
+        p = put16(p, first);
         p = put16(p, in->fields);
         first += in->fields;
     }
