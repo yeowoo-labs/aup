@@ -1745,7 +1745,7 @@ static Expr *plain_string(Compiler *c, const char *what) {
 /* record Name { field = number, field = false, field: text = "..." } */
 /* A field's type after ':' (a record's field or a variant's case value): text, i64, number, bool, list of X or X. */
 static void declared_type(Compiler *c, Record *r, unsigned index, bool variant) {
-    Token type = expect_name(c, variant ? "the type of the case's value" : "text, i64, a record, a variant or list of one");
+    Token type = expect_name(c, variant ? "the type of the case's value" : "text, bytes, i64, a record, a variant or list of one");
     if (!strcmp(type.text, "list")) {
         expect_word(c, "of");
         Token of = expect_name(c, "what the list holds");
@@ -1755,13 +1755,14 @@ static void declared_type(Compiler *c, Record *r, unsigned index, bool variant) 
         return;
     }
     if (!strcmp(type.text, "text")) r->declared[index].kind = TEXT;
+    else if (!strcmp(type.text, "bytes")) r->declared[index].kind = BYTES; /* (Pure 027's 4b) */
     else if (!strcmp(type.text, "i64")) r->declared[index].kind = I64;
     else if (variant && !strcmp(type.text, "number")) r->declared[index].kind = NUM;
     else if (variant && !strcmp(type.text, "bool")) r->declared[index].kind = BOOL;
     else { /* a record's or a variant's fields, flattened once all are declared */
         if (reserved_name(type.text) || !strcmp(type.text, "number") || !strcmp(type.text, "bool"))
             fail_at(c, type.line, type.column, "a field is a number (field = 0), a bool (field = false), text (field: text), "
-                    "an i64 (field: i64), a record, a variant or a list of one");
+                    "bytes (field: bytes), an i64 (field: i64), a record, a variant or a list of one");
         memcpy(r->declared[index].type, type.text, NAME);
         r->typed = true;
     }
@@ -1797,11 +1798,12 @@ static void record_declaration(Compiler *c) {
             take(c);
             declared_type(c, r, index, false);
             if (is(c, "=")) {
-                if (r->declared[index].kind != TEXT && r->declared[index].kind != I64)
+                if (r->declared[index].kind != TEXT && r->declared[index].kind != BYTES && r->declared[index].kind != I64)
                     fail_at(c, c->token.line, c->token.column, "a record, a variant or a list in a field begins as its own default");
                 take(c);
                 r->declared[index].given = true;
-                if (r->declared[index].kind == TEXT) r->declared[index].string = plain_string(c, "a text field");
+                if (r->declared[index].kind == TEXT || r->declared[index].kind == BYTES)
+                    r->declared[index].string = plain_string(c, r->declared[index].kind == TEXT ? "a text field" : "a bytes field");
                 else r->declared[index].integer = signed_integer(c, "an i64 field's default");
             }
         } else {
@@ -3507,7 +3509,13 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             if (dot) { /* item.items.count: a list in a field, then what a list has; item.name.bytes: a text's */
                 *dot = 0;
                 field = field_named(r, path);
-                if (field >= 0 && (r->field_kinds[field] == TEXT || r->field_kinds[field] == BYTES)) {
+                if (field >= 0 && r->field_kinds[field] == BYTES) { /* item.body.bytes: a bytes field's length */
+                    emit(c, e->line, e->column, ITEM_GET, (uint32_t)item_list | (uint32_t)field << 16, 0);
+                    if (strcmp(dot + 1, "bytes")) fail_at(c, e->line, e->column, "bytes have bytes, not '%s'", dot + 1);
+                    emit(c, e->line, e->column, LEN, 0, 0);
+                    return (Kind){NUM, -1};
+                }
+                if (field >= 0 && r->field_kinds[field] == TEXT) {
                     const char *m = dot + 1;
                     emit(c, e->line, e->column, ITEM_GET, (uint32_t)item_list | (uint32_t)field << 16, 0);
                     if (!strcmp(m, "chars") || !strcmp(m, "lines") || !strcmp(m, "bytes")) {
@@ -4270,8 +4278,10 @@ static void record_fields_of(Compiler *c, const Expr *e, const Record *r, const 
             if (values[k]) list_field(c, r, k, values[k], at);
             else emit(c, e->line, e->column, LIST_VALUE, (uint32_t)hidden_list(c, r->field_record[k], false, e->line, e->column), 0);
         } else if (values[k]) expect_kind(c, values[k], wanted(c, values[k], c->handling, at, field_kind(r, k)), field_kind(r, k));
-        else if (r->field_kinds[k] == TEXT) emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
-        else if (r->field_kinds[k] == I64) emit_integer(c, e->line, e->column, r->field_integer[k]);
+        else if (r->field_kinds[k] == TEXT || r->field_kinds[k] == BYTES) {
+            emit(c, e->line, e->column, TEXT_CONST, r->field_constant[k], 0);
+            if (r->field_kinds[k] == BYTES) emit(c, e->line, e->column, BYTES_FROM, 0, 0);
+        } else if (r->field_kinds[k] == I64) emit_integer(c, e->line, e->column, r->field_integer[k]);
         else emit(c, e->line, e->column, CONST, r->field_kinds[k] == BOOL, r->field_number[k]);
     }
 }
@@ -5374,9 +5384,10 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (*c->state_key[i]) {
                 const Record *r = &c->records[record];
                 c->list_key[i] = 1 + (int)record_field(c, r, c->state_key[i], c->state_key_line[i], c->state_key_column[i]);
-                if (r->field_kinds[c->list_key[i] - 1] == BOOL)
-                    fail_at(c, c->state_key_line[i], c->state_key_column[i], "a list is keyed by a number or text; '%s' is a bool",
-                            c->state_key[i]);
+                int kind = r->field_kinds[c->list_key[i] - 1];
+                if (kind == BOOL || kind == BYTES || kind == LIST)
+                    fail_at(c, c->state_key_line[i], c->state_key_column[i], "a list is keyed by a number or text; '%s' is %s",
+                            c->state_key[i], kind == BOOL ? "a bool" : kind == BYTES ? "bytes" : "a list");
             }
         }
     }
@@ -5384,7 +5395,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         Record *r = &c->records[i];
         for (unsigned k = 0; k < r->fields; ++k) {
             Expr empty = {.kind = E_TEXT, .line = r->line, .column = r->column};
-            if (r->field_kinds[k] == TEXT) r->field_constant[k] = constant(c, r->field_string[k] ? r->field_string[k] : &empty);
+            if (r->field_kinds[k] == TEXT || r->field_kinds[k] == BYTES)
+                r->field_constant[k] = constant(c, r->field_string[k] ? r->field_string[k] : &empty);
         }
     }
     for (unsigned i = 0; i < c->handler_count; ++i) {
@@ -5579,9 +5591,9 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         for (unsigned k = 0; k < c->records[i].fields; ++k) {
             const Record *r = &c->records[i];
             p = put32(p, record_field_name[i][k]);
-            static const uint32_t types[] = {[NUM] = 0, [TEXT] = 1, [BOOL] = 2, [I64] = 3, [LIST] = 4}; /* Pure's record field types */
+            static const uint32_t types[] = {[NUM] = 0, [TEXT] = 1, [BOOL] = 2, [I64] = 3, [LIST] = 4, [BYTES] = 5}; /* Pure's */
             p = put32(p, types[r->field_kinds[k]]);
-            if (r->field_kinds[k] == TEXT) { p = put32(p, r->field_constant[k]); p = put32(p, 0); }
+            if (r->field_kinds[k] == TEXT || r->field_kinds[k] == BYTES) { p = put32(p, r->field_constant[k]); p = put32(p, 0); }
             else if (r->field_kinds[k] == I64) p = put64(p, (uint64_t)r->field_integer[k]);
             else if (r->field_kinds[k] == LIST) p = put64(p, (uint64_t)r->field_record[k]); /* the record of its items */
             else p = put_double(p, r->field_number[k]);

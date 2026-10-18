@@ -1,0 +1,39 @@
+# Revision-checked byte edits of keyed documents. A document is an item of a
+# keyed list; an edit names the revision it was made against and commits only
+# if that is still the document's (0 for one not there yet), and a failed
+# event leaves everything as it was.
+record Doc {
+  id: text
+  body: bytes
+  revision: i64
+}
+state docs: list of Doc by id
+
+input show = message {
+  id: text
+}
+input edit = message {
+  id: text
+  base: i64
+  start: u32
+  remove: u32
+  insert: bytes
+}
+
+on show {
+  reply docs[show.id].body
+}
+
+on edit {
+  if docs.has(edit.id) {
+    let d = docs[edit.id]
+    require d.revision == edit.base
+    require edit.start + edit.remove <= d.body.bytes
+    docs[edit.id].body = d.body[0 .. edit.start] + edit.insert + d.body[edit.start + edit.remove .. d.body.bytes]
+    docs[edit.id].revision = d.revision + 1
+  } else {
+    require edit.base == 0 && edit.start == 0 && edit.remove == 0
+    docs.add(Doc { id: edit.id, body: edit.insert, revision: 1 })
+  }
+  reply edit.insert
+}

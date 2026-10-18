@@ -125,6 +125,13 @@ DIAGNOSTICS = [
      '    }\n  }\n}\n', '16:7', 'an arm after _ is never taken'),
     (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  let ms: list of M\n  xs.append(Json.arr(ms))\n}\n', '14:22',
      "'arr' holds a list of Json, not of M"),
+    # Bytes in a field (Pure 027's 4b): a length alone, a string's bytes as its default, never a text where bytes go, no key.
+    ('record D {\n  b: bytes\n}\nstate ds: list of D\nstate n = 0\non frame {\n  for d in ds {\n    n = n + d.b.chars\n  }\n}\n',
+     '8:13', "bytes have bytes, not 'chars'"),
+    ('record D {\n  b: bytes = 3\n}\nstate ds: list of D\n', '2:14', 'a bytes field starts from a string'),
+    ('record D {\n  b: bytes\n}\nstate ds: list of D\non frame {\n  ds.append(D { b: "x" })\n}\n', '6:20',
+     'expected bytes, not text'),
+    ('record D {\n  b: bytes\n}\nstate ds: list of D by b\n', '4:24', "a list is keyed by a number or text; 'b' is bytes"),
     (JSON_M + 'input m = message {\n  docs: list of Json\n}\non m {\n  for d in m.docs {\n    d.arr.append(Json.null)\n  }\n}\n',
      '15:5', "not of a message's rows or one read from a record"),
     (JSON_M + 'state n = 0\non frame {\n  let ms: list of M\n  for m in ms {\n    n = m.value\n  }\n}\n', '14:9',
@@ -237,7 +244,8 @@ DIAGNOSTICS = [
     # records, lists and indices
     ('record T {\n  a = 0\n  a = 1\n}\n', '3:3', "duplicate field 'a'"),
     ('record T {\n}\n', '1:8', 'a record needs at least one field'),
-    ('record T {\n  a: number\n}\n', '2:6', 'a field is a number (field = 0), a bool (field = false), text (field: text), an i64 (field: i64), a record'),
+    ('record T {\n  a: number\n}\n', '2:6',
+     'a field is a number (field = 0), a bool (field = false), text (field: text), bytes (field: bytes), an i64 (field: i64), a record'),
     ('record T {\n  a = 0\n}\nstate T = 0\n', '4:7', "'T' is already declared as a record"),
     ('state xs: list of Missing\n', '1:7', "a list holds a record; 'Missing' is not one"),
     ('state x = 0\nstate at: index of x\n', '2:7', "an index points into a list state; 'x' is not one"),
@@ -1771,6 +1779,66 @@ view tags {
 """
 
 
+def documents_model(aup, pure_run, work, seeds, steps=160):
+    """Pure 027's 4b: keyed byte documents as a keyed list of records holding bytes (examples/documents.aup), each edit
+    checked against the revision it was made on, run on a store restarting at random points (some runs saving in bursts)
+    and in memory, against a model: every step's fault and documents alike (bodies of any bytes, up to 5,000 at once),
+    a failed event leaving nothing."""
+    import shutil
+    import struct
+    module = work / 'documents.pmod'
+    compile_module(aup, ROOT / 'examples/documents.aup', module)
+    ids = ['a', 'b', 'long-key_1', '문서', '']
+    compared = restarts = 0
+    for seed in seeds:
+        rng = random.Random(seed + 41000)
+        docs = {}
+        commands, expected = [], []
+        for _ in range(steps):
+            i = rng.choice(ids)
+            body, revision = docs.get(i, (b'', 0))
+            fault = 'none'
+            if rng.random() < 0.25:
+                commands.append(f"message show {i.encode().hex() or '-'}")
+                if i not in docs: fault = 'not_found'
+            else:
+                pick = rng.random()
+                base = (revision if pick < 0.7 else revision - 1 if pick < 0.8 else 0 if pick < 0.9
+                        else rng.choice([7, -1, 9223372036854775807]))
+                start = rng.randint(0, len(body) + 2) if rng.random() < 0.8 else 0
+                remove = rng.choice([0, 0, 1, 2, 5, len(body)])
+                insert = bytes(rng.randrange(256) for _ in range(rng.choice([0, 1, 5, 300, 5000])))
+                encoded = i.encode()
+                commands.append('message edit ' + (struct.pack('<IqII', len(encoded), base, start, remove) + encoded + insert).hex())
+                if i in docs:
+                    if base != revision or start + remove > len(body): fault = 'limit'
+                    else: docs[i] = (body[:start] + insert + body[start + remove:], revision + 1)
+                elif base != 0 or start or remove: fault = 'limit'
+                else: docs[i] = (insert, 1)
+            expected.append((fault, [{'id': k, 'body': docs[k][0].hex(), 'revision': docs[k][1]}
+                                     for k in sorted(docs, key=lambda k: k.encode())]))
+        runs = {'memory': run(pure_run, module, stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()}
+        store = work / f'store-documents-{seed}'
+        if store.exists():
+            shutil.rmtree(store)
+        cuts, lines = sorted(rng.sample(range(1, steps), 6)), []
+        for number_, (start, end) in enumerate(zip([0] + cuts, cuts + [steps])):
+            batch = ['--batch', str(rng.randint(2, 9))] if number_ % 2 else []
+            lines += run(pure_run, module, '--store', store, *batch, stdin='\n'.join(commands[start:end]) + '\n',
+                         check=False).stdout.splitlines()
+            restarts += 1
+        runs['stored'] = lines
+        for way, outputs in runs.items():
+            assert len(outputs) == steps, (way, seed, len(outputs))
+            for line, command, (fault, want) in zip(outputs, commands, expected):
+                snapshot = json.loads(line)
+                where = (way, seed, command[:40])
+                assert snapshot['fault'] == fault, (where, snapshot['fault'])
+                assert snapshot['states']['docs'] == want, (where, snapshot['states']['docs'], want)
+                compared += 1
+    return [compared, restarts]
+
+
 def stored_nested(aup, pure_run, work, seeds, steps=200):
     """Pure 027's stage 3: a stored list whose items hold lists whose items hold lists (columns of cards of tags), run
     on a store restarting at random points (some runs saving in bursts) and in memory, against a model: every step's
@@ -2499,6 +2567,7 @@ def main():
         report['nested_values'] = nested_values(aup, pure_run, work)
         report['functions'] = functions(aup, pure_run, work)
         report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
+        report['documents'] = documents_model(aup, pure_run, work, range(4))
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

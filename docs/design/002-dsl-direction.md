@@ -817,7 +817,8 @@ on check {
 
 ### 저장되는 중첩 (Pure 027의 3단계)
 
-저장 상태와 transient 리스트의 레코드도 리스트를 담는다. 메시지의 행은 아직이다.
+저장 상태와 transient 리스트의 레코드도 리스트를 담는다. 메시지의 행도 4a부터 담는다(행은 읽기만 한다: 행 안의 리스트에
+덧붙이는 것은 거절한다).
 
 ```text
 record Card {
@@ -847,3 +848,35 @@ on tag {
 검증:
 - 열과 카드와 태그의 앱(`BOARD_SOURCE`)을 무작위 조작 200걸음으로 모델과 대조한다. 메모리에서, 그리고 저장소에서 여덟 번 다시
   시작하며(그중 반은 묶음 저장) 돈다. 씨앗 여섯 개에서 모든 걸음의 실패, 상태, 리스트를 읽는 보기가 모델과 같다.
+
+### 바이트를 담는 필드와 키별 문서 (Pure 027의 4b)
+
+레코드 필드가 바이트를 담는다(`body: bytes`, 기본값은 `= "…"`의 바이트). 키별 문서(`bytes by key`, `message by key`)가 하던 일을
+키 있는 리스트로 쓴다(`examples/documents.aup`).
+
+```text
+record Doc {
+  id: text
+  body: bytes
+  revision: i64
+}
+state docs: list of Doc by id
+on edit {
+  if docs.has(edit.id) {
+    let d = docs[edit.id]
+    require d.revision == edit.base       # 보낸 쪽이 본 리비전이 아직 그 문서의 것이어야 한다
+    require edit.start + edit.remove <= d.body.bytes
+    docs[edit.id].body = d.body[0 .. edit.start] + edit.insert + d.body[edit.start + edit.remove .. d.body.bytes]
+    docs[edit.id].revision = d.revision + 1
+  } else {
+    require edit.base == 0 && edit.start == 0 && edit.remove == 0
+    docs.add(Doc { id: edit.id, body: edit.insert, revision: 1 })
+  }
+  reply edit.insert
+}
+```
+
+- **뜻.** 바이트 필드는 text 필드처럼 읽고 쓰지만 UTF-8을 묻지 않는다. `x.body.bytes`가 길이다. text는 `bytes(t)`로만 그 자리에
+  간다.
+- **검증.** `documents_model`이 무작위 보기와 편집(묵은 리비전, 범위 밖, 아무 바이트, 한 번에 5,000바이트까지) 160걸음을 모델과
+  대조한다. 메모리에서, 그리고 저장소에서 여섯 번 다시 시작하며(반은 묶음 저장) 돈다. 씨앗 넷에서 모든 걸음의 실패와 문서가 같다.
