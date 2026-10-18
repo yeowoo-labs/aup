@@ -881,3 +881,9 @@ on edit {
   간다.
 - **검증.** `documents_model`이 무작위 보기와 편집(묵은 리비전, 범위 밖, 아무 바이트, 한 번에 5,000바이트까지) 160걸음을 모델과
   대조한다. 메모리에서, 그리고 저장소에서 여섯 번 다시 시작하며(반은 묶음 저장) 돈다. 씨앗 넷에서 모든 걸음의 실패와 문서가 같다.
+
+### 앵커 (Pure 027의 4c)
+
+언어는 그대로다(`cursor in note`, `mark in note`, `index of tasks`). Pure의 모듈에서는 커서와 인덱스가 앵커 하나다: 상태 종류 2가
+text나 리스트 안의 자리이고, 명령 일곱(LOAD, STORE, START, END, MOVE, COUNT, AT)이 그 둘의 열셋을 대신한다. aup는 MOVE와
+COUNT에 커서가 든 text나 인덱스가 든 리스트를 적어 낸다. Pure의 줄 수가 0부터이므로 `at.line`은 1을 더해 내보낸다.

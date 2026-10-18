@@ -16,13 +16,19 @@ enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK 
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
        MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, LEN, REPLY, REQUIRE,
        TEXT_CONST, TEXT_LOAD, TEXT_INPUT, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
-       CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
-       TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
-       ITEM_GET, ITEM_SET, INDEX_LOAD, INDEX_STORE, INDEX_MOVE, INDEX_FIRST, INDEX_LAST, INDEX_NUM, ROW,
+       ANCHOR_LOAD, ANCHOR_START, ANCHOR_END, ANCHOR_MOVE, ANCHOR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
+       TEXT_SET, TEXT_FROM, BYTES_FROM, ANCHOR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
+       ITEM_GET, ITEM_SET, ROW,
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
        LOCAL_LOAD, LOCAL_STORE, I64_ADD, I64_SUB, I64_MUL, I64_DIV, I64_MOD, I64_NEG, I64_COMPARE, I64_MIN, I64_MAX,
-       I64_FROM, NUM_FROM, LOOP, BREAK, I64_BITS, BYTE_AT, BYTES_OF, INDEX_AT, BYTES_SLICE, BYTE, BYTES_LOAD, BYTES_STORE,
+       I64_FROM, NUM_FROM, LOOP, BREAK, I64_BITS, BYTE_AT, BYTES_OF, ANCHOR_AT, BYTES_SLICE, BYTE, BYTES_LOAD, BYTES_STORE,
        LIST_VALUE, LIST_BIND, APPEND_IN, NUM_PARSE, CALL, RETURN, CHAR_AT, CHAR };
+/* A cursor's and an index's instructions are Pure's anchor's (027's 4c), MOVE and COUNT naming the text or list in
+ * bits 0-15 and the unit above (IN). */
+enum { CUR_LOAD = ANCHOR_LOAD, CUR_START = ANCHOR_START, CUR_END = ANCHOR_END, CUR_MOVE = ANCHOR_MOVE, CUR_STORE = ANCHOR_STORE,
+       CUR_COUNT = ANCHOR_COUNT, INDEX_LOAD = ANCHOR_LOAD, INDEX_STORE = ANCHOR_STORE, INDEX_MOVE = ANCHOR_MOVE,
+       INDEX_FIRST = ANCHOR_START, INDEX_LAST = ANCHOR_END, INDEX_NUM = ANCHOR_COUNT, INDEX_AT = ANCHOR_AT, ANCHOR_UNIT = 16 };
+#define IN(target, unit) ((uint32_t)(target) | (uint32_t)(unit) << ANCHOR_UNIT)
 /* Pure's values held by name: 0-15 bytes, 16-31 texts; BYTES_STORE's bit 8 appends. NUM_TEXT's format (Pure 027). */
 enum { HELD = 16, HELD_TEXT = 16, HELD_APPEND = 1 << 8 };
 enum { FORMAT_WIDTH = 8, FORMAT_ZEROS = 1 << 16, FORMAT_FORM = 17, FORMAT_DIGITS = 20,
@@ -3523,10 +3529,17 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         }
         if (inner.type == BYTES && !strcmp(m, "bytes")) { emit(c, e->line, e->column, LEN, 0, 0); return (Kind){NUM, -1}; }
         if (inner.type == CURSOR && (!strcmp(m, "chars") || !strcmp(m, "line"))) {
-            emit(c, e->line, e->column, CUR_COUNT, m[0] == 'c' ? UNIT_CHAR : UNIT_LINE, 0);
+            emit(c, e->line, e->column, CUR_COUNT, IN(inner.owner, m[0] == 'c' ? UNIT_CHAR : UNIT_LINE), 0);
+            if (m[0] == 'l') { /* at.line counts from 1, Pure's lines from 0 */
+                emit(c, e->line, e->column, CONST, 0, 1);
+                emit(c, e->line, e->column, ADD, 0, 0);
+            }
             return (Kind){NUM, -1};
         }
-        if (inner.type == INDEX && !strcmp(m, "position")) { emit(c, e->line, e->column, INDEX_NUM, 0, 0); return (Kind){NUM, -1}; }
+        if (inner.type == INDEX && !strcmp(m, "position")) {
+            emit(c, e->line, e->column, INDEX_NUM, (uint32_t)inner.owner, 0);
+            return (Kind){NUM, -1};
+        }
         if (inner.type == LIST) { /* a list value: bound to read */
             int reg = bind_list(c, e, inner);
             if (!strcmp(m, "count")) { emit(c, e->line, e->column, LIST_COUNT, (uint32_t)reg, 0); return (Kind){NUM, -1}; }
@@ -3780,8 +3793,8 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             if (distance || left.type == INDEX) {
                 number(c, distance ? e->args[1]->args[0] : e->args[1], handler, height + 1);
                 if (e->op == SUB) emit(c, e->line, e->column, NEG, 0, 0);
-                if (distance) emit(c, e->line, e->column, CUR_MOVE, (uint32_t)e->args[1]->op, 0);
-                else emit(c, e->line, e->column, INDEX_MOVE, 0, 0);
+                if (distance) emit(c, e->line, e->column, CUR_MOVE, IN(left.owner, e->args[1]->op), 0);
+                else emit(c, e->line, e->column, INDEX_MOVE, (uint32_t)left.owner, 0);
                 return left;
             }
             Type type = second(c, e, left, handler, height);
@@ -5447,7 +5460,10 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     p += 38;
     for (unsigned i = 0; i < c->states; ++i) {
         p = put32(p, state_name[i]);
-        p = put32(p, (uint32_t)c->state_types[i] | (c->state_transient[i] ? STATE_TRANSIENT : 0));
+        /* Pure's types in a module: a cursor and an index are its anchor (027's 4c), a bool and an i64 then 4 and 5. */
+        static const uint32_t module_types[] = {[STATE_NUM] = 0, [STATE_TEXT] = 1, [STATE_CURSOR] = 2, [STATE_LIST] = 3,
+                                                [STATE_INDEX] = 2, [STATE_BOOL] = 4, [STATE_I64] = 5};
+        p = put32(p, module_types[c->state_types[i]] | (c->state_transient[i] ? STATE_TRANSIENT : 0));
         if (c->state_types[i] == STATE_NUM || c->state_types[i] == STATE_BOOL) p = put_double(p, c->initial[i]);
         else if (c->state_types[i] == STATE_I64) p = put64(p, (uint64_t)c->state_integer[i]);
         else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */
