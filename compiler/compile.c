@@ -4727,7 +4727,7 @@ static void statements(Compiler *c, const Stmt *s) {
                     fail_at(c, s->first->line, s->first->column, "'%s' is not a list in a field", path);
                 if (c->state_bound[list] || c->state_rows[list])
                     fail_at(c, s->first->line, s->first->column, "a list in a field changes in an item of a let's, a stored or a "
-                            "transient list, not of one read from a record");
+                            "transient list, not of a message's rows or one read from a record");
                 view_changes(c, s, list, c->state_names[list]);
                 const Record *inner = &c->records[r->field_record[field]];
                 const Expr *values[FIELDS_PER_RECORD];
@@ -5371,10 +5371,6 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (record < 0)
                 fail_at(c, c->state_line[i], c->state_column[i], "a list holds a record; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)record;
-            for (unsigned k = 0; k < c->records[record].fields && c->state_rows[i]; ++k)
-                if (c->records[record].field_kinds[k] == LIST) /* (027's 2b and 3) */
-                    fail_at(c, c->state_line[i], c->state_column[i], "'%s' holds lists in its items: a message's rows do not, "
-                            "for now (lets', stored and transient lists do)", c->state_names[i]);
             if (*c->state_key[i]) {
                 const Record *r = &c->records[record];
                 c->list_key[i] = 1 + (int)record_field(c, r, c->state_key[i], c->state_key_line[i], c->state_key_column[i]);
