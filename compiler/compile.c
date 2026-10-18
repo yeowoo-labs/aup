@@ -10,11 +10,11 @@
 
 /* Limits and opcodes of Pure module format v6. */
 enum { STATES = 32, INPUTS = 32, VIEWS = 64, HANDLERS = 64, CODE = 65535, STACK = 64, NAME = 32, JOINS = 8,
-       DEPTH = 64, FIELDS = 64, COLLECTIONS = 1, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
+       DEPTH = 64, FIELDS = 64, CONSTANTS = 4096, CONSTANT_BYTES = 1 << 20,
        RECORDS = 16, RECORD_FIELDS = 128, FIELDS_PER_RECORD = 16, FNS = 64, PARAMS = 8, MODULES = 9,
        LIBRARY_RECORDS = 64 };
 enum { CONST, LOAD, DT, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NOT,
-       MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, DOC, DOC_SIZE, LEN, REPLACE, REPLY, REQUIRE,
+       MIN, MAX, CLAMP, STORE, JZ, JMP, FIELD, LEN, REPLY, REQUIRE,
        TEXT_CONST, TEXT_LOAD, TEXT_INPUT, NUM_TEXT, CONCAT, CHARS, LINES, TEXT_BYTES,
        CUR_LOAD, CUR_START, CUR_END, CUR_MOVE, CUR_STORE, TEXT_INSERT, TEXT_REMOVE, TEXT_LINE,
        TEXT_SET, TEXT_FROM, BYTES_FROM, CUR_COUNT, LIST_COUNT, LIST_APPEND, LIST_INSERT, LIST_REMOVE,
@@ -62,8 +62,6 @@ typedef struct {
 typedef enum {
     E_NUMBER, E_BOOL, E_NAME, E_DT, E_NOW, E_UNARY, E_BINARY, E_CALL,
     E_MEMBER,  /* args[0].member */
-    E_DOC,     /* name[key] */
-    E_SIZE,    /* name[key].bytes */
     E_STRING,  /* parts linked by next: E_TEXT literals and expressions */
     E_TEXT,    /* literal bytes */
     E_UNIT,    /* args[0] char|line */
@@ -93,7 +91,7 @@ typedef struct Expr {
     size_t size;
 } Expr;
 
-typedef enum { S_ASSIGN, S_IF, S_REPLACE, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
+typedef enum { S_ASSIGN, S_IF, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
                S_LET, S_COUNT, S_BREAK, S_RETURN, S_ASSIGNS, S_LETS, S_MATCH, S_ARM, S_CALL } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
@@ -118,7 +116,6 @@ typedef struct {
     char name[NAME], key[NAME];
     int kind;
     uint32_t period; /* a timer's, in milliseconds */
-    bool keyed;
     char field_names[FIELDS][NAME];
     int field_types[FIELDS];
     /* A rows field's record (its library: 0 the app's), where it was written, and the list its rows fill. */
@@ -223,8 +220,6 @@ typedef struct {
     int64_t state_integer[STATES]; /* an i64 state's start */
     Expr *state_text[STATES];
     unsigned states;
-    char collection_names[COLLECTIONS][NAME];
-    unsigned collections;
     Record records[RECORDS]; /* the module's: the app's, then the libraries' it uses (pull_records) */
     unsigned record_count, record_fields;
     Record library_records[LIBRARY_RECORDS]; /* the libraries', in the order they were read */
@@ -560,15 +555,6 @@ static Token held_record(Compiler *c, char name[NAME], int *library);
 static int used_library(const Compiler *c, int module, const char *name);
 static int library_record(const Compiler *c, int library, const char *name);
 
-/* name[key]: collections are indexed only by the message key. */
-static void index_key(Compiler *c) {
-    take(c); /* [ */
-    if (!word(c, "key"))
-        fail_at(c, c->token.line, c->token.column, "a collection is indexed by the message key, as in name[key]");
-    take(c);
-    expect(c, "]", "']'");
-}
-
 /* (a, b, ...) after a fn name. */
 /* Arguments once the opening parenthesis is taken. */
 static Expr *inserted_value(Compiler *c, bool multiline);
@@ -592,18 +578,7 @@ static Expr *arguments(Compiler *c, Expr *call) {
 }
 
 static Expr *postfix(Compiler *c, Expr *e) {
-    const Token *next = is(c, "[") ? lookahead(c) : NULL;
-    if (e->kind == E_NAME && next && next->kind == T_NAME && !strcmp(next->text, "key")) {
-        index_key(c);
-        e->kind = E_DOC;
-        if (is(c, ".") && lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "bytes")) {
-            take(c);
-            take(c);
-            e->kind = E_SIZE;
-        }
-        return e;
-    }
-    if (e->kind == E_NAME && next) {
+    if (e->kind == E_NAME && is(c, "[")) {
         /* tasks[at].title: a field of a list item. */
         take(c);
         Expr *item = node(c, E_ITEM, e->line, e->column);
@@ -1126,14 +1101,6 @@ static Expr *inserted_value(Compiler *c, bool multiline) {
 
 static Stmt *block(Compiler *c, unsigned depth);
 
-static void range(Compiler *c, Stmt *s) {
-    s->first = expression(c, 0, true);
-    newlines(c);
-    expect(c, "..", "'..'");
-    s->last = expression(c, 0, true);
-    newlines(c);
-}
-
 /* name.field.append(item) or name.first.field.append(item) (027's 2b), name taken, '.' next: into the list in a field
  * of the item; false, with nothing taken, for anything else. */
 static bool path_append(Compiler *c, Stmt *s, const Token *name) {
@@ -1416,7 +1383,7 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         s->value = arguments(c, call);
         return s;
     }
-    if (is(c, "[") && !(lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "key"))) {
+    if (is(c, "[")) {
         /* tasks[at].field = value */
         take(c);
         s->kind = S_SET;
@@ -1444,8 +1411,7 @@ static Stmt *statement(Compiler *c, unsigned depth) {
                 expect(c, ")", "')'");
                 return s;
             }
-            if (is(c, "("))
-                fail_at(c, s->first->line, s->first->column, "a collection is indexed by the message key, as in name[key]");
+            if (is(c, "(")) fail_at(c, field.line, field.column, "a field changes by '=', as in %s[at].%s = value", s->name, field.text);
             memcpy(s->member, field.text, NAME);
         } else if (is(c, "=")) { /* tasks[at] = Task { ... }: every field of the item (no member); xs[i] = 5 */
             take(c);
@@ -1456,20 +1422,6 @@ static Stmt *statement(Compiler *c, unsigned depth) {
                     "expected '.' and the field to change, as in %s[at].field = value, or '=' and a record", s->name);
         expect(c, "=", "'='");
         s->value = expression(c, 0, false);
-        return s;
-    }
-    if (is(c, "[")) {
-        index_key(c);
-        expect(c, ".", "'.replace'");
-        Token method = expect_name(c, "replace");
-        if (strcmp(method.text, "replace")) fail_at(c, method.line, method.column, "a collection entry supports replace(first .. last, value)");
-        expect(c, "(", "'('");
-        s->kind = S_REPLACE;
-        range(c, s);
-        expect(c, ",", "','");
-        s->value = expression(c, 0, true);
-        newlines(c);
-        expect(c, ")", "')'");
         return s;
     }
     if (is(c, ".") && path_append(c, s, &token)) return s;
@@ -1601,7 +1553,6 @@ static const char *declared_kind(const Compiler *c, const char *name) {
     int state = state_index(c, name);
     if (state >= 0) return states[c->state_types[state]];
     if (record_index(c, name) >= 0) return "a record";
-    for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) return "a collection";
     int input = input_index(c, name);
     if (input >= 0) return c->inputs[input].kind == KIND_KEY ? "a key input" :
                            c->inputs[input].kind == KIND_TEXT ? "a text input" :
@@ -1897,16 +1848,6 @@ static Token held_record(Compiler *c, char name[NAME], int *library) {
 static void state_declaration(Compiler *c, bool transient) {
     Token name = expect_name(c, "state name");
     declare(c, &name);
-    if (is(c, ":") && lookahead(c)->kind == T_NAME && !strcmp(lookahead(c)->text, "bytes")) {
-        if (transient) fail_at(c, name.line, name.column, "a keyed collection is stored; only a state can be transient");
-        take(c);
-        take(c);
-        expect_word(c, "by");
-        expect_word(c, "key");
-        if (c->collections == COLLECTIONS) fail_at(c, name.line, name.column, "at most one keyed collection is allowed");
-        memcpy(c->collection_names[c->collections++], name.text, NAME);
-        return;
-    }
     if (c->states == STATES) fail_at(c, name.line, name.column, "at most 32 states are allowed");
     unsigned index = c->states;
     memcpy(c->state_names[index], name.text, NAME);
@@ -1948,8 +1889,8 @@ static void state_declaration(Compiler *c, bool transient) {
                 c->state_key_column[index] = key.column;
             }
         } else fail_at(c, type.line, type.column,
-                       "state types are numbers, bools, i64, text, cursor or mark in a text, list of a record, index of "
-                       "a list, and bytes by key");
+                       "state types are numbers, bools, i64, text, cursor or mark in a text, list of a record and index of "
+                       "a list");
         ++c->states;
         return;
     }
@@ -2196,7 +2137,6 @@ static void declaration(Compiler *c) {
         if (word(c, "message")) {
             take(c);
             in->kind = KIND_MESSAGE;
-            if (word(c, "by")) { take(c); expect_word(c, "key"); in->keyed = true; }
             ++c->input_count;
             if (word(c, "like")) {
                 take(c);
@@ -2337,20 +2277,6 @@ static uint32_t constant(Compiler *c, const Expr *e) {
     return c->constants++;
 }
 
-/* The keyed collection used by name[key] in the current handler. */
-static uint32_t collection(Compiler *c, const char *name, int line, int column) {
-    int index = -1;
-    for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) index = (int)i;
-    if (index < 0) {
-        const char *kind = declared_kind(c, name);
-        if (kind) fail_at(c, line, column, "'%s' is %s, not a collection", name, kind);
-        fail_at(c, line, column, "unknown collection '%s'", name);
-    }
-    if (c->message < 0 || c->inputs[c->message].kind != KIND_MESSAGE || !c->inputs[c->message].keyed)
-        fail_at(c, line, column, "%s[key] needs the handler of a message by key", name);
-    return (uint32_t)index;
-}
-
 static int text_state(Compiler *c, const char *name, int line, int column) {
     int index = state_index(c, name);
     if (index < 0 || c->state_types[index] != STATE_TEXT) {
@@ -2363,7 +2289,7 @@ static int text_state(Compiler *c, const char *name, int line, int column) {
 
 static int cursor_owner(const Compiler *c, int cursor) { return state_index(c, c->state_target[cursor]); }
 
-/* The list state name[...] indexes; where points at the index for a collection. */
+/* The list state name[...] indexes (where: the index, or NULL). */
 static int list_state(Compiler *c, const char *name, int line, int column, const Expr *where) {
     int index = state_index(c, name);
     if (index >= 0 && c->state_types[index] == STATE_LIST) {
@@ -2371,9 +2297,7 @@ static int list_state(Compiler *c, const char *name, int line, int column, const
             fail_at(c, line, column, "the rows of '%s' are only available in its handler", c->inputs[c->state_rows[index] - 1].name);
         return index;
     }
-    for (unsigned i = 0; i < c->collections; ++i)
-        if (!strcmp(c->collection_names[i], name) && where)
-            fail_at(c, where->line, where->column, "a collection is indexed by the message key, as in name[key]");
+    (void)where;
     const char *kind = declared_kind(c, name);
     if (kind) fail_at(c, line, column, "'%s' is %s, not a list", name, kind);
     fail_at(c, line, column, "unknown list '%s'", name);
@@ -2607,10 +2531,6 @@ static Kind item_value(Compiler *c, const Expr *e, int list) {
     return field_value(r, 0);
 }
 
-static int collection_index(const Compiler *c, const char *name) {
-    for (unsigned i = 0; i < c->collections; ++i) if (!strcmp(c->collection_names[i], name)) return (int)i;
-    return -1;
-}
 
 static Kind call_fn(Compiler *c, const Expr *e, int fn, bool handler, int height, Kind *kinds, unsigned given);
 static bool variant_case(Compiler *c, const Expr *e, int *variant, unsigned *index, const Expr **payload);
@@ -2699,7 +2619,7 @@ static int rows_list(Compiler *c, const Expr *e) {
     return -1;
 }
 
-/* A name of the app (a state, input or collection): not visible in a library
+/* A name of the app (a state or an input): not visible in a library
  * fn, and hidden by a parameter of the same name. */
 static void app_name(Compiler *c, const Expr *e, const char *name) {
     if (c->module) fail_at(c, e->line, e->column, "'%s' is not a parameter; a library fn reads only its parameters", name);
@@ -3668,14 +3588,6 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         emit(c, e->line, e->column, TEXT_LINE, (uint32_t)text, 0);
         return (Kind){TEXT, -1};
     }
-    case E_DOC:
-        app_name(c, e, e->name);
-        emit(c, e->line, e->column, DOC, collection(c, e->name, e->line, e->column), 0);
-        return (Kind){BYTES, -1};
-    case E_SIZE:
-        app_name(c, e, e->name);
-        emit(c, e->line, e->column, DOC_SIZE, collection(c, e->name, e->line, e->column), 0);
-        return (Kind){NUM, -1};
     case E_CONVERT: {
         const Expr *a = e->args[0];
         int list = e->op == BYTES_FROM && a->kind == E_NAME && !c->module && parameter(c, a->name) < 0 ? state_index(c, a->name) : -1;
@@ -3697,7 +3609,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     }
     case E_ITEM: {
         int named = c->module || parameter(c, e->name) >= 0 ? -1 : state_index(c, e->name);
-        if (!*e->member && (named < 0 || c->state_types[named] != STATE_LIST) && collection_index(c, e->name) < 0) {
+        if (!*e->member && (named < 0 || c->state_types[named] != STATE_LIST)) {
             Expr name = *e, at = *e; /* data[i]: a parameter's, an argument's, a let's or a state's byte; data[a .. c] */
             name.kind = E_NAME;
             name.count = 0;
@@ -4810,15 +4722,6 @@ static void statements(Compiler *c, const Stmt *s) {
             emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
         }
-        case S_REPLACE: {
-            view_changes(c, s, -1, s->name);
-            uint32_t target = collection(c, s->name, s->line, s->column);
-            number(c, s->first, c->handling, 0);
-            number(c, s->last, c->handling, 1);
-            bytes_value(c, s->value, 2, "replace");
-            emit(c, s->line, s->column, REPLACE, target, 0);
-            break;
-        }
         case S_SEND: {
             if (!c->handling) fail_at(c, s->line, s->column, "a view sends nothing; a handler sends");
             int output = input_index(c, s->name);
@@ -5216,8 +5119,8 @@ static void rows_lists(Compiler *c) {
  * module after the app's own: library by library as they were read, each
  * in its declaration order (so records moved from the top of an app into
  * a library it uses first leave the module as it was). In a module the
- * records share one namespace with the states, inputs, views and
- * collections (Pure's), however they were written. */
+ * records share one namespace with the states, inputs and views (Pure's),
+ * however they were written. */
 static void pull_records(Compiler *c) {
     for (unsigned i = 0; i < c->library_record_count; ++i) {
         const Record *r = &c->library_records[i];
@@ -5228,8 +5131,6 @@ static void pull_records(Compiler *c) {
                             input >= 0 ? (c->inputs[input].kind == KIND_OUTPUT ? "an output" : "an input") : NULL;
         for (unsigned v = 0; !taken && other < 0 && v < c->views; ++v)
             if (!c->view_table[v] && !strcmp(c->view_names[v], r->name)) taken = "a view";
-        for (unsigned k = 0; !taken && other < 0 && k < c->collections; ++k)
-            if (!strcmp(c->collection_names[k], r->name)) taken = "a collection";
         if (other >= 0)
             fail_at(c, r->used_line, r->used_column, "%s.%s is '%s' in the module, as %s is: two records cannot share a name",
                     library, r->name, r->name, record_shown(c, 0, &c->records[other]));
@@ -5504,9 +5405,9 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             fail_at(c, c->fns[in->fn].line, c->fns[in->fn].column, "fn '%s' takes or gives more than 64 values", c->fns[in->fn].name);
         signature_items += taken + given;
     }
-    static unsigned char strings[(STATES + COLLECTIONS + 2 * INPUTS + FIELDS + VIEWS + RECORDS + RECORD_FIELDS) * NAME];
+    static unsigned char strings[(STATES + 2 * INPUTS + FIELDS + VIEWS + RECORDS + RECORD_FIELDS) * NAME];
     size_t used = 0;
-    uint32_t state_name[STATES] = {0}, collection_name[COLLECTIONS] = {0}, input_name[INPUTS] = {0}, input_key[INPUTS] = {0};
+    uint32_t state_name[STATES] = {0}, input_name[INPUTS] = {0}, input_key[INPUTS] = {0};
     uint32_t field_name[FIELDS] = {0}, view_name[VIEWS] = {0}, record_name[RECORDS] = {0};
     uint32_t record_field_name[RECORDS][FIELDS_PER_RECORD] = {{0}};
     unsigned fields = 0;
@@ -5514,7 +5415,6 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         state_name[i] = intern(strings, &used, c->state_names[i]);
         if (c->state_hidden[i]) state_ref[i] = (uint32_t)c->state_record[i]; /* made while the code was */
     }
-    for (unsigned i = 0; i < c->collections; ++i) collection_name[i] = intern(strings, &used, c->collection_names[i]);
     for (unsigned i = 0; i < c->input_count; ++i) {
         input_name[i] = intern(strings, &used, c->inputs[i].name);
         input_key[i] = c->inputs[i].kind == KIND_KEY ? intern(strings, &used, c->inputs[i].key) : 0;
@@ -5527,11 +5427,11 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         for (unsigned k = 0; k < c->records[i].fields; ++k)
             record_field_name[i][k] = intern(strings, &used, c->records[i].field_names[k]);
     }
-    *size = 40 + 16u * c->states + 12u * c->collections + 16u * c->input_count + 8u * fields + 8u * c->constants +
+    *size = 38 + 16u * c->states + 16u * c->input_count + 8u * fields + 8u * c->constants +
             8u * c->record_count + 16u * c->record_fields + 16u * c->views + 12u * c->handler_count + 12u * c->instance_count +
             4u * signature_items + 16u * c->code_count + used + c->constant_used;
     unsigned char *p = *module = allocate(c, *size);
-    memcpy(p, "PUREMOD6", 8);
+    memcpy(p, "PUREMOD7", 8);
     put16(p + 8, c->states);
     put16(p + 10, c->input_count);
     put16(p + 12, c->views);
@@ -5539,13 +5439,12 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
     put32(p + 16, c->code_count);
     put32(p + 20, (uint32_t)used);
     put16(p + 24, fields);
-    put16(p + 26, c->collections);
-    put16(p + 28, c->constants);
-    put16(p + 30, c->record_count);
-    put32(p + 32, (uint32_t)c->constant_used);
-    put16(p + 36, c->record_fields);
-    put16(p + 38, c->instance_count);
-    p += 40;
+    put16(p + 26, c->constants);
+    put16(p + 28, c->record_count);
+    put32(p + 30, (uint32_t)c->constant_used);
+    put16(p + 34, c->record_fields);
+    put16(p + 36, c->instance_count);
+    p += 38;
     for (unsigned i = 0; i < c->states; ++i) {
         p = put32(p, state_name[i]);
         p = put32(p, (uint32_t)c->state_types[i] | (c->state_transient[i] ? STATE_TRANSIENT : 0));
@@ -5558,13 +5457,12 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                          c->state_stays[i] ? 1 : 0);
         }
     }
-    for (unsigned i = 0; i < c->collections; ++i) { p = put32(p, collection_name[i]); p = put32(p, 1); p = put32(p, 1); }
     unsigned first = 0;
     for (unsigned i = 0; i < c->input_count; ++i) {
         const Input *in = &c->inputs[i];
         p = put32(p, input_name[i]);
         *p++ = (unsigned char)in->kind;
-        *p++ = in->keyed;
+        *p++ = 0;
         p = put16(p, 0);
         p = put32(p, in->kind == KIND_TIMER ? in->period : in->kind == KIND_ARGUMENTS ? in->view : input_key[i]);
         p = put16(p, in->kind == KIND_MESSAGE || in->kind == KIND_OUTPUT || in->kind == KIND_ARGUMENTS ? first : 0);

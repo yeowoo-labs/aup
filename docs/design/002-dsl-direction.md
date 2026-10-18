@@ -852,7 +852,8 @@ on tag {
 ### 바이트를 담는 필드와 키별 문서 (Pure 027의 4b)
 
 레코드 필드가 바이트를 담는다(`body: bytes`, 기본값은 `= "…"`의 바이트). 키별 문서(`bytes by key`, `message by key`)가 하던 일을
-키 있는 리스트로 쓴다(`examples/documents.aup`).
+키 있는 리스트로 쓴다(`examples/documents.aup`). 4b-2에서 키별 문서는 언어에서 빠졌다: `bytes by key`, `message by key`, `이름[key]`,
+`.replace(..)`, 그리고 옛 편집기 예제 둘(`editor.aup`, `bounded-editor.aup`)과 그것을 옛 편집기와 대조하던 검사.
 
 ```text
 record Doc {
