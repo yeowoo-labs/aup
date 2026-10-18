@@ -53,7 +53,9 @@ enum { STATE_TRANSIENT = 256 };
 enum { STATE_NUM = 0, STATE_TEXT = 1, STATE_CURSOR = 2, STATE_LIST = 3, STATE_INDEX = 4, STATE_BOOL = 5, STATE_I64 = 6,
        UNIT_CHAR = 0, UNIT_LINE = 1 };
 /* Pure's view types, record field types (0 a number, 1 a text, 2 a bool, 3 an i64) and what a local holds. */
-enum { VIEW_NUM = 0, VIEW_TEXT = 1, VIEW_TABLE = 2, VIEW_BOOL = 3, VIEW_I64 = 4, LOCAL_BOOL = 2, LOCAL_I64 = 3, LOCAL_LIST = 4 };
+/* A view's type is a record field's (Pure 027's 4e). */
+enum { VIEW_NUM = 0, VIEW_TEXT = 1, VIEW_BOOL = 2, VIEW_I64 = 3, VIEW_LIST = 4, VIEW_BYTES = 5, LOCAL_BOOL = 2, LOCAL_I64 = 3,
+       LOCAL_LIST = 4 };
 /* LIST: a list in a record (Pure 027). RECORD: a record's or a variant's value, its fields on the stack in its order
  * (027's 2c); TUPLE: the values a fn gives (owner: its instance); NOTHING: what a fn that gives none gives. */
 typedef enum { NUM = 1, BYTES, TEXT, CURSOR, UNIT, INDEX, BOOL, I64, LIST, RECORD, TUPLE, NOTHING } Type;
@@ -238,12 +240,15 @@ typedef struct {
     unsigned library_record_count;
     Input inputs[INPUTS];
     unsigned input_count, field_count;
-    /* Views in order; a table (no value) is followed by its columns. */
+    /* Views in order; a table (no value) is followed by its columns, or has none (each ... without them: its list's
+     * items as they are, view_whole). */
     char view_names[VIEWS][NAME], view_row[VIEWS][NAME], view_list[VIEWS][NAME];
     Expr *view_value[VIEWS];
     Stmt *view_body[VIEWS];                           /* a view that computes: its statements, return last (view_value) */
     Expr *view_filter[VIEWS];                         /* a table's where condition, or NULL */
-    unsigned char view_byte[VIEWS];                   /* a filtered table's list + 1 */
+    int view_source[VIEWS];                           /* a list view over a list state: that state + 1 */
+    int view_record[VIEWS];                           /* a list view's or a list column's items' record + 1 (a map's 0) */
+    bool view_whole[VIEWS];                           /* each ... without columns */
     int view_table[VIEWS];                            /* a column's table + 1, or 0 */
     int view_arguments[VIEWS];                        /* the input of a view's arguments + 1, or 0 */
     int view_line[VIEWS][2], view_column[VIEWS][2];   /* a table's row name and list name */
@@ -1934,6 +1939,10 @@ static void table_declaration(Compiler *c, unsigned table) {
     if (word(c, "where")) { /* a row only for the items it keeps */
         take(c);
         c->view_filter[table] = expression(c, 0, false);
+    }
+    if (!is(c, "{")) { /* its list's items as they are: their fields its columns */
+        c->view_whole[table] = true;
+        return;
     }
     expect(c, "{", "'{' on the line of the table");
     separators(c);
@@ -4934,7 +4943,16 @@ static void statements(Compiler *c, const Stmt *s) {
             /* a view's body's value, its last line */
             if (c->handling) fail_at(c, s->line, s->column, "return gives a view's body its value; a handler returns nothing");
             if (s->next || c->nested) fail_at(c, s->line, s->column, "return is the last line of a view's body");
-            c->returned = value(c, s->value, false, 0);
+            const Expr *v = s->value;
+            int named = v->kind == E_NAME && parameter(c, v->name) < 0 ? state_index(c, v->name) : -1;
+            if (named >= 0 && c->state_types[named] == STATE_LIST) { /* a list it built: the view's rows (Pure 027's 4e) */
+                int list = list_state(c, v->name, v->line, v->column, NULL);
+                if (!c->state_event[list])
+                    fail_at(c, v->line, v->column, "a view's body returns a list it built; a state's list is a view as it is, "
+                            "as in view all = %s", v->name);
+                emit(c, v->line, v->column, LIST_VALUE, (uint32_t)list, 0);
+                c->returned = (Kind){LIST, (int)module_record(c, c->state_library[list], c->state_target[list])};
+            } else c->returned = value(c, s->value, false, 0);
             c->has_returned = true;
             break;
         }
@@ -5352,9 +5370,13 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         if (c->view_table[v] || length <= 6 || strcmp(c->view_names[v] + length - 6, "_focus") || !e || e->kind != E_MEMBER ||
             strcmp(e->member, "position") || e->args[0]->kind != E_NAME) continue;
         int anchor = state_index(c, e->args[0]->name), table = -1;
-        for (unsigned t = 0; t < c->views; ++t)
-            if (!c->view_table[t] && *c->view_list[t] && strlen(c->view_names[t]) == length - 6 &&
-                !memcmp(c->view_names[t], c->view_names[v], length - 6)) table = (int)t;
+        for (unsigned t = 0; t < c->views; ++t) { /* a list view over a list state: each ..., or the state as it is */
+            const Expr *whole = c->view_value[t] && !c->view_body[t] && c->view_value[t]->kind == E_NAME ? c->view_value[t] : NULL;
+            int listed = whole ? state_index(c, whole->name) : -1;
+            if (!c->view_table[t] && (*c->view_list[t] || (listed >= 0 && c->state_types[listed] == STATE_LIST)) &&
+                strlen(c->view_names[t]) == length - 6 && !memcmp(c->view_names[t], c->view_names[v], length - 6))
+                table = (int)t;
+        }
         if (anchor < 0 || c->state_types[anchor] != STATE_INDEX || table < 0) continue;
         if (c->input_count == INPUTS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most 32 inputs are allowed");
         if (c->handler_count == HANDLERS) fail_at(c, c->view_line[v][0], c->view_column[v][0], "at most 64 handlers are allowed");
@@ -5416,13 +5438,20 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
      * list in place of code; its columns may read its row. */
     c->message = -1;
     for (unsigned i = 0; i < c->views; ++i) {
-        if (!c->view_value[i]) {
-            const char *row = c->view_row[i], *kind = declared_kind(c, row);
-            if (kind) fail_at(c, c->view_line[i][0], c->view_column[i][0], "'%s' is already declared as %s", row, kind);
-            int list = list_state(c, c->view_list[i], c->view_line[i][1], c->view_column[i][1], NULL);
-            c->view_types[i] = VIEW_TABLE;
-            c->view_code[i][0] = (uint32_t)list;
-            c->view_code[i][1] = 0;
+        const Expr *named = c->view_value[i] && !c->view_body[i] && !c->view_table[i] ? c->view_value[i] : NULL;
+        int whole = named && named->kind == E_NAME && !c->view_arguments[i] ? state_index(c, named->name) : -1;
+        if (whole >= 0 && c->state_types[whole] != STATE_LIST) whole = -1;
+        if (!c->view_value[i] || whole >= 0) { /* a list view over a list state: a map, or its items as they are */
+            int list = whole >= 0 ? list_state(c, named->name, named->line, named->column, NULL)
+                                  : list_state(c, c->view_list[i], c->view_line[i][1], c->view_column[i][1], NULL);
+            if (whole < 0) {
+                const char *row = c->view_row[i], *kind = declared_kind(c, row);
+                if (kind) fail_at(c, c->view_line[i][0], c->view_column[i][0], "'%s' is already declared as %s", row, kind);
+            }
+            c->view_types[i] = VIEW_LIST;
+            c->view_source[i] = list + 1;
+            c->view_record[i] = whole >= 0 || c->view_whole[i] ? (int)module_record(c, c->state_library[list], c->state_target[list]) + 1 : 0;
+            c->view_code[i][0] = c->view_code[i][1] = 0;
             if (c->view_filter[i]) {
                 /* The filter runs as a column of the list: it reads the table's row. */
                 c->row = (int)i;
@@ -5431,7 +5460,6 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
                 c->view_code[i][0] = c->code_count;
                 truth(c, c->view_filter[i], false, 0, "where");
                 c->view_code[i][1] = c->code_count - c->view_code[i][0];
-                c->view_byte[i] = (unsigned char)(list + 1);
                 c->filtering = false;
             }
             continue;
@@ -5446,10 +5474,14 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             statements(c, c->view_body[i]);
             kind = c->returned;
         } else kind = value(c, c->view_value[i], false, 0);
-        if (kind.type != NUM && kind.type != BOOL && kind.type != I64 && kind.type != TEXT)
-            fail_at(c, c->view_value[i]->line, c->view_value[i]->column, "a %s is a number, a bool, an i64 or text, not %s",
-                    c->row >= 0 ? "column" : "view", type_name(kind.type));
-        c->view_types[i] = kind.type == TEXT ? VIEW_TEXT : kind.type == BOOL ? VIEW_BOOL : kind.type == I64 ? VIEW_I64 : VIEW_NUM;
+        if (kind.type != NUM && kind.type != BOOL && kind.type != I64 && kind.type != TEXT && kind.type != BYTES && kind.type != LIST)
+            fail_at(c, c->view_value[i]->line, c->view_value[i]->column,
+                    "a %s is a number, a bool, an i64, text, bytes or a list, not %s", c->row >= 0 ? "column" : "view",
+                    type_name(kind.type));
+        static const int types[] = {[NUM] = VIEW_NUM, [TEXT] = VIEW_TEXT, [BOOL] = VIEW_BOOL, [I64] = VIEW_I64, [LIST] = VIEW_LIST,
+                                    [BYTES] = VIEW_BYTES};
+        c->view_types[i] = types[kind.type];
+        c->view_record[i] = kind.type == LIST ? kind.owner + 1 : 0; /* a list it leaves: its items' record */
         c->view_code[i][1] = c->code_count - c->view_code[i][0];
     }
     c->row = -1;
@@ -5510,7 +5542,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             record_field_name[i][k] = intern(strings, &used, c->records[i].field_names[k]);
     }
     *size = 38 + 16u * c->states + 16u * c->input_count + 8u * fields + 8u * c->constants +
-            8u * c->record_count + 16u * c->record_fields + 16u * c->views + 12u * c->handler_count + 12u * c->instance_count +
+            8u * c->record_count + 16u * c->record_fields + 20u * c->views + 12u * c->handler_count + 12u * c->instance_count +
             4u * signature_items + 16u * c->code_count + used + c->constant_used;
     unsigned char *p = *module = allocate(c, *size);
     memcpy(p, "PUREMOD7", 8);
@@ -5588,11 +5620,13 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             else if (r->field_kinds[k] == LIST) p = put64(p, (uint64_t)r->field_record[k]); /* the record of its items */
             else p = put_double(p, r->field_number[k]);
         }
-    for (unsigned i = 0; i < c->views; ++i) {
+    for (unsigned i = 0; i < c->views; ++i) { /* 20 bytes: type, 0, table + 1, record + 1, list + 1, block */
         p = put32(p, view_name[i]);
         *p++ = (unsigned char)c->view_types[i];
-        *p++ = c->view_byte[i];
+        *p++ = 0;
         p = put16(p, (uint32_t)c->view_table[i]);
+        p = put16(p, (uint32_t)c->view_record[i]);
+        p = put16(p, (uint32_t)c->view_source[i]);
         p = put32(p, c->view_code[i][0]);
         p = put32(p, c->view_code[i][1]);
     }

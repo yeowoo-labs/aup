@@ -221,7 +221,7 @@ DIAGNOSTICS = [
      '6:12', "a cursor of 'a' cannot point into 'b'"),
     ('state a: text\nstate at: cursor in a\ninput k = key KeyK\non k.down {\n  at = 3\n}\n', '5:8',
      'expected a cursor, not a number'),
-    ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number, a bool, an i64 or text, not a cursor'),
+    ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number, a bool, an i64, text, bytes or a list, not a cursor'),
     ('state a: text\nstate at: cursor in a\nview v = "{at}"\n', '3:12', 'a string shows numbers, bools, i64s and text, not a cursor'),
     ('state x = 1\nstate t: text = "{x}"\n', '2:17', 'a text state starts from a plain string'),
     ('view v = "a\\qb"\n', '1:12', 'unknown escape'),
@@ -246,10 +246,10 @@ DIAGNOSTICS = [
     (RECORD + 'state xs: list of T\nstate ys: list of T\nstate at: index of xs\nview v = ys[at].a\n', '7:13',
      "an index of 'xs' cannot point into 'ys'"),
     (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at].b\n', '6:10', "record 'T' has no field 'b'"),
-    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at]\n', '6:10', 'a view is a number, a bool, an i64 or text, not an index'),
-    (RECORD + 'state xs: list of T\nview v = xs\n', '5:10', "'xs' is a list; read xs.count"),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = xs[at]\n', '6:10', 'a view is a number, a bool, an i64, text, bytes or a list, not an index'),
+    (RECORD + 'state xs: list of T\nview v {\n  return xs\n}\n', '6:10', "a view's body returns a list it built"),
     (RECORD + 'state xs: list of T\nview v = xs.size\n', '5:10', "a list has count, first and last, not 'size'"),
-    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number, a bool, an i64 or text, not an index'),
+    (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number, a bool, an i64, text, bytes or a list, not an index'),
     (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  at = 3\n}\n', '8:8', 'expected an index, not a number'),
     (RECORD + 'state xs: list of T\n' + ON_K + '  xs = 1\n}\n', '7:3', 'a list changes by append, insert, remove'),
     (RECORD + 'record U {\n  a = 0\n}\nstate xs: list of T\n' + ON_K + '  xs.append(U { a: 1 })\n}\n', '10:13',
@@ -284,7 +284,7 @@ DIAGNOSTICS = [
     (LIST + 'view t = each x in xs {\n  a = 1\n  a = 2\n}\n', '8:3', "duplicate column 'a'"),
     (LIST + 'view t = each x in xs {\n  a = x.a\n}\nview v = x.a\n', '9:10', "unknown state 'x'"),
     (LIST + 'view t = each at in xs {\n  a = 1\n}\n', '6:15', "'at' is already declared as a list index"),
-    (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number, a bool, an i64 or text, not an index'),
+    (LIST + 'view t = each x in xs {\n  c = x\n}\n', '7:7', 'a column is a number, a bool, an i64, text, bytes or a list, not an index'),
     ('view each = 1\n', '1:6', "'each' is reserved"),
     # fns
     ('fn f(x) = x\nview v = f(1, 2)\n', '2:10', 'f expects 1 argument'),
@@ -306,7 +306,7 @@ DIAGNOSTICS = [
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
     (LIST + 'view v = sum(x.a for x xs)\n', '6:24', "expected 'in' and a list, as in sum(x in tasks)"),
     (LIST + 'view w = each r in xs where r {\n  n = r.a\n}\n', '6:29', 'expected a bool, not an index'),
-    (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number, a bool, an i64 or text, not an index'),
+    (LIST + 'view v = first(x in xs)\n', '6:10', 'a view is a number, a bool, an i64, text, bytes or a list, not an index'),
     (LIST + 'view w = each r in xs where count(y in xs) > 0 {\n  n = r.a\n}\n', '6:29',
      "a table's where cannot hold a count, sum, max or min"),
     # Keyed lists: a key field of the record, placed by add, found by key, never changed.
@@ -535,6 +535,11 @@ on forever.down {
 '''
 
 ACCEPTED = [
+    # Views of any value (Pure 027's 4e): a list as it is, filtered, a map with a list and a bytes column, a list a body
+    # built, bytes.
+    'record Tag {\n  v: i64\n}\nrecord T {\n  s: text\n  b: bytes\n  tags: list of Tag\n}\nstate xs: list of T\n'
+    'view all = xs\nview some = each x in xs where x.s.chars > 1\nview map = each x in xs {\n  tags = x.tags\n  raw = x.b\n}\n'
+    'view made {\n  let ys: list of Tag\n  ys.append(Tag { v: i64(xs.count) })\n  return ys\n}\nview blob = bytes("zz")\n',
     # Fns that call themselves (Pure 027's 2c): a block, several values, records' values made, held, matched, given and
     # appended, an item and a field's record passed as values, a walk of a list a value holds, a text's characters.
     FUNCTIONS,
@@ -1693,6 +1698,20 @@ view tags {
   }
   return n
 }
+view board = columns
+view busy = each col in columns where col.name.chars > 1
+view names = each col in columns {
+  label = col.name
+  cards = col.cards
+  raw = bytes(col.name)
+}
+view titles {
+  let ts: list of text
+  for col in columns {
+    for c in col.cards { ts.append(c.title) }
+  }
+  return ts
+}
 """
 
 
@@ -1759,7 +1778,8 @@ def documents_model(aup, pure_run, work, seeds, steps=160):
 def stored_nested(aup, pure_run, work, seeds, steps=200):
     """Pure 027's stage 3: a stored list whose items hold lists whose items hold lists (columns of cards of tags), run
     on a store restarting at random points (some runs saving in bursts) and in memory, against a model: every step's
-    fault, states and a view reading the lists alike, a failed event leaving nothing."""
+    fault, states and a view reading the lists alike, a failed event leaving nothing. Its list views (027's 4e) too: the
+    list as it is, filtered, a map with a list and a bytes column, and a list a view's body builds."""
     import copy
     import shutil
     import struct
@@ -1830,7 +1850,12 @@ def stored_nested(aup, pure_run, work, seeds, steps=200):
                 assert snapshot['fault'] == fault, (where, snapshot['fault'])
                 states = snapshot['states']
                 assert strict(states['columns'], want) and states['cards'] == count, (where, states['columns'], want)
-                assert snapshot['views']['tags'] == sum(len(c['tags']) for col in want for c in col['cards']), where
+                views = snapshot['views']
+                assert views['tags'] == sum(len(c['tags']) for col in want for c in col['cards']), where
+                assert strict(views['board'], want) and strict(views['busy'], [col for col in want if len(col['name']) > 1]), where
+                assert strict(views['names'], [{'label': col['name'], 'cards': col['cards'], 'raw': col['name'].encode().hex()}
+                                               for col in want]), (where, views['names'])
+                assert views['titles'] == [{'value': c['title']} for col in want for c in col['cards']], (where, views['titles'])
                 assert all(states[name] == [] for name in states if name not in ('columns', 'cards')), where
                 compared += 1
     return compared, restarts
