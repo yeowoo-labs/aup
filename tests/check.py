@@ -125,7 +125,8 @@ DIAGNOSTICS = [
      '    }\n  }\n}\n', '16:7', 'an arm after _ is never taken'),
     (JSON_M + 'state n = 0\non frame {\n  let xs: list of Json\n  let ms: list of M\n  xs.append(Json.arr(ms))\n}\n', '14:22',
      "'arr' holds a list of Json, not of M"),
-    (JSON_M + 'state xs: list of Json\n', '10:7', "'xs' holds lists in its items: a let's list may, for now"),
+    (JSON_M + 'input m = message {\n  docs: list of Json\n}\non m {\n  require m.docs.count > 0\n}\n', '11:17',
+     "holds lists in its items: a message's rows do not, for now"),
     (JSON_M + 'state n = 0\non frame {\n  let ms: list of M\n  for m in ms {\n    n = m.value\n  }\n}\n', '14:9',
      "'value' holds a variant: match it"),
     ('record P {\n  x = 0\n}\nstate n = 0\non frame {\n  let ps: list of P\n  match ps.first {\n    _ => n = 1\n  }\n}\n', '7:9',
@@ -1717,6 +1718,139 @@ def stored_runs(aup, pure_run, work, seeds, steps=240):
     return compared, restarts
 
 
+BOARD_SOURCE = """record Card {
+  title: text
+  tags: list of text
+}
+record Column {
+  name: text
+  cards: list of Card
+}
+state columns: list of Column
+state cards = 0
+input add_column = message { name: text }
+input add_card = message { column: number, title: text }
+input tag = message { column: number, card: number, tag: text }
+input move = message { column: number, card: number, to: number }
+input drop = message { column: number }
+on add_column { columns.append(Column { name: add_column.name, cards: [] }) }
+on add_card {
+  columns[add_card.column].cards.append(Card { title: add_card.title, tags: [] })
+  cards = cards + 1
+}
+on tag {
+  let kept: list of Card
+  let col = columns[tag.column]
+  for c in col.cards { kept.append(c) }
+  kept[tag.card].tags.append(tag.tag)
+  columns[tag.column].cards = kept
+}
+on move {
+  let rest: list of Card
+  let col = columns[move.column]
+  let k = 0
+  let found = false
+  for c in col.cards {
+    if k == move.card {
+      columns[move.to].cards.append(c)
+      found = true
+    } else { rest.append(c) }
+    k = k + 1
+  }
+  require found
+  columns[move.column].cards = rest
+}
+on drop { columns.remove(columns[drop.column]) }
+view tags {
+  let n = 0
+  for col in columns {
+    for c in col.cards { n = n + c.tags.count }
+  }
+  return n
+}
+"""
+
+
+def stored_nested(aup, pure_run, work, seeds, steps=200):
+    """Pure 027's stage 3: a stored list whose items hold lists whose items hold lists (columns of cards of tags), run
+    on a store restarting at random points (some runs saving in bursts) and in memory, against a model: every step's
+    fault, states and a view reading the lists alike, a failed event leaving nothing."""
+    import copy
+    import shutil
+    import struct
+    module = work / 'board.pmod'
+    (work / 'board.aup').write_text(BOARD_SOURCE)
+    compile_module(aup, work / 'board.aup', module)
+    words = ['a', 'todo', '할 일', 'q"x', '😀', '']
+    compared = restarts = 0
+    for seed in seeds:
+        rng = random.Random(seed + 27000)
+        columns, cards = [], 0
+        commands, expected = [], []
+
+        def number(x):
+            return struct.pack('<d', x)
+        for _ in range(steps):
+            op = rng.choice(['add_column', 'add_card', 'add_card', 'tag', 'tag', 'move', 'drop'] if columns else ['add_column'])
+            c = rng.randrange(len(columns) + 1)
+            fault = 'none'
+            if op == 'add_column':
+                name = rng.choice(words)
+                commands.append(f"message add_column {name.encode().hex() or '-'}")
+                columns.append({'name': name, 'cards': []})
+            elif op == 'add_card':
+                title = rng.choice(words)
+                commands.append(f"message add_card {(number(c) + title.encode()).hex()}")
+                if c >= len(columns): fault = 'not_found'
+                else:
+                    columns[c]['cards'].append({'title': title, 'tags': []})
+                    cards += 1
+            elif op == 'tag':
+                k, t = rng.randrange(4), rng.choice(words)
+                commands.append(f"message tag {(number(c) + number(k) + t.encode()).hex()}")
+                if c >= len(columns) or k >= len(columns[c]['cards']): fault = 'not_found'
+                else: columns[c]['cards'][k]['tags'].append({'value': t})
+            elif op == 'move':
+                k, to = rng.randrange(4), rng.randrange(len(columns) + 1)
+                commands.append(f"message move {(number(c) + number(k) + number(to)).hex()}")
+                if c >= len(columns): fault = 'not_found'
+                elif k >= len(columns[c]['cards']): fault = 'limit'
+                elif to >= len(columns): fault = 'not_found'
+                else:
+                    held = columns[c]['cards']
+                    rest = held[:k] + held[k + 1:]
+                    columns[to]['cards'].append(copy.deepcopy(held[k]))
+                    columns[c]['cards'] = rest
+            else:
+                commands.append(f"message drop {number(c).hex()}")
+                if c >= len(columns): fault = 'not_found'
+                else: del columns[c]
+            expected.append((fault, copy.deepcopy(columns), cards))
+        runs = {'memory': run(pure_run, module, stdin='\n'.join(commands) + '\n', check=False).stdout.splitlines()}
+        store = work / f'store-board-{seed}'
+        if store.exists():
+            shutil.rmtree(store)
+        cuts, lines = sorted(rng.sample(range(1, steps), 8)), []
+        for number_, (start, end) in enumerate(zip([0] + cuts, cuts + [steps])):
+            batch = ['--batch', str(rng.randint(2, 9))] if number_ % 2 else []
+            lines += run(pure_run, module, '--store', store, *batch, stdin='\n'.join(commands[start:end]) + '\n',
+                         check=False).stdout.splitlines()
+            restarts += 1
+        runs['stored'] = lines
+        for way, outputs in runs.items():
+            assert len(outputs) == steps, (way, seed, len(outputs))
+            for line, command, (fault, want, count) in zip(outputs, commands, expected):
+                snapshot = json.loads(line)
+                where = (way, seed, command)
+                assert snapshot['fault'] == fault, (where, snapshot['fault'])
+                states = snapshot['states']
+                assert strict(states['columns'], want) and states['cards'] == count, (where, states['columns'], want)
+                assert snapshot['views']['tags'] == sum(len(c['tags']) for col in want for c in col['cards']), where
+                assert all(states[name] == [] for name in states if name not in ('columns', 'cards')), where
+                compared += 1
+    return compared, restarts
+
+
 FOLDS_SOURCE = """record Task {
   title: text
   done = false
@@ -2364,6 +2498,7 @@ def main():
         report['formats_and_texts'] = formats_and_texts(aup, pure_run, work)
         report['nested_values'] = nested_values(aup, pure_run, work)
         report['functions'] = functions(aup, pure_run, work)
+        report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
         report['editor_parity_operations'], report['editor_parity_outcomes'] = \
             editor_parity(aup, args.pure.resolve(), work, range(args.editor_seeds))
     print(json.dumps(report))

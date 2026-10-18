@@ -4206,6 +4206,15 @@ static void record_values_of(Compiler *c, const Expr *e, const Record *r, const 
     snprintf(shown, sizeof(shown), "%s", record_shown(c, c->module, r));
     char path[2 * NAME + 2];
     int binding = e->kind != E_RECORD ? binding_path(c, e, path) : -1;
+    if (e->kind == E_NAME && binding < 0 && !c->scope) { /* an item of the same record (a walk's, an index let's): its fields */
+        int loop = loop_named(c, e->name), local = local_named(c, e->name), list = -1;
+        if (loop >= 0 && c->loops[loop].list >= 0) list = c->loops[loop].list;
+        else if (local >= 0 && c->locals[local].kind.type == INDEX) list = c->locals[local].kind.owner;
+        if (list >= 0 && record_of(c, list) == r) {
+            for (unsigned k = 0; k < r->fields; ++k) values[k] = member_of(c, e, r->field_names[k]);
+            return;
+        }
+    }
     if (binding >= 0) { /* a record's value held by name, or one under it (027's 2c): of r alone */
         bool root = !strcmp(path, c->locals[binding].name);
         int held = root ? c->locals[binding].kind.owner : sub_record(c, c->locals[binding].kind.owner, path + strlen(c->locals[binding].name) + 1);
@@ -4716,9 +4725,9 @@ static void statements(Compiler *c, const Stmt *s) {
                 int field = field_named(r, path);
                 if (field < 0 || r->field_kinds[field] != LIST)
                     fail_at(c, s->first->line, s->first->column, "'%s' is not a list in a field", path);
-                if (!c->state_event[list] || c->state_bound[list])
-                    fail_at(c, s->first->line, s->first->column, "a list in a field changes in an item of a let's list (a stored one's "
-                            "comes with stored lists in records)");
+                if (c->state_bound[list] || c->state_rows[list])
+                    fail_at(c, s->first->line, s->first->column, "a list in a field changes in an item of a let's, a stored or a "
+                            "transient list, not of one read from a record");
                 view_changes(c, s, list, c->state_names[list]);
                 const Record *inner = &c->records[r->field_record[field]];
                 const Expr *values[FIELDS_PER_RECORD];
@@ -4786,7 +4795,8 @@ static void statements(Compiler *c, const Stmt *s) {
             if (c->list_key[list] == (int)field + 1)
                 fail_at(c, s->line, s->column, "the key of '%s' does not change; remove the item and add it again", c->state_names[list]);
             if (*s->name) item_of(c, s->first, c->handling, 0, list);
-            expect_kind(c, s->value, wanted(c, s->value, c->handling, 1, field_kind(r, field)), field_kind(r, field));
+            if (r->field_kinds[field] == LIST) list_field(c, r, field, s->value, 1); /* a let's list, [], or a list value */
+            else expect_kind(c, s->value, wanted(c, s->value, c->handling, 1, field_kind(r, field)), field_kind(r, field));
             emit(c, s->line, s->column, ITEM_SET, (uint32_t)list | field << 16, 0);
             break;
         }
@@ -5361,10 +5371,10 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
             if (record < 0)
                 fail_at(c, c->state_line[i], c->state_column[i], "a list holds a record; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)record;
-            for (unsigned k = 0; k < c->records[record].fields && (!c->state_event[i] || c->state_rows[i]); ++k)
-                if (c->records[record].field_kinds[k] == LIST) /* (027's 2b) */
-                    fail_at(c, c->state_line[i], c->state_column[i], "'%s' holds lists in its items: a let's list may, for now "
-                            "(stored and message lists of lists come with stored lists in records)", c->state_names[i]);
+            for (unsigned k = 0; k < c->records[record].fields && c->state_rows[i]; ++k)
+                if (c->records[record].field_kinds[k] == LIST) /* (027's 2b and 3) */
+                    fail_at(c, c->state_line[i], c->state_column[i], "'%s' holds lists in its items: a message's rows do not, "
+                            "for now (lets', stored and transient lists do)", c->state_names[i]);
             if (*c->state_key[i]) {
                 const Record *r = &c->records[record];
                 c->list_key[i] = 1 + (int)record_field(c, r, c->state_key[i], c->state_key_line[i], c->state_key_column[i]);

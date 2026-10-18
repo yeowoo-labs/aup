@@ -814,3 +814,36 @@ on check {
 - 모듈은 2b의 컴파일러와 바이트까지 같다(aup와 Pure의 aup 소스 49개). 다른 것은 `match`를 쓴 `json_tree.aup`뿐이다.
 - 바뀐 진단 문구 셋: 레코드가 이제 값이라 `n.insert(at, T { … })`는 "expected text, not a record"다. let의 타입 목록에 리스트와
   레코드가 들었다. 자신을 부르는 식 fn은 이제 보기에서만 거절된다.
+
+### 저장되는 중첩 (Pure 027의 3단계)
+
+저장 상태와 transient 리스트의 레코드도 리스트를 담는다. 메시지의 행은 아직이다.
+
+```text
+record Card {
+  title: text
+  tags: list of text
+}
+record Column {
+  name: text
+  cards: list of Card
+}
+state columns: list of Column          # 저장된다: 열, 그 카드, 그 태그
+on add_card { columns[add_card.column].cards.append(Card { title: add_card.title, tags: [] }) }
+on tag {
+  let kept: list of Card
+  let col = columns[tag.column]
+  for c in col.cards { kept.append(c) }     # 같은 레코드의 항목은 그대로 덧붙는다
+  kept[tag.card].tags.append(tag.tag)
+  columns[tag.column].cards = kept          # 항목의 리스트 필드에 let의 리스트(값)
+}
+```
+
+- **뜻은 2b와 같다.** 리스트는 값이다. 저장된 항목의 리스트 필드를 읽으면 이벤트의 리스트 값이 되고, 쓰면 그 값이 저장된다.
+  `xs[i].items.append(…)`가 저장된 리스트의 항목에서도 된다.
+- **새로 받는 꼴.** `xs[i].field = 리스트`(let의 리스트, `[]`, 리스트 값), 같은 레코드의 항목을 그대로 덧붙이기(`ys.append(y)`).
+- **아직 안 되는 것.** `for c in xs[i].cards`(`let col = xs[i]`를 먼저), 접기 안에서 리스트 필드의 `.count`(레지스터를 묶어야 한다).
+
+검증:
+- 열과 카드와 태그의 앱(`BOARD_SOURCE`)을 무작위 조작 200걸음으로 모델과 대조한다. 메모리에서, 그리고 저장소에서 여덟 번 다시
+  시작하며(그중 반은 묶음 저장) 돈다. 씨앗 여섯 개에서 모든 걸음의 실패, 상태, 리스트를 읽는 보기가 모델과 같다.
