@@ -77,6 +77,9 @@ DIAGNOSTICS = [
     ('state y: i64\nview v = 0xffffffffffffffff + y\n', '2:10', "the number is past an i64's range"),
     ('state a = 0\nstate b = 0\non frame {\n  a, b = 1\n}\n', '4:3', '2 names take 2 values, not 1'),
     ('state a = 0\non frame {\n  a, a = 1, 2\n}\n', '3:6', "'a' is named twice"),
+    ('state a = 0\non frame {\n  let xs, ys: list of number = [1]\n}\n', '3:30',
+     'lists declared together begin empty: give each its elements apart'),
+    ('state a = 0\non frame {\n  let xs, xs: list of number\n}\n', '3:11', "'xs' is named twice"),
     ('state s: text\nstate a = 0\non frame {\n  s, a = "x", 1\n}\n', '4:3', "'s' takes its value apart"),
     ('state t: text\nstate c: cursor in t\non frame {\n  let a, b = 1, c\n}\n', '4:17',
      'a let holds a number, a bool, an i64, an index, bytes, text, a list or a record, not a cursor'),
@@ -642,6 +645,53 @@ on m {
   let d = m.rows[m.at]
   through = d.a + d.b
   picked = both(m.rows[m.at])
+}
+'''
+
+FRICTIONS = '''record P {
+  x = 0
+}
+record B {
+  x = 0
+  y = 0
+}
+state total = 0
+state n = 0
+state bs: list of B
+state a = 0
+state b = 0
+state i = 0
+input go = message { k: u32 }
+on go {
+  if bs.count == 0 { bs.append(B {}) }
+  bs.append(B {})
+  bs[0].x, bs[0].y = go.k, go.k * 2
+  a, bs[1].x = bs[0].y, a + 1
+  i, bs[i].y = 1, 7
+  a, b = b, a
+  let ns: list of number
+  ns.append(0)
+  ns.append(0)
+  ns[0], ns[1] = 3, go.k
+  b = b + ns[0] * 100 + ns[1]
+  let xs, ys: list of number
+  let ps, qs: list of P
+  for j in 0 .. go.k {
+    xs.append(j)
+    ys.append(j * 2)
+    ps.append(P { x: j })
+  }
+  if go.k > 1 {
+    let inner, outer: list of number
+    inner.append(go.k)
+    outer.append(1)
+    n = inner.count * 10 + outer.count + inner[0]
+  }
+  let t = 0
+  for v in xs { t = t + v }
+  for v in ys { t = t + v * 100 }
+  for p in ps { t = t + p.x * 10000 }
+  total = t + qs.count
 }
 '''
 
@@ -1729,6 +1779,38 @@ def rows_at(aup, pure_run, work, events=200):
                 'through': a + b, 'picked': a * 1000 + b}
         assert state['fault'] == 'none' and state['states'] == kept, (at, rows, state)
     assert failed > 0
+    return events
+
+
+def frictions(aup, pure_run, work, events=100):
+    """140's frictions written away in aup alone, no core change: lets' lists declared together (let a, b: list of R),
+    each its own and empty as it begins, in inner blocks too; targets together with fields and items among them
+    (xs[i].x, xs[i].y = a, b; a, xs[i] = ...), the values first, then each target left to right as Python's. Each event
+    against Python's."""
+    import random
+    import struct
+    path = work / 'frictions.pmod'
+    (work / 'frictions.aup').write_text(FRICTIONS)
+    compile_module(aup, work / 'frictions.aup', path)
+    rng = random.Random(140)
+    asked = [rng.randrange(0, 9) for _ in range(events)]
+    lines = run(pure_run, path, stdin=''.join(f"message go {struct.pack('<I', k).hex()}\n" for k in asked)).stdout.splitlines()
+    assert len(lines) == events
+    n, bs, a, b, i = 0, [], 0, 0, 0
+    for k, line in zip(asked, lines):
+        state = json.loads(line)
+        if k > 1: n = 10 + 1 + k
+        bs += [{'x': 0, 'y': 0}] * (2 if not bs else 1)
+        bs = [dict(x) for x in bs]
+        bs[0]['x'], bs[0]['y'] = k, k * 2
+        a, bs[1]['x'] = bs[0]['y'], a + 1
+        i, bs[i]['y'] = 1, 7
+        a, b = b, a
+        ns = [0, 0]
+        ns[0], ns[1] = 3, k
+        b = b + ns[0] * 100 + ns[1]
+        want = {'total': sum(range(k)) * (1 + 200 + 10000), 'n': n, 'bs': bs, 'a': a, 'b': b, 'i': i}
+        assert state['fault'] == 'none' and {key: state['states'][key] for key in want} == want, (k, state['states'])
     return events
 
 
@@ -2927,6 +3009,7 @@ def main():
         report['bytes_compared'] = bytes_compared(aup, pure_run, work)
         report['inner_lists'] = inner_lists(aup, pure_run, work)
         report['rows_at'] = rows_at(aup, pure_run, work)
+        report['frictions'] = frictions(aup, pure_run, work)
         report['bytes_state'] = bytes_state(aup, pure_run, work)
         report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
         report['documents'] = documents_model(aup, pure_run, work, range(4))

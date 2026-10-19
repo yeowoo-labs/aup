@@ -1162,7 +1162,7 @@ static bool path_append(Compiler *c, Stmt *s, const Token *name) {
 }
 
 /* , b, c = x, y, z after the first name: every name, then as many values on the line. */
-static void several(Compiler *c, Stmt *s, const char *first) {
+static void several_names(Compiler *c, Stmt *s, const char *first) {
     s->names = allocate(c, STACK * sizeof(*s->names));
     memcpy(s->names[s->name_count++], first, NAME);
     while (is(c, ",")) {
@@ -1174,6 +1174,10 @@ static void several(Compiler *c, Stmt *s, const char *first) {
             if (!strcmp(s->names[i], name.text)) fail_at(c, name.line, name.column, "'%s' is named twice", name.text);
         memcpy(s->names[s->name_count++], name.text, NAME);
     }
+}
+
+/* = x, y (after the names): every name's value, or one call that gives them all. */
+static void several_values(Compiler *c, Stmt *s) {
     expect(c, "=", "'='");
     Expr **tail = &s->value;
     unsigned values = 0;
@@ -1187,6 +1191,99 @@ static void several(Compiler *c, Stmt *s, const char *first) {
     }
     if (values != s->name_count && values != 1) /* one: a fn's call that gives them (027's 2c) */
         fail_at(c, s->line, s->column, "%u names take %u values, not %u", s->name_count, s->name_count, values);
+}
+
+/* A target of a, xs[i].x = ...: a name (S_ASSIGN), a list's item's field or its item at a position (S_SET), or an
+ * index's field (at.x, S_SET); its value comes later. */
+static Stmt *target(Compiler *c, Token name) {
+    Stmt *t = allocate(c, sizeof(*t));
+    t->line = name.line, t->column = name.column;
+    memcpy(t->name, name.text, NAME);
+    if (is(c, "[")) {
+        take(c);
+        t->kind = S_SET;
+        t->first = expression(c, 0, true);
+        newlines(c);
+        expect(c, "]", "']'");
+        if (is(c, ".")) {
+            take(c);
+            Token field = expect_name(c, "a field");
+            memcpy(t->member, field.text, NAME);
+        }
+        return t;
+    }
+    if (is(c, ".")) {
+        take(c);
+        Token field = expect_name(c, "a field");
+        t->kind = S_SET;
+        t->first = node(c, E_NAME, name.line, name.column);
+        memcpy(t->first->name, name.text, NAME);
+        t->name[0] = 0;
+        memcpy(t->member, field.text, NAME);
+        return t;
+    }
+    if (reserved_name(name.text)) fail_at(c, name.line, name.column, "'%s' is reserved", name.text);
+    t->kind = S_ASSIGN;
+    return t;
+}
+
+/* a, xs[i].x = x, y after its first target: every target its value at once, the values first, in order. Names alone
+ * are S_ASSIGNS; with a field or an item among them, the values go to lets of their own first (a literal, which
+ * reads nothing, goes straight), then each target takes its own: a let each and a statement each, linked. */
+static Stmt *together(Compiler *c, Stmt *first) {
+    Stmt *targets[STACK];
+    unsigned n = 0;
+    bool names = first->kind == S_ASSIGN;
+    targets[n++] = first;
+    while (is(c, ",")) {
+        take(c);
+        Token name = expect_name(c, "a name");
+        if (n == STACK) fail_at(c, name.line, name.column, "at most %d names take values at once", STACK);
+        Stmt *t = target(c, name);
+        for (unsigned i = 0; t->kind == S_ASSIGN && i < n; ++i)
+            if (targets[i]->kind == S_ASSIGN && !strcmp(targets[i]->name, t->name))
+                fail_at(c, name.line, name.column, "'%s' is named twice", name.text);
+        names = names && t->kind == S_ASSIGN;
+        targets[n++] = t;
+    }
+    Stmt *s = allocate(c, sizeof(*s));
+    s->line = first->line, s->column = first->column;
+    s->names = allocate(c, STACK * sizeof(*s->names));
+    s->name_count = n;
+    for (unsigned i = 0; i < n; ++i)
+        if (names) memcpy(s->names[i], targets[i]->name, NAME);
+        else snprintf(s->names[i], NAME, ".%d.%d.%u", s->line, s->column, i); /* no name of the source's */
+    s->kind = names ? S_ASSIGNS : S_LETS;
+    several_values(c, s);
+    if (names) return s;
+    Expr *values[STACK];
+    unsigned count = 0;
+    for (Expr *v = s->value; v; v = v->next) values[count++] = v;
+    Stmt *last = s;
+    Expr **link = &s->value;
+    unsigned kept = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        Expr *v = count == n ? values[i] : NULL; /* NULL: one call gives them all */
+        if (v && (v->kind == E_NUMBER || v->kind == E_BOOL || v->kind == E_TEXT)) {
+            v->next = NULL;      /* a literal reads nothing: straight to its target */
+            targets[i]->value = v;
+        } else {
+            memcpy(s->names[kept++], s->names[i], NAME);
+            Expr *given = node(c, E_NAME, s->line, s->column);
+            memcpy(given->name, s->names[i], NAME);
+            targets[i]->value = given;
+            if (v) *link = v, link = &v->next;
+        }
+        last = last->next = targets[i];
+    }
+    if (count == n) *link = NULL;
+    s->name_count = kept;
+    if (kept == 1) { /* one let: as let x = value */
+        s->kind = S_LET;
+        memcpy(s->name, s->names[0], NAME);
+        s->names = NULL, s->name_count = 0;
+    }
+    return kept ? s : s->next; /* every value a literal: no lets */
 }
 
 static Stmt *statement(Compiler *c, unsigned depth) {
@@ -1219,10 +1316,13 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         memcpy(s->name, name.text, NAME);
         s->line = name.line;
         s->column = name.column;
-        if (is(c, ",")) { /* let a, b = x, y */
-            s->kind = S_LETS;
-            several(c, s, name.text);
-            return s;
+        if (is(c, ",")) { /* let a, b = x, y, or let a, b: list of R (a list each, empty as it begins) */
+            several_names(c, s, name.text);
+            if (!is(c, ":")) {
+                s->kind = S_LETS;
+                several_values(c, s);
+                return s;
+            }
         }
         if (is(c, ":")) { /* let name: list of R [by field]: the event's list, empty as it begins */
             take(c);
@@ -1239,6 +1339,20 @@ static Stmt *statement(Compiler *c, unsigned depth) {
                 s->key_column = key.column;
             }
             s->listed = true;
+            if (s->name_count > 1) { /* the names after the first: lets of their own, of the same list, after it */
+                Stmt *last = s;
+                for (unsigned i = 1; i < s->name_count; ++i) {
+                    Stmt *other = allocate(c, sizeof(*other));
+                    *other = *s;
+                    other->names = NULL, other->name_count = 0;
+                    memcpy(other->name, s->names[i], NAME);
+                    last = last->next = other;
+                }
+                s->names = NULL, s->name_count = 0;
+                if (is(c, "="))
+                    fail_at(c, c->token.line, c->token.column, "lists declared together begin empty: give each its elements apart");
+                return s;
+            }
             if (is(c, "=")) { /* = [a, b, ...]: what it holds as it begins, appended in order */
                 take(c);
                 Token open = expect(c, "[", "'[' and the list's elements");
@@ -1435,6 +1549,9 @@ static Stmt *statement(Compiler *c, unsigned depth) {
             }
             if (is(c, "(")) fail_at(c, field.line, field.column, "a field changes by '=', as in %s[at].%s = value", s->name, field.text);
             memcpy(s->member, field.text, NAME);
+            if (is(c, ",")) return together(c, s); /* xs[i].x, xs[i].y = a, b */
+        } else if (is(c, ",")) {
+            return together(c, s); /* xs[i], ys[j] = a, b */
         } else if (is(c, "=")) { /* tasks[at] = Task { ... }: every field of the item (no member); xs[i] = 5 */
             take(c);
             s->value = inserted_value(c, false);
@@ -1450,6 +1567,14 @@ static Stmt *statement(Compiler *c, unsigned depth) {
     if (is(c, ".")) {
         take(c);
         Token method = expect_name(c, "insert, remove, append or a field");
+        if (is(c, ",")) { /* at.x, at.y = a, b */
+            s->kind = S_SET;
+            s->first = node(c, E_NAME, token.line, token.column);
+            memcpy(s->first->name, s->name, NAME);
+            s->name[0] = 0;
+            memcpy(s->member, method.text, NAME);
+            return together(c, s);
+        }
         if (is(c, "=")) {
             /* at.field = value: a field of the item an index names. */
             take(c);
@@ -1488,10 +1613,9 @@ static Stmt *statement(Compiler *c, unsigned depth) {
         expect(c, ")", "')'");
         return s;
     }
-    if (is(c, ",")) { /* a, b = b, a */
-        s->kind = S_ASSIGNS;
-        several(c, s, token.text);
-        return s;
+    if (is(c, ",")) { /* a, b = b, a; a, xs[i].x = 1, 2 */
+        s->kind = S_ASSIGN;
+        return together(c, s);
     }
     s->kind = S_ASSIGN;
     expect(c, "=", "'='");
@@ -1508,7 +1632,7 @@ static Stmt *block(Compiler *c, unsigned depth) {
     while (!is(c, "}")) {
         if (c->token.kind == T_EOF) fail_at(c, c->token.line, c->token.column, "expected '}'");
         *tail = statement(c, depth);
-        tail = &(*tail)->next;
+        while (*tail) tail = &(*tail)->next; /* let a, b: list of R is a let each */
         end(c);
     }
     take(c);
