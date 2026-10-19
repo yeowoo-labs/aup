@@ -1,0 +1,173 @@
+# HTTP/1.1 requests (RFC 9112) read a packet at a time: each packet's bytes added to what the last ones left, and every
+# request they complete read: its line, its fields (names lowercased), its body by Content-Length or chunked, a chunked
+# one's trailers. The grammar is h11's. A stream that is no HTTP fails its event.
+record Field {
+  name: bytes
+  value: bytes
+}
+record Fields {
+  of: list of Field
+}
+record Request {
+  method: bytes
+  target: bytes
+  minor = 1                                      # HTTP/1.minor
+  fields: list of Field
+  body: bytes
+  trailers: list of Field
+}
+record Left {
+  data: bytes
+}
+state requests: list of Request
+state pending: list of Left                      # the bytes no request has completed (a list of one: bytes are no state)
+input packet = message { data: bytes }
+
+fn letter(b) = b >= 0x61 && b <= 0x7a || b >= 0x41 && b <= 0x5a
+fn digit(b) = b >= 0x30 && b <= 0x39
+fn mark(b) = b == 0x21 || b >= 0x23 && b <= 0x27 || b == 0x2a || b == 0x2b || b == 0x2d || b == 0x2e  # ! # $ % & ' * + - .
+fn token(b) = letter(b) || digit(b) || mark(b) || b >= 0x5e && b <= 0x60 || b == 0x7c || b == 0x7e  # and ^ _ ` | ~
+fn hex(b) = digit(b) || b >= 0x61 && b <= 0x66 || b >= 0x41 && b <= 0x46
+fn space(b) = b == 0 || b >= 9 && b <= 13 || b == 0x20  # never in a field value's words
+fn blank(b) = b == 0x20 || b == 9
+
+# Where the CRLF at or after i is, or -1 if it has not come yet.
+fn crlf(d, i) {
+  let j = i
+  while j + 1 < d.bytes {
+    if d[j] == 13 && d[j + 1] == 10 { return j }
+    j = j + 1
+  }
+  return -1
+}
+
+fn lower(s) {
+  let out = s[0 .. 0]
+  for k in 0 .. s.bytes { out = out + byte(if s[k] >= 0x41 && s[k] <= 0x5a { s[k] + 32 } else { s[k] }) }
+  return out
+}
+
+# The field line d[i .. e]: its name lowercased, its value without the spaces around it.
+fn field(d, i, e) -> Field {
+  let c = i
+  while c < e && d[c] != 0x3a { c = c + 1 }
+  require c > i && c < e
+  for k in i .. c { require token(d[k]) }
+  let a = c + 1
+  let b = e
+  while a < b && blank(d[a]) { a = a + 1 }
+  while b > a && blank(d[b - 1]) { b = b - 1 }
+  for k in a .. b { require !space(d[k]) || blank(d[k]) }
+  return Field { name: lower(d[i .. c]), value: d[a .. b] }
+}
+
+# The field lines from i to an empty line, and where it ends; -1 if they have not all come.
+fn fields(d, i) -> Fields, number {
+  let out: list of Field
+  let j = i
+  let e = crlf(d, j)
+  while e > j {
+    out.append(field(d, j, e))
+    j = e + 2
+    e = crlf(d, j)
+  }
+  return Fields { of: out }, if e < 0 { -1 } else { e + 2 }
+}
+
+# The request at the start of d, and its length; -1 if d holds only part of one.
+fn request(d) -> Request, number {
+  let e = crlf(d, 0)
+  if e < 0 { return Request {}, -1 }
+  let s1 = 0
+  while s1 < e && d[s1] != 0x20 { s1 = s1 + 1 }
+  let s2 = s1 + 1
+  while s2 < e && d[s2] != 0x20 { s2 = s2 + 1 }
+  require s1 > 0 && s2 > s1 + 1 && s2 + 9 == e
+  for k in 0 .. s1 { require token(d[k]) }
+  for k in s1 + 1 .. s2 { require d[k] >= 0x21 && d[k] <= 0x7e }
+  require text(d[s2 + 1 .. e - 1]) == "HTTP/1." && (d[e - 1] == 0x30 || d[e - 1] == 0x31)
+  let found, i = fields(d, e + 2)
+  if i < 0 { return Request {}, -1 }
+  let hosts, coded, lengths, length = 0, 0, 0, 0
+  let chunked = false
+  for f in found.of {
+    let n = text(f.name)                         # a token: its bytes are text
+    if n == "host" { hosts = hosts + 1 }
+    if n == "transfer-encoding" {
+      coded = coded + 1
+      chunked = text(lower(f.value)) == "chunked"
+    }
+    if n == "content-length" {
+      lengths = lengths + 1
+      require f.value.bytes > 0
+      for k in 0 .. f.value.bytes {
+        require digit(f.value[k])
+        length = length * 10 + number(f.value[k] - 0x30)
+      }
+    }
+  }
+  require hosts <= 1 && (hosts == 1 || d[e - 1] == 0x30)  # HTTP/1.1 names its host
+  let body = d[0 .. 0]
+  let trailers = Fields { of: [] }
+  let j = i
+  if coded > 0 {
+    require lengths == 0 && coded == 1 && chunked
+    let more = true
+    while more {
+      let c = crlf(d, j)
+      if c < 0 { return Request {}, -1 }
+      let semi = j
+      while semi < c && d[semi] != 0x3b { semi = semi + 1 }
+      let z = semi
+      if semi == c {
+        while z > j && blank(d[z - 1]) { z = z - 1 }
+      }
+      require z > j && z - j <= 20
+      let n = 0
+      for k in j .. z {
+        require hex(d[k])
+        n = n * 16 + number(if d[k] <= 0x39 { d[k] - 0x30 } else if d[k] >= 0x61 { d[k] - 0x57 } else { d[k] - 0x37 })
+      }
+      for k in semi .. c { require d[k] != 10 }
+      require n <= 2147483648                    # 2^31 at most: ours, not h11's
+      if n == 0 {
+        let t, after = fields(d, c + 2)
+        if after < 0 { return Request {}, -1 }
+        trailers = t
+        j = after
+        more = false
+      } else {
+        if d.bytes < c + 4 + n { return Request {}, -1 }
+        require d[c + 2 + n] == 13 && d[c + 3 + n] == 10
+        body = body + d[c + 2 .. c + 2 + n]
+        j = c + 4 + n
+      }
+    }
+  } else if lengths > 0 {
+    require lengths == 1 && length <= 2147483648
+    if d.bytes < i + length { return Request {}, -1 }
+    body = d[i .. i + length]
+    j = i + length
+  }
+  return Request { method: d[0 .. s1], target: d[s1 + 1 .. s2], minor: number(d[e - 1] - 0x30), fields: found.of, body: body,
+                   trailers: trailers.of }, j
+}
+
+on packet {
+  let d = packet.data
+  if pending.count > 0 {
+    d = pending[0].data + d
+    pending.remove(pending.first)
+  }
+  let going = true
+  while going && d.bytes > 0 {
+    let r, n = request(d)
+    if n < 0 {
+      going = false
+    } else {
+      requests.append(r)
+      d = d[n .. d.bytes]
+    }
+  }
+  if d.bytes > 0 { pending.append(Left { data: d }) }
+}
