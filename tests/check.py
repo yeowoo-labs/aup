@@ -714,8 +714,10 @@ on go {
   ns.append(0)
   ns[0], ns[1] = 3, go.k
   b = b + ns[0] * 100 + ns[1]
-  let xs, ys: list of number
+  let xs, ys, zs, us: list of number
   let ps, qs: list of P
+  zs.append(1)
+  us.append(2)
   for w in 0 .. go.k {
     xs.append(w)
     ys.append(w * 2)
@@ -731,7 +733,7 @@ on go {
   for v in xs { t = t + v }
   for v in ys { t = t + v * 100 }
   for p in ps { t = t + p.x * 10000 }
-  total = t + qs.count
+  total = t + qs.count + (zs.count + us.count - 2) * 1000000
 }
 '''
 

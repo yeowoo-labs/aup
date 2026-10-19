@@ -1354,7 +1354,7 @@ static Stmt *statement(Compiler *c, unsigned depth) {
                 for (unsigned i = 1; i < s->name_count; ++i) {
                     Stmt *other = allocate(c, sizeof(*other));
                     *other = *s;
-                    other->names = NULL, other->name_count = 0;
+                    other->names = NULL, other->name_count = 0, other->next = NULL; /* (s's next is the first other by now) */
                     memcpy(other->name, s->names[i], NAME);
                     last = last->next = other;
                 }
