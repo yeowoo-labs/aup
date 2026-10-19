@@ -1,0 +1,124 @@
+# Box layout, a subset of CSS Flexbox 1 (as Pure's research 140 states it): containers lay their items out in one line
+# (no wrap) along a row or a column, with padding, a gap between items, justify-content (start, end, center,
+# space-between, space-around, space-evenly) and align-items (start, end, center, stretch). An item's main size is its
+# flex basis grown or shrunk (9.7, its loop: an item frozen at its padding, its content box at zero), its cross size its
+# own or, auto, stretched to the line. Every size is known from above: nothing is sized by its content. A tree comes as
+# its nodes in preorder; each node's box is relative to its parent's.
+record Node {
+  parent = 0
+  column = false
+  w = 0                                          # -1: auto
+  h = 0
+  grow = 0
+  shrink = 0
+  basis = 0
+  left = 0
+  right = 0
+  top = 0
+  bottom = 0
+  gap = 0
+  justify = 0
+  align = 0
+}
+record Box {
+  x = 0
+  y = 0
+  w = 0
+  h = 0
+}
+state boxes: list of Box
+input tree = message { nodes: list of Node }
+
+fn START = 0; fn END = 1; fn CENTER = 2; fn BETWEEN = 3; fn AROUND = 4; fn EVENLY = 5; fn STRETCH = 3
+fn factor(e, growing, base, pad) = if growing { e.grow } else { (base - pad) * e.shrink }
+
+on tree {
+  while boxes.count > 0 { boxes.remove(boxes.last) }
+  for d in tree.nodes { boxes.append(Box {}) }
+  boxes[0].w = tree.nodes[0].w
+  boxes[0].h = tree.nodes[0].h
+  for i in 0 .. tree.nodes.count {
+    let d = tree.nodes[i]
+    let kids: list of number
+    for j in i + 1 .. tree.nodes.count {
+      if tree.nodes[j].parent == i { kids.append(j) }
+    }
+    let n = kids.count
+    if n > 0 {
+      let inner = (if d.column { boxes[i].h } else { boxes[i].w }) - (if d.column { d.top + d.bottom } else { d.left + d.right })
+      let line = max((if d.column { boxes[i].w } else { boxes[i].h }) - (if d.column { d.left + d.right } else { d.top + d.bottom }), 0)
+      let pads: list of number                   # each item's padding on the main axis, and on the cross
+      let crosses: list of number
+      let bases: list of number
+      let sizes: list of number
+      let frozen: list of bool
+      let total = 0
+      for k in kids {
+        let e = tree.nodes[k]
+        let p = if d.column { e.top + e.bottom } else { e.left + e.right }
+        pads.append(p)
+        crosses.append(if d.column { e.left + e.right } else { e.top + e.bottom })
+        bases.append(max(e.basis, p))
+        sizes.append(max(e.basis, p))
+        frozen.append(e.grow == 0 && e.shrink == 0)
+        total = total + max(e.basis, p)
+      }
+      let gaps = d.gap * (n - 1)
+      let free = inner - (total + gaps)
+      let growing = free > 0
+      let open = 0
+      for x in 0 .. n {
+        if free == 0 { frozen[x] = true }
+        if !frozen[x] { open = open + 1 }
+      }
+      while open > 0 {                           # 9.7: each pass freezes one item at least
+        let used, factors, violation = 0, 0, 0
+        for x in 0 .. n {
+          used = used + (if frozen[x] { sizes[x] } else { bases[x] })
+          if !frozen[x] { factors = factors + factor(tree.nodes[kids[x]], growing, bases[x], pads[x]) }
+        }
+        free = inner - (used + gaps)
+        for x in 0 .. n {                        # grown by the grow factors, or shrunk by the shrink factors scaled
+          if !frozen[x] && free != 0 && factors > 0 {
+            sizes[x] = bases[x] + free * (factor(tree.nodes[kids[x]], growing, bases[x], pads[x]) / factors)
+          }
+          if !frozen[x] { violation = violation + (max(sizes[x], pads[x]) - sizes[x]) }  # min violations: below the padding
+        }
+        for x in 0 .. n {
+          if !frozen[x] {
+            let v = max(sizes[x], pads[x]) - sizes[x]
+            sizes[x] = max(sizes[x], pads[x])
+            if v > 0 || violation == 0 {
+              frozen[x] = true
+              open = open - 1
+            }
+          }
+        }
+      }
+      let used = 0
+      for s in sizes { used = used + s }
+      free = inner - (used + gaps)               # 9.5: what is left, by justify-content
+      let justify = d.justify
+      if (n == 1 || free <= 0) && justify >= BETWEEN {
+        justify = if free <= 0 || justify == BETWEEN { START } else { CENTER }
+      }
+      let first = if justify == END { free } else if justify == CENTER { free / 2 } else if justify == AROUND { free / n / 2 } else if justify == EVENLY { free / (n + 1) } else { 0 }
+      let between = (if justify == BETWEEN { free / max(n - 1, 1) } else if justify == AROUND { free / n } else if justify == EVENLY { free / (n + 1) } else { 0 }) + d.gap
+      let at = if d.column { d.top } else { d.left }
+      for x in 0 .. n {
+        let k = kids[x]
+        let e = tree.nodes[k]
+        at = at + (if x == 0 { first } else { between })
+        let own = if d.column { e.w } else { e.h }
+        require own >= 0 || d.align == STRETCH  # an auto cross size not stretched would be sized by its content
+        let across = max(if own < 0 { line } else { own }, crosses[x])
+        let offset = if d.align == END { line - across } else if d.align == CENTER { (line - across) / 2 } else { 0 }
+        boxes[k].x = if d.column { d.left + offset } else { at }
+        boxes[k].y = if d.column { at } else { d.top + offset }
+        boxes[k].w = if d.column { across } else { sizes[x] }
+        boxes[k].h = if d.column { sizes[x] } else { across }
+        at = at + sizes[x]
+      }
+    }
+  }
+}
