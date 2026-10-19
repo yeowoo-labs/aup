@@ -1,0 +1,128 @@
+# DNS messages (RFC 1035): a message's bytes read into its header and records, and the message written back from them.
+# Names are kept in their wire form uncompressed (length-prefixed labels, then the root), the owner's and those inside
+# NS, CNAME, PTR, MX, SOA and SRV data (dnspython compresses SRV's too); other data as it is. Reading follows
+# compression pointers, each pointing before the last (so they end); writing compresses the owners. A message that is
+# none fails its event.
+record Record {
+  section = 0                                    # 0 question, 1 answer, 2 authority, 3 additional
+  name: bytes
+  type = 0
+  class = 0
+  ttl = 0
+  data: bytes
+}
+record Seen {
+  name: bytes                                    # a name written, from one of its labels to the root
+  at = 0                                         # where it starts in the message
+}
+state id = 0
+state flags = 0
+state records: list of Record
+input read = message { data: bytes }
+
+fn word(d, i) = number(d[i] << 8 | d[i + 1])
+fn long(d, i) = word(d, i) * 65536 + word(d, i + 2)
+fn two(n) = byte(i64(n) >> 8) + byte(i64(n) & 0xff)
+
+# The name at i uncompressed, and where it ends in place.
+fn name(d, i) {
+  let out = d[i .. i]
+  let j = i
+  let end = -1
+  let below = i                                  # where the next pointer must point before
+  while d[j] != 0 {
+    if d[j] >= 0xc0 {
+      let to = number((d[j] & 0x3f) << 8 | d[j + 1])
+      require to < below
+      if end < 0 { end = j + 2 }
+      below = to
+      j = to
+    } else {
+      require d[j] < 0x40
+      out = out + d[j .. j + number(d[j]) + 1]
+      j = j + number(d[j]) + 1
+    }
+  }
+  require out.bytes < 255
+  return out + byte(0), if end < 0 { j + 1 } else { end }
+}
+
+# A record's data at i (size bytes), the names in it uncompressed.
+fn data(d, i, size, type) {
+  if type == 2 || type == 5 || type == 12 || type == 15 || type == 33 {
+    let skip = if type == 15 { 2 } else if type == 33 { 6 } else { 0 }  # MX's preference, SRV's three numbers
+    let n, end = name(d, i + skip)
+    require end == i + size
+    return d[i .. i + skip] + n
+  }
+  if type == 6 {                                 # SOA: two names, five numbers
+    let m, after = name(d, i)
+    let r, end = name(d, after)
+    require end + 20 == i + size
+    return m + r + d[end .. end + 20]
+  }
+  return d[i .. i + size]
+}
+
+on read {
+  let d = read.data
+  require d.bytes >= 12
+  while records.count > 0 { records.remove(records.first) }
+  let at = 12
+  for section in 0 .. 4 {
+    for k in 0 .. word(d, 4 + 2 * section) {
+      let owner, next = name(d, at)
+      at = next + 4
+      require at <= d.bytes
+      if section == 0 {
+        records.append(Record { section: 0, name: owner, type: word(d, next), class: word(d, next + 2) })
+      } else {
+        require at + 6 <= d.bytes && at + 6 + word(d, at + 4) <= d.bytes
+        let size = word(d, at + 4)
+        records.append(Record { section: section, name: owner, type: word(d, next), class: word(d, next + 2),
+                                ttl: long(d, at), data: data(d, at + 6, size, word(d, next)) })
+        at = at + 6 + size
+      }
+    }
+  }
+  require at == d.bytes
+  id = word(d, 0)
+  flags = word(d, 2)
+}
+
+# The message as bytes: each owner written from its first label whose rest was written before, as a pointer to it.
+view wire {
+  let seen: list of Seen
+  let out = two(id) + two(flags)
+  for section in 0 .. 4 { out = out + two(count(r in records where r.section == section)) }
+  for r in records {
+    let k = 0
+    let done = false
+    while !done && r.name[k] != 0 {
+      for s in seen {
+        if !done && s.name.bytes == r.name.bytes - k {
+          let same = true                        # bytes have no ==: compared a byte at a time
+          for b in 0 .. s.name.bytes {
+            if s.name[b] != r.name[k + b] {
+              same = false
+              break
+            }
+          }
+          if same {
+            out = out + two(49152 + s.at)          # 0xc000: a pointer
+            done = true
+          }
+        }
+      }
+      if !done {
+        if out.bytes < 16384 { seen.append(Seen { name: r.name[k .. r.name.bytes], at: out.bytes }) }
+        out = out + r.name[k .. k + number(r.name[k]) + 1]
+        k = k + number(r.name[k]) + 1
+      }
+    }
+    if !done { out = out + byte(0) }
+    out = out + two(r.type) + two(r.class)
+    if r.section > 0 { out = out + two(r.ttl // 65536) + two(r.ttl % 65536) + two(r.data.bytes) + r.data }
+  }
+  return out
+}
