@@ -80,6 +80,7 @@ DIAGNOSTICS = [
     ('state a = 0\non frame {\n  let xs, ys: list of number = [1]\n}\n', '3:30',
      'lists declared together begin empty: give each its elements apart'),
     ('state a = 0\non frame {\n  let xs, xs: list of number\n}\n', '3:11', "'xs' is named twice"),
+    ('state t: text\nview v = abs(t)\n', '2:14', 'expected a number, not text'),
     ('record F {\n  v = 0\n}\nstate kept: list of F\nstate n = 0\non frame {\n  kept = n\n}\n', '7:10',
      "'kept' takes a list of F, not a number"),
     ('record F {\n  v = 0\n}\nrecord G {\n  w = 0\n}\nstate kept: list of F\nstate other: list of G\non frame {\n  kept = other\n}\n',
@@ -667,7 +668,13 @@ state i = 0
 state kept: list of P
 state keyed: list of P by x
 state j = 0
+state far = 0
+state wide: i64
+state per = 0
+input tick = every 250 ms
 input go = message { k: u32 }
+input edge = message { x: i64 }
+on edge { wide = abs(edge.x) }
 fn made(n) -> list of P, number {
   let out: list of P
   for m in 0 .. n { out.append(P { x: m * 10 }) }
@@ -679,6 +686,9 @@ fn only(n) -> list of P {
   return out
 }
 on go {
+  far = abs(go.k - 4.5) + abs(-0.0)
+  wide = abs(i64(go.k) - 4)
+  per = tick.period
   let ts: list of P
   ts.append(P { x: 1 })
   ts, j = made(go.k)
@@ -1811,7 +1821,7 @@ def frictions(aup, pure_run, work, events=100):
     each its own and empty as it begins, in inner blocks too; targets together with fields and items among them
     (xs[i].x, xs[i].y = a, b; a, xs[i] = ...), the values first, then each target left to right as Python's; a list
     given a list value whole (xs = f(x), xs = ys, xs = xs, xs = [] for a list state too, xs, j = f(x)), added by key
-    when keyed. Each event against Python's."""
+    when keyed; abs(x) of a number and an i64 (x once); a timer's period (tick.period). Each event against Python's."""
     import random
     import struct
     path = work / 'frictions.pmod'
@@ -1838,8 +1848,12 @@ def frictions(aup, pure_run, work, events=100):
         ns[0], ns[1] = 3, k
         b = b + ns[0] * 100 + ns[1]
         want = {'total': sum(range(k)) * (1 + 200 + 10000), 'n': n, 'bs': bs, 'a': a, 'b': b, 'i': i, 'kept': kept,
-                'keyed': keyed, 'j': k + 100}
+                'keyed': keyed, 'j': k + 100, 'far': abs(k - 4.5), 'wide': abs(k - 4), 'per': 250}
         assert state['fault'] == 'none' and {key: state['states'][key] for key in want} == want, (k, state['states'])
+    edges = ''.join(f"message edge {struct.pack('<q', x).hex()}\n" for x in (-2 ** 63 + 1, -2 ** 63))
+    first, second = (json.loads(line) for line in run(pure_run, path, stdin=edges, check=False).stdout.splitlines())
+    assert first['fault'] == 'none' and first['states']['wide'] == 2 ** 63 - 1, first  # abs of i64's least overflows
+    assert second['fault'] == 'overflow' and second['states']['wide'] == 2 ** 63 - 1, second
     return events
 
 

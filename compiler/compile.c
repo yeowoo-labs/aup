@@ -40,6 +40,7 @@ enum { BIT_AND = 0x100, BIT_OR, BIT_XOR, BIT_LEFT, BIT_RIGHT, BIT_NOT };
 enum { LOCALS = 64 }; /* an event's locals (Pure's) */
 enum { NESTING = 8, LOOP_INTEGER = 256 }; /* loops (for) nest 8 deep; an i64's count (Pure 018) */
 enum { FOLD_COUNT, FOLD_SUM, FOLD_MAX, FOLD_MIN, FOLD_FIRST, FOLD_DISTINCT, FOLD_INTEGER = 0x40 };
+enum { ABS = BIT_NOT + 1 }; /* abs(x), the compiler's alone: x, a PICK of it, its negation and MAX (no instruction of Pure's) */
 /* An input as the app writes it; in Pure's module (027's 4d) each of them but an output and a view's arguments is a
  * message, its binding what makes it: a key's press (KIND_KEY) and its release (KIND_RELEASE, an `on k.up`'s, k.up), a
  * text's (one field, text), a timer's tick, a frame (one field, dt: frame, an `on frame`'s) or a pointing at a table's
@@ -916,7 +917,8 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     } else if (token.kind == T_NAME) {
         static const struct { const char *name; unsigned count; int op; } calls[] =
             {{"min", 2, MIN}, {"max", 2, MAX}, {"clamp", 3, CLAMP}, {"text", 1, TEXT_FROM}, {"bytes", 1, BYTES_FROM},
-             {"floor", 1, FLOOR}, {"i64", 1, I64_FROM}, {"number", 1, NUM_FROM}, {"byte", 1, BYTE}, {"char", 1, CHAR}};
+             {"floor", 1, FLOOR}, {"i64", 1, I64_FROM}, {"number", 1, NUM_FROM}, {"byte", 1, BYTE}, {"char", 1, CHAR},
+             {"abs", 1, ABS}};
         int call = -1, how = -1;
         for (int i = 0; i < (int)(sizeof(calls) / sizeof(*calls)); ++i) if (!strcmp(token.text, calls[i].name)) call = i;
         static const char *const folds[] = {"count", "sum", "max", "min", "first", "distinct"};
@@ -3604,6 +3606,12 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         const Expr *base = e->args[0];
         int item_list;
         char item[2 * NAME + 2];
+        int timer = base->kind == E_NAME && !strcmp(e->member, "period") && !c->module && parameter(c, base->name) < 0 &&
+                    local_named(c, base->name) < 0 ? input_index(c, base->name) : -1;
+        if (timer >= 0 && c->inputs[timer].kind == KIND_TIMER) { /* tick.period: a timer's, in milliseconds, as now is */
+            emit(c, e->line, e->column, CONST, 0, (double)c->inputs[timer].period);
+            return (Kind){NUM, -1};
+        }
         int binding = binding_path(c, e, item);
         if (binding >= 0) { /* down a record's value held by name (027's 2c) */
             Kind kind = binding_value(c, e, binding, item);
@@ -4096,6 +4104,15 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 truth(c, e->args[i], handler, height + (int)i, *e->member ? e->member : e->op == NOT ? "!" : e->op == AND ? "&&" : "||");
             emit(c, e->line, e->column, (uint8_t)e->op, 0, 0);
             return (Kind){BOOL, -1};
+        }
+        if (e->op == ABS) { /* abs(x): x once, then the greater of it and its negation (-0's is +0, as IEEE's maximum) */
+            Kind operand = wanted(c, e->args[0], handler, height, want);
+            if (operand.type != I64) expect_kind(c, e->args[0], operand, NUM);
+            if (height + 2 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
+            emit(c, e->line, e->column, PICK, 0, 0);
+            emit(c, e->line, e->column, operand.type == I64 ? I64_NEG : NEG, 0, 0);
+            emit(c, e->line, e->column, operand.type == I64 ? I64_MAX : MAX, 0, 0);
+            return (Kind){operand.type, -1};
         }
         if (e->op == BYTE) { /* byte(n): one byte, n an i64 0-255 */
             integer(c, e->args[0], handler, height);
