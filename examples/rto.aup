@@ -1,0 +1,65 @@
+# RFC 6298's retransmission timer: a sender's segments sent and acknowledged (cumulatively); the round-trip time of each
+# acknowledged segment that was never sent again (Karn) updates SRTT, RTTVAR and RTO (2.2-2.5: 1 s at least, 60 s at
+# most), and the timer runs as 5.1-5.6 say: started when one is sent and none runs, stopped when all are acknowledged,
+# restarted when new data is, and on expiry the earliest is sent again and RTO doubles. Time is the events' now: the
+# timer is a deadline in the state, looked at on each tick.
+record Segment {
+  seq = 0
+  sent = 0
+  again = false                                  # sent again: no sample from it (Karn)
+}
+record Retransmit {
+  seq = 0
+  at = 0
+}
+state srtt = 0
+state rttvar = 0
+state rto = 1000
+state measured = false
+state deadline = -1                              # when the timer expires, or -1: not running
+state outstanding: list of Segment
+state retransmits: list of Retransmit
+input transmit = message { seq: u32 }
+input ack = message { seq: u32 }
+input tick = every 10 ms
+
+fn LOWEST = 1000; fn HIGHEST = 60000; fn PERIOD = 10   # milliseconds; the clock's granularity G is the tick's period
+
+on transmit {
+  outstanding.append(Segment { seq: transmit.seq, sent: now })
+  if deadline < 0 { deadline = now + rto }                                            # 5.1
+}
+
+on ack {
+  let acked, sent = 0, 0
+  let again = false
+  for s in outstanding {
+    if s.seq <= ack.seq {
+      acked = acked + 1
+      sent, again = s.sent, s.again
+    }
+  }
+  if acked > 0 {
+    for k in 0 .. acked { outstanding.remove(outstanding.first) }
+    if !again {
+      let r = now - sent
+      if !measured {                                                                  # 2.2
+        srtt, rttvar, measured = r, r / 2, true
+      } else {                                                                        # 2.3
+        rttvar = 0.75 * rttvar + 0.25 * max(srtt - r, r - srtt)
+        srtt = 0.875 * srtt + 0.125 * r
+      }
+      rto = min(max(srtt + max(PERIOD, 4 * rttvar), LOWEST), HIGHEST)                 # 2.4, 2.5
+    }
+    deadline = if outstanding.count > 0 { now + rto } else { -1 }                     # 5.3, 5.2
+  }
+}
+
+on tick {
+  if deadline >= 0 && now >= deadline {                                               # 5.4-5.6
+    outstanding[outstanding.first].again = true
+    retransmits.append(Retransmit { seq: outstanding.first.seq, at: now })
+    rto = min(rto * 2, HIGHEST)
+    deadline = now + rto
+  }
+}
