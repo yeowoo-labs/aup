@@ -83,6 +83,9 @@ DIAGNOSTICS = [
     ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
      '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
     ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
+    # Lets' lists in inner blocks and xs = [...] (after 140's inflate): a stored list is not given elements so.
+    ('record R {\n  v = 0\n}\nstate rs: list of R\non frame {\n  rs = []\n}\n', '6:3',
+     "a list changes by append, insert, remove, rs[index].field = value and (a let's) rs = [...]"),
     # Bytes compared (after 140's DNS and HTTP): bytes compare with bytes (a string where bytes go is its bytes), and
     # neither compares nor joins with a text's value.
     ('state t: text\ninput m = message { name: bytes }\non m {\n  require m.name == t\n}\n', '4:21',
@@ -398,8 +401,7 @@ DIAGNOSTICS = [
     (LETS + 'on k.down {\n  for r in xs {\n    let r = 1\n  }\n}\n', '11:9', "'r' is the item this for walks"),
     # Counting fors, break and a let's list (Pure 018).
     (LETS + 'on k.down {\n  break\n}\n', '10:3', "break ends a for; this one is outside any"),
-    (LETS + 'on k.down {\n  if n > 0 {\n    let q: list of T\n  }\n}\n', '11:9',
-     "a let's list goes in the handler's own block, not in an if or a for"),
+    (LETS + 'on k.down {\n  if n > 0 {\n    let q: list of T\n  }\n  n = q.count\n}\n', '13:7', "unknown state 'q'"),  # its block's
     (LETS + 'on k.down {\n  for i in 0 .. 3 {\n    i = 1\n  }\n}\n', '11:5', "'i' is what this for counts; it is not assigned"),
     (LETS + 'on k.down {\n  for a in xs {\n    for b in ys {\n      xs.remove(a)\n    }\n  }\n}\n', '12:7',
      'a for removes from the list it walks, not from one an outer for walks'),
@@ -612,6 +614,55 @@ on m {
   if "ab" < m.a { lit = lit + 2 }
   if m.b != "{rel}" { lit = lit + 4 }
   joined = "<" + m.a + "|" + m.b + ">" == bytes("<") + m.a + bytes("|") + m.b + bytes(">")
+}
+'''
+
+INNER_LISTS = '''record Seen {
+  node = 0
+  depth = 0
+}
+state total = 0
+state keyed = 0
+state again = 0
+state counted = 0
+input go = message { n: u32, k: u32 }
+
+fn rows(n) {
+  let t = 0
+  for r in 0 .. n {
+    let zs: list of number
+    zs.append(r)
+    t = t + zs.count + zs.first
+  }
+  return t
+}
+
+on go {
+  total = 0
+  keyed = 0
+  for r in 0 .. go.n {
+    let xs: list of number = [r]
+    for k in 0 .. r % go.k + 1 { xs.append(k * r) }
+    total = total + xs.count * 1000 + sum(x for x in xs)
+    let seen: list of Seen by node
+    for k in 0 .. r % 3 + 1 { seen.add(Seen { node: k * 7 + r, depth: k }) }
+    keyed = keyed + seen.count * 100 + sum(s.depth for s in seen)
+  }
+  let ys: list of number = [1, 2, 3]
+  ys = [go.n, go.k]
+  again = ys.count * 1000 + ys.first * 10 + ys.last
+  ys = []
+  again = again + ys.count
+  counted = rows(go.n)
+}
+
+view inner {
+  let t = 0
+  for r in 0 .. 3 {
+    let zs: list of number = [r, r]
+    t = t + zs.count + sum(z for z in zs)
+  }
+  return t
 }
 '''
 
@@ -1530,6 +1581,30 @@ def nested_values(aup, pure_run, work):
     return {'events': 3}
 
 
+
+
+def inner_lists(aup, pure_run, work, events=100):
+    """Lets' lists in inner blocks, and xs = [...] (after 140's inflate): a let's list in a for's block, a keyed one, one
+    in a fn's for and one in a view's body begin empty each time their let is run; xs = [...] empties a let's list and
+    gives it its elements, [] none; each event's states and the view against Python's."""
+    import random
+    import struct
+    path = work / 'inner_lists.pmod'
+    (work / 'inner_lists.aup').write_text(INNER_LISTS)
+    compile_module(aup, work / 'inner_lists.aup', path)
+    rng = random.Random(140)
+    asked = [(rng.randrange(0, 12), rng.randrange(1, 5)) for _ in range(events)]
+    commands = ''.join(f"message go {struct.pack('<II', n, k).hex()}\n" for n, k in asked)
+    lines = run(pure_run, path, stdin=commands).stdout.splitlines()
+    assert len(lines) == events
+    for (n, k), line in zip(asked, lines):
+        state = json.loads(line)
+        total = sum(len(xs) * 1000 + sum(xs) for xs in ([r] + [j * r for j in range(r % k + 1)] for r in range(n)))
+        keyed = sum((r % 3 + 1) * 100 + sum(range(r % 3 + 1)) for r in range(n))
+        want = {'total': total, 'keyed': keyed, 'again': 2000 + n * 10 + k, 'counted': sum(1 + r for r in range(n))}
+        assert state['fault'] == 'none' and {key: state['states'][key] for key in want} == want, ((n, k), state['states'])
+        assert state['views']['inner'] == sum(2 + 2 * r for r in range(3)), state['views']
+    return events
 
 
 def bytes_compared(aup, pure_run, work, events=400):
@@ -2725,6 +2800,7 @@ def main():
         report['functions'] = functions(aup, pure_run, work)
         report['bare_lists'] = bare_lists(aup, pure_run, work)
         report['bytes_compared'] = bytes_compared(aup, pure_run, work)
+        report['inner_lists'] = inner_lists(aup, pure_run, work)
         report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
         report['documents'] = documents_model(aup, pure_run, work, range(4))
     print(json.dumps(report))

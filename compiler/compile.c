@@ -901,8 +901,8 @@ static Expr *expression(Compiler *c, int minimum, bool multiline) {
     } else if (token.kind == T_PUNCT && !strcmp(token.text, "[")) { /* refused where it stands (only a let's list begins so) */
         left = node(c, E_LIST, token.line, token.column);
         newlines(c);
-        while (!is(c, "]")) {
-            expression(c, 0, true);
+        for (Expr **tail = &left->args[0]; !is(c, "]"); tail = &(*tail)->next) {
+            *tail = expression(c, 0, true);
             newlines(c);
             if (!is(c, ",")) break;
             take(c);
@@ -4360,6 +4360,44 @@ static unsigned held_slot(Compiler *c, const Stmt *s, Type type) {
 static void chars_loop(Compiler *c, const Stmt *s, const Expr *subject);
 static bool text_path(Compiler *c, const char *path);
 
+/* A let's list emptied (at a let in an inner block, or by xs = [...]): while xs.count > 0 { xs.remove(xs.last) } (a list
+ * of numbers' place count - 1), the same as a new list each time the let is run. Its items go one at a time (Pure has no op that empties a list). */
+static Stmt *emptied(Compiler *c, const char *name, int line, int column) {
+    Stmt *loop = allocate(c, sizeof(*loop)), *check = allocate(c, sizeof(*check)), *stop = allocate(c, sizeof(*stop)),
+         *remove = allocate(c, sizeof(*remove));
+    Expr *list = node(c, E_NAME, line, column), *count = node(c, E_MEMBER, line, column), *none = node(c, E_NUMBER, line, column),
+         *empty = node(c, E_BINARY, line, column), *last = node(c, E_MEMBER, line, column);
+    memcpy(list->name, name, NAME);
+    count->args[0] = last->args[0] = list;
+    count->count = last->count = 1;
+    memcpy(count->member, "count", 6);
+    memcpy(last->member, "last", 5);
+    none->whole = true;
+    empty->op = LE, empty->args[0] = count, empty->args[1] = none, empty->count = 2;
+    check->kind = S_IF, check->line = line, check->column = column, check->value = empty, check->then = stop;
+    stop->kind = S_BREAK, stop->line = line, stop->column = column;
+    remove->kind = S_REMOVE, remove->line = line, remove->column = column, remove->first = last;
+    int state = state_index(c, name);
+    if (state >= 0 && record_of(c, state)->scalar) { /* a list of numbers' last is its value: its place is count - 1 */
+        Expr *place = node(c, E_BINARY, line, column), *one = node(c, E_NUMBER, line, column);
+        one->number = 1, one->integer = 1, one->whole = true;
+        place->op = SUB, place->args[0] = count, place->args[1] = one, place->count = 2;
+        remove->first = place;
+    }
+    memcpy(remove->name, name, NAME);
+    check->next = remove;
+    loop->kind = S_COUNT, loop->line = line, loop->column = column;
+    snprintf(loop->name, NAME, "while.%u", c->whiles++);
+    loop->low = node(c, E_NUMBER, line, column);
+    loop->low->whole = true;
+    loop->high = node(c, E_NUMBER, line, column);
+    loop->high->number = 9007199254740992.0;
+    loop->high->integer = INT64_C(9007199254740992);
+    loop->high->whole = true;
+    loop->then = check;
+    return loop;
+}
+
 static void statements(Compiler *c, const Stmt *s) {
     unsigned scope = c->local_count; /* a block's lets end with it */
     for (const Stmt *before = NULL; s; before = s, s = s->next) {
@@ -4507,7 +4545,7 @@ static void statements(Compiler *c, const Stmt *s) {
                         "'%s' is what this for counts", s->name);
             if (c->local_count == LOCALS) fail_at(c, s->line, s->column, "at most %d lets are allowed in a handler", LOCALS);
             if (s->listed) { /* the event's list: its state let.NAME, made before the handlers (event_lists) */
-                if (c->nested) fail_at(c, s->line, s->column, "a let's list goes in the handler's own block, not in an if or a for");
+                if (c->folding || c->filtering) fail_at(c, s->line, s->column, "a fold or a filter holds no let's list");
                 char path[2 * NAME];
                 snprintf(path, sizeof(path), "let.%s", s->name);
                 int list = -1;
@@ -4516,6 +4554,7 @@ static void statements(Compiler *c, const Stmt *s) {
                 memset(&c->locals[local], 0, sizeof(c->locals[local]));
                 memcpy(c->locals[local].name, s->name, NAME);
                 c->locals[local].list = list;
+                if (c->nested) statements(c, emptied(c, s->name, s->line, s->column)); /* an inner block's: new each time */
                 for (const Expr *element = s->value ? s->value->args[0] : NULL; element; element = element->next) {
                     if (keyed_by(c, list))
                         fail_at(c, element->line, element->column, "a keyed list adds its elements by key; add them one by one");
@@ -4690,8 +4729,17 @@ static void statements(Compiler *c, const Stmt *s) {
             } else if (c->state_types[index] == STATE_NUM || c->state_types[index] == STATE_BOOL) {
                 expect_kind(c, s->value, value(c, s->value, c->handling, 0), c->state_types[index] == STATE_BOOL ? BOOL : NUM);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
+            } else if (c->state_types[index] == STATE_LIST && c->state_event[index] && s->value->kind == E_LIST) {
+                statements(c, emptied(c, s->name, s->line, s->column)); /* xs = [...]: a let's list emptied, then its elements */
+                if (keyed_by(c, index) && s->value->args[0])
+                    fail_at(c, s->value->line, s->value->column, "a keyed list adds its elements by key; add them one by one");
+                for (const Expr *element = s->value->args[0]; element; element = element->next) {
+                    record_fields(c, element, index, 0);
+                    emit(c, element->line, element->column, LIST_APPEND, (uint32_t)index, 0);
+                }
             } else if (c->state_types[index] == STATE_LIST) {
-                fail_at(c, s->line, s->column, "a list changes by append, insert, remove and %s[index].field = value", s->name);
+                fail_at(c, s->line, s->column, "a list changes by append, insert, remove, %s[index].field = value and (a let's) "
+                        "%s = [...]", s->name, s->name);
             } else if (c->state_types[index] == STATE_INDEX) {
                 index_of(c, s->value, c->handling, 0, cursor_owner(c, index));
                 emit(c, s->line, s->column, INDEX_STORE, (uint32_t)index, 0);
@@ -5159,45 +5207,60 @@ static uint32_t intern(unsigned char *strings, size_t *used, const char *text) {
  * list (Pure 018), one for the lets of that name in the handlers' own
  * blocks, which hold one record keyed one way; no two handlers of one event
  * have one, so each begins empty. */
+/* Whether the statements (and the blocks in them) hold a let's list of that name. */
+static bool holds_list_let(const Stmt *s, const char *name) {
+    for (; s; s = s->next)
+        if ((s->kind == S_LET && s->listed && !strcmp(s->name, name)) || holds_list_let(s->then, name) ||
+            holds_list_let(s->otherwise, name))
+            return true;
+    return false;
+}
+
+/* The lets' lists of statements h's (a handler's, a view's body's or a fn's), in its inner blocks too: each name one
+ * state let.NAME of one record, emptied at each inner block's let (emptied). */
+static void event_lists_in(Compiler *c, unsigned h, const Stmt *s) {
+    for (; s; s = s->next) {
+        event_lists_in(c, h, s->then);
+        event_lists_in(c, h, s->otherwise);
+        if (s->kind != S_LET || !s->listed) continue;
+        char path[2 * NAME];
+        snprintf(path, sizeof(path), "let.%s", s->name);
+        if (strlen(path) >= NAME)
+            fail_at(c, s->line, s->column, "a let's list has a name of %d characters at most", NAME - 5);
+        int found = -1;
+        for (unsigned i = 0; i < c->states; ++i)
+            if (c->state_event[i] && !strcmp(c->state_names[i], path)) found = (int)i;
+        if (found >= 0) {
+            if (strcmp(c->state_target[found], s->member) || c->state_library[found] != s->library ||
+                strcmp(c->state_key[found], s->key))
+                fail_at(c, s->line, s->column, "'%s' is a let's list of another record or key in another handler or block; "
+                        "one name holds one kind of list", s->name);
+            for (unsigned k = 0; h < c->handler_count && k < h; ++k) {
+                if (strcmp(c->handlers[k].input, c->handlers[h].input) || c->handlers[k].edge != c->handlers[h].edge) continue;
+                if (holds_list_let(c->handlers[k].body, s->name))
+                    fail_at(c, s->line, s->column, "another handler of this event has a list '%s'; name this one apart", s->name);
+            }
+            continue;
+        }
+        if (c->states == STATES) fail_at(c, s->line, s->column, "at most %d states are allowed, a let's list among them", STATES);
+        unsigned i = c->states++;
+        memcpy(c->state_names[i], path, strlen(path) + 1);
+        c->state_types[i] = STATE_LIST;
+        c->state_event[i] = true;
+        memcpy(c->state_target[i], s->member, NAME);
+        c->state_library[i] = s->library;
+        memcpy(c->state_key[i], s->key, NAME);
+        c->state_key_line[i] = s->key_line;
+        c->state_key_column[i] = s->key_column;
+        c->state_line[i] = s->line;
+        c->state_column[i] = s->column;
+    }
+}
+
 static void event_lists(Compiler *c) {
     for (unsigned h = 0; h < c->handler_count + c->views + c->fn_count; ++h) /* the handlers', the views' bodies', the fns' */
-        for (const Stmt *s = h < c->handler_count ? c->handlers[h].body : h < c->handler_count + c->views ?
-                             c->view_body[h - c->handler_count] : c->fns[h - c->handler_count - c->views].block; s; s = s->next) {
-            if (s->kind != S_LET || !s->listed) continue;
-            char path[2 * NAME];
-            snprintf(path, sizeof(path), "let.%s", s->name);
-            if (strlen(path) >= NAME)
-                fail_at(c, s->line, s->column, "a let's list has a name of %d characters at most", NAME - 5);
-            int found = -1;
-            for (unsigned i = 0; i < c->states; ++i)
-                if (c->state_event[i] && !strcmp(c->state_names[i], path)) found = (int)i;
-            if (found >= 0) {
-                if (strcmp(c->state_target[found], s->member) || c->state_library[found] != s->library ||
-                    strcmp(c->state_key[found], s->key))
-                    fail_at(c, s->line, s->column, "'%s' is a let's list of another record or key in another handler; one name "
-                            "holds one kind of list", s->name);
-                for (unsigned k = 0; h < c->handler_count && k < h; ++k) {
-                    if (strcmp(c->handlers[k].input, c->handlers[h].input) || c->handlers[k].edge != c->handlers[h].edge) continue;
-                    for (const Stmt *t = c->handlers[k].body; t; t = t->next)
-                        if (t->kind == S_LET && t->listed && !strcmp(t->name, s->name))
-                            fail_at(c, s->line, s->column, "another handler of this event has a list '%s'; name this one apart",
-                                    s->name);
-                }
-                continue;
-            }
-            if (c->states == STATES) fail_at(c, s->line, s->column, "at most %d states are allowed, a let's list among them", STATES);
-            unsigned i = c->states++;
-            memcpy(c->state_names[i], path, strlen(path) + 1);
-            c->state_types[i] = STATE_LIST;
-            c->state_event[i] = true;
-            memcpy(c->state_target[i], s->member, NAME);
-            c->state_library[i] = s->library;
-            memcpy(c->state_key[i], s->key, NAME);
-            c->state_key_line[i] = s->key_line;
-            c->state_key_column[i] = s->key_column;
-            c->state_line[i] = s->line;
-            c->state_column[i] = s->column;
-        }
+        event_lists_in(c, h, h < c->handler_count ? c->handlers[h].body : h < c->handler_count + c->views ?
+                                 c->view_body[h - c->handler_count] : c->fns[h - c->handler_count - c->views].block);
 }
 
 static void rows_lists(Compiler *c) {
