@@ -4,13 +4,7 @@ record Code {
   counts: list of number                         # how many codes of each length, 0 to 15
   symbols: list of number                        # the symbols in their codes' order
 }
-record Lengths {
-  of: list of number
-}
-record Inflated {
-  data: bytes
-}
-state inflated: list of Inflated                 # the last stream's bytes (a list of one: a record is no state alone)
+state inflated: bytes                            # the last stream's bytes
 input inflate = message { data: bytes }
 
 fn bit(d, at) = d[at // 8] >> at % 8 & 1
@@ -22,13 +16,13 @@ fn take(d, at, n) {
   return number(v)
 }
 
-fn code(l) -> Code {
+fn code(lengths) -> Code {
   let counts: list of number = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   let symbols: list of number
-  for x in l.of { counts[x] = counts[x] + 1 }
+  for x in lengths { counts[x] = counts[x] + 1 }
   for n in 1 .. 16 {
-    for s in 0 .. l.of.count {
-      if l.of[s] == n { symbols.append(s) }
+    for s in 0 .. lengths.count {
+      if lengths[s] == n { symbols.append(s) }
     }
   }
   return Code { counts: counts, symbols: symbols }
@@ -48,50 +42,6 @@ fn decode(d, at, c) {
   return 0, at
 }
 
-# A block's literal and length code and its distance code, fixed (kind 1) or from bit at (kind 2), and the bit after.
-fn codes(d, at, kind) -> Code, Code, number {
-  let lengths: list of number
-  let distances: list of number
-  let both: list of number
-  let order: list of number = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
-  let small: list of number = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-  let i = at
-  if kind == 1 {
-    for s in 0 .. 288 { lengths.append(if s < 144 { 8 } else if s < 256 { 9 } else if s < 280 { 7 } else { 8 }) }
-    for s in 0 .. 30 { distances.append(5) }
-    return code(Lengths { of: lengths }), code(Lengths { of: distances }), i
-  }
-  let literals = take(d, i, 5) + 257
-  let count = take(d, i + 5, 5) + 1
-  let n = take(d, i + 10, 4) + 4
-  i = i + 14
-  for k in 0 .. n { small[order[k]] = take(d, i + 3 * k, 3) }
-  i = i + 3 * n
-  let c = code(Lengths { of: small })
-  while both.count < literals + count {
-    let symbol, next = decode(d, i, c)
-    i = next
-    if symbol < 16 {
-      both.append(symbol)
-    } else if symbol == 16 {
-      require both.count > 0                     # a repeat with nothing before it
-      let previous = both[both.count - 1]
-      for k in 0 .. 3 + take(d, i, 2) { both.append(previous) }
-      i = i + 2
-    } else if symbol == 17 {
-      for k in 0 .. 3 + take(d, i, 3) { both.append(0) }
-      i = i + 3
-    } else {
-      for k in 0 .. 11 + take(d, i, 7) { both.append(0) }
-      i = i + 7
-    }
-  }
-  require both.count == literals + count
-  for s in 0 .. literals { lengths.append(both[s]) }
-  for s in literals .. literals + count { distances.append(both[s]) }
-  return code(Lengths { of: lengths }), code(Lengths { of: distances }), i
-}
-
 on inflate {
   let length_base: list of number = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,
                                      115, 131, 163, 195, 227, 258]
@@ -100,6 +50,7 @@ on inflate {
                                        1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
   let distance_extra: list of number = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
                                         12, 12, 13, 13]
+  let order: list of number = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
   let d = inflate.data
   let out: list of i64
   let at = 0
@@ -116,8 +67,45 @@ on inflate {
       at = (b + 4 + size) * 8
     } else {
       require kind != 3
-      let lc, dc, next = codes(d, at, kind)
-      at = next
+      let lengths: list of number
+      let distances: list of number
+      if kind == 1 {
+        for s in 0 .. 288 { lengths.append(if s < 144 { 8 } else if s < 256 { 9 } else if s < 280 { 7 } else { 8 }) }
+        for s in 0 .. 30 { distances.append(5) }
+      } else {
+        let literals = take(d, at, 5) + 257
+        let count = take(d, at + 5, 5) + 1
+        let n = take(d, at + 10, 4) + 4
+        at = at + 14
+        let small: list of number = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        for k in 0 .. n { small[order[k]] = take(d, at + 3 * k, 3) }
+        at = at + 3 * n
+        let c = code(small)
+        let both: list of number
+        while both.count < literals + count {
+          let symbol, next = decode(d, at, c)
+          at = next
+          if symbol < 16 {
+            both.append(symbol)
+          } else if symbol == 16 {
+            require both.count > 0                 # a repeat with nothing before it
+            let previous = both[both.count - 1]
+            for k in 0 .. 3 + take(d, at, 2) { both.append(previous) }
+            at = at + 2
+          } else if symbol == 17 {
+            for k in 0 .. 3 + take(d, at, 3) { both.append(0) }
+            at = at + 3
+          } else {
+            for k in 0 .. 11 + take(d, at, 7) { both.append(0) }
+            at = at + 7
+          }
+        }
+        require both.count == literals + count
+        for s in 0 .. literals { lengths.append(both[s]) }
+        for s in literals .. literals + count { distances.append(both[s]) }
+      }
+      let lc = code(lengths)
+      let dc = code(distances)
       let symbol, then = decode(d, at, lc)
       at = then
       while symbol != 256 {
@@ -138,6 +126,5 @@ on inflate {
       }
     }
   }
-  if inflated.count > 0 { inflated.remove(inflated.first) }
-  inflated.append(Inflated { data: bytes(out) })
+  inflated = bytes(out)
 }

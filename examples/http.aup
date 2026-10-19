@@ -5,9 +5,6 @@ record Field {
   name: bytes
   value: bytes
 }
-record Fields {
-  of: list of Field
-}
 record Request {
   method: bytes
   target: bytes
@@ -16,11 +13,8 @@ record Request {
   body: bytes
   trailers: list of Field
 }
-record Left {
-  data: bytes
-}
 state requests: list of Request
-state pending: list of Left                      # the bytes no request has completed (a list of one: bytes are no state)
+state pending: bytes                             # the bytes no request has completed
 input packet = message { data: bytes }
 
 fn letter(b) = b >= 0x61 && b <= 0x7a || b >= 0x41 && b <= 0x5a
@@ -62,7 +56,7 @@ fn field(d, i, e) -> Field {
 }
 
 # The field lines from i to an empty line, and where it ends; -1 if they have not all come.
-fn fields(d, i) -> Fields, number {
+fn fields(d, i) {
   let out: list of Field
   let j = i
   let e = crlf(d, j)
@@ -71,7 +65,7 @@ fn fields(d, i) -> Fields, number {
     j = e + 2
     e = crlf(d, j)
   }
-  return Fields { of: out }, if e < 0 { -1 } else { e + 2 }
+  return out, if e < 0 { -1 } else { e + 2 }
 }
 
 # The request at the start of d, and its length; -1 if d holds only part of one.
@@ -85,19 +79,18 @@ fn request(d) -> Request, number {
   require s1 > 0 && s2 > s1 + 1 && s2 + 9 == e
   for k in 0 .. s1 { require token(d[k]) }
   for k in s1 + 1 .. s2 { require d[k] >= 0x21 && d[k] <= 0x7e }
-  require text(d[s2 + 1 .. e - 1]) == "HTTP/1." && (d[e - 1] == 0x30 || d[e - 1] == 0x31)
+  require d[s2 + 1 .. e - 1] == "HTTP/1." && (d[e - 1] == 0x30 || d[e - 1] == 0x31)
   let found, i = fields(d, e + 2)
   if i < 0 { return Request {}, -1 }
   let hosts, coded, lengths, length = 0, 0, 0, 0
   let chunked = false
-  for f in found.of {
-    let n = text(f.name)                         # a token: its bytes are text
-    if n == "host" { hosts = hosts + 1 }
-    if n == "transfer-encoding" {
+  for f in found {
+    if f.name == "host" { hosts = hosts + 1 }
+    if f.name == "transfer-encoding" {
       coded = coded + 1
-      chunked = text(lower(f.value)) == "chunked"
+      chunked = lower(f.value) == "chunked"
     }
-    if n == "content-length" {
+    if f.name == "content-length" {
       lengths = lengths + 1
       require f.value.bytes > 0
       for k in 0 .. f.value.bytes {
@@ -108,7 +101,7 @@ fn request(d) -> Request, number {
   }
   require hosts <= 1 && (hosts == 1 || d[e - 1] == 0x30)  # HTTP/1.1 names its host
   let body = d[0 .. 0]
-  let trailers = Fields { of: [] }
+  let trailers: list of Field
   let j = i
   if coded > 0 {
     require lengths == 0 && coded == 1 && chunked
@@ -133,7 +126,7 @@ fn request(d) -> Request, number {
       if n == 0 {
         let t, after = fields(d, c + 2)
         if after < 0 { return Request {}, -1 }
-        trailers = t
+        for f in t { trailers.append(f) }
         j = after
         more = false
       } else {
@@ -149,16 +142,12 @@ fn request(d) -> Request, number {
     body = d[i .. i + length]
     j = i + length
   }
-  return Request { method: d[0 .. s1], target: d[s1 + 1 .. s2], minor: number(d[e - 1] - 0x30), fields: found.of, body: body,
-                   trailers: trailers.of }, j
+  return Request { method: d[0 .. s1], target: d[s1 + 1 .. s2], minor: number(d[e - 1] - 0x30), fields: found, body: body,
+                   trailers: trailers }, j
 }
 
 on packet {
-  let d = packet.data
-  if pending.count > 0 {
-    d = pending[0].data + d
-    pending.remove(pending.first)
-  }
+  let d = pending + packet.data
   let going = true
   while going && d.bytes > 0 {
     let r, n = request(d)
@@ -169,5 +158,5 @@ on packet {
       d = d[n .. d.bytes]
     }
   }
-  if d.bytes > 0 { pending.append(Left { data: d }) }
+  pending = d
 }
