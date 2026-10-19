@@ -331,8 +331,6 @@ DIAGNOSTICS = [
     (LIST + 'view v = count(x in at)\n', '6:10', "'at' is a list index, not a list"),
     ('record T {\n  t: text\n}\nstate xs: list of T\nview v = sum(x.t for x in xs)\n', '5:14',
      'sum, max, min and distinct take numbers or i64s, not text'),
-    (LIST + 'fn f(n) = count(x in xs where x.a == n)\nview v = f(1)\n', '6:38',
-     "'n' is a parameter outside this count, sum, max or min"),
     (LIST + 'view v = sum(dt for x in xs)\n', '6:14', 'dt is not available in count, sum, max or min'),
     (LIST + 'view v = sum(x.a for x xs)\n', '6:24', "expected 'in' and a list, as in sum(x in tasks)"),
     (LIST + 'view w = each r in xs where r {\n  n = r.a\n}\n', '6:29', 'expected a bool, not an index'),
@@ -810,6 +808,8 @@ view whole = data
 '''
 
 ACCEPTED = [
+    # an inlined fn's fold reads its argument (put in a let before the fold: its block sees no stack)
+    LIST + 'fn f(n) = count(x in xs where x.a == n)\nview v = f(1)\n',
     # Views of any value (Pure 027's 4e): a list as it is, filtered, a map with a list and a bytes column, a list a body
     # built, bytes.
     'record Tag {\n  v: i64\n}\nrecord T {\n  s: text\n  b: bytes\n  tags: list of Tag\n}\nstate xs: list of T\n'

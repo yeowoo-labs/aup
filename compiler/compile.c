@@ -203,10 +203,12 @@ typedef struct {
     uint32_t start;
 } Instance;
 
-/* The fn being inlined: where its arguments are on the stack and their kinds. */
+/* The fn being inlined: where its arguments are on the stack and their kinds; while a count, sum, max, min or first
+ * in it is compiled, the lets its arguments were put in for it (a fold's block sees no stack: 1 + the let, 0 none). */
 typedef struct Scope {
     int fn, base, line, column;
     Kind kinds[PARAMS];
+    int spilled[PARAMS];
 } Scope;
 
 typedef struct {
@@ -2784,6 +2786,17 @@ static Kind inline_fn(Compiler *c, const Expr *e, int module, const char *name, 
 }
 
 /* A parameter of the fn being inlined, or -1. */
+/* The arguments of the fn being inlined that an expression names (not where item, the fold's own item, hides one). */
+static void reads_parameters(const Compiler *c, const Expr *e, const char *item, bool reads[PARAMS]) {
+    for (; e; e = e->next) {
+        if (e->kind == E_NAME && strcmp(e->name, item)) {
+            const Fn *f = &c->fns[c->scope->fn];
+            for (unsigned i = 0; i < f->param_count; ++i) if (!strcmp(f->params[i], e->name)) reads[i] = true;
+        }
+        for (unsigned i = 0; i < PARAMS; ++i) if (e->args[i]) reads_parameters(c, e->args[i], item, reads);
+    }
+}
+
 static int parameter(const Compiler *c, const char *name) {
     if (!c->scope) return -1;
     const Fn *f = &c->fns[c->scope->fn];
@@ -3555,6 +3568,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             return field_value(record_of(c, list), (unsigned)field);
         }
         int param = parameter(c, e->name);
+        if (param >= 0 && c->folding && c->scope == c->fold_scope && c->scope->spilled[param]) {
+            int local = c->scope->spilled[param] - 1; /* the argument, put in a let before the fold */
+            emit(c, e->line, e->column, LOCAL_LOAD, local_arg(c, local), 0);
+            return c->locals[local].kind;
+        }
         if (param >= 0 && c->folding && c->scope == c->fold_scope)
             fail_at(c, e->line, e->column,
                     "'%s' is a parameter outside this count, sum, max or min; its block reads only its item and states", e->name);
@@ -3984,6 +4002,25 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         }
         if (list > 0xFF) /* a fold names its list in a byte of its argument (Pure's FOLD) */
             fail_at(c, e->line, e->column, "a folded list is among the first 256 states; '%s' is state %d", e->member, list);
+        /* In an inlined fn, the arguments its block reads go into lets first: the block sees no stack. */
+        bool spilled = false;
+        if (c->scope) {
+            bool reads[PARAMS] = {false};
+            for (unsigned i = 0; i < 2; ++i) reads_parameters(c, e->args[i], e->name, reads);
+            const Fn *f = &c->fns[c->scope->fn];
+            for (unsigned p = 0; p < f->param_count; ++p) {
+                Kind kind = c->scope->kinds[p];
+                if (!reads[p] || (kind.type != NUM && kind.type != BOOL && kind.type != I64 && kind.type != INDEX)) continue;
+                char hidden[NAME];
+                snprintf(hidden, sizeof(hidden), "$%u$%.24s", p, f->params[p]); /* no name the source can write */
+                name_value(c, hidden, kind, e->line, e->column);
+                int local = (int)c->local_count - 1;
+                emit(c, e->line, e->column, PICK, (uint32_t)(height - 1 - (c->scope->base + (int)p)), 0);
+                emit(c, e->line, e->column, LOCAL_STORE, c->locals[local].slot, 0);
+                c->scope->spilled[p] = local + 1;
+                spilled = true;
+            }
+        }
         unsigned at = c->code_count, joins = c->joins;
         emit(c, e->line, e->column, FOLD, 0, 0);
         c->folding = true;
@@ -4005,6 +4042,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         c->folding = false;
         c->fold_list = -1;
         c->joins = joins;
+        if (spilled) memset(c->scope->spilled, 0, sizeof(c->scope->spilled));
         c->code[at].arg = (uint32_t)e->op | (values == I64 ? FOLD_INTEGER : 0) | (sliced ? 0x80u : 0) | (uint32_t)list << 8 |
                           (uint32_t)(c->code_count - at - 1) << 16;
         return e->op == FOLD_FIRST ? (Kind){INDEX, list} :
