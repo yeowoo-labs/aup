@@ -622,6 +622,29 @@ on m {
 }
 '''
 
+ROWS_AT = '''record R {
+  a = 0
+  b = 0
+}
+state first = 0
+state last = 0
+state total = 0
+state through = 0
+state picked = 0
+input m = message { at: u32, rows: list of R }
+fn both(r) = r.a * 1000 + r.b
+on m {
+  first = m.rows[0].a
+  last = m.rows[m.rows.count - 1].b
+  let t = 0
+  for k in 0 .. m.rows.count { t = t + m.rows[k].a * (k + 1) }
+  total = t
+  let d = m.rows[m.at]
+  through = d.a + d.b
+  picked = both(m.rows[m.at])
+}
+'''
+
 INNER_LISTS = '''record Seen {
   node = 0
   depth = 0
@@ -1672,6 +1695,40 @@ def inner_lists(aup, pure_run, work, events=100):
         want = {'total': total, 'keyed': keyed, 'again': 2000 + n * 10 + k, 'counted': sum(1 + r for r in range(n))}
         assert state['fault'] == 'none' and {key: state['states'][key] for key in want} == want, ((n, k), state['states'])
         assert state['views']['inner'] == sum(2 + 2 * r for r in range(3)), state['views']
+    return events
+
+
+def rows_at(aup, pure_run, work, events=200):
+    """A message's rows read by position (after 140's box layout: read where they are, not from a copy of them, which
+    made each read cost the rows' count): at a literal, a computed and a looped position, through a let and as a fn's
+    argument; a position past the last fails the event (none is kept). Each event against Python's."""
+    import random
+    import struct
+    path = work / 'rows_at.pmod'
+    (work / 'rows_at.aup').write_text(ROWS_AT)
+    compile_module(aup, work / 'rows_at.aup', path)
+    rng = random.Random(140)
+    asked = []
+    for _ in range(events):
+        rows = [(rng.randrange(100), rng.randrange(100)) for _ in range(rng.randrange(1, 7))]
+        asked.append((rng.randrange(len(rows) + 1), rows))
+    commands = ''.join(f"message m {(struct.pack('<I', at) + b''.join(struct.pack('<2d', *r) for r in rows)).hex()}\n"
+                       for at, rows in asked)
+    lines = run(pure_run, path, stdin=commands, check=False).stdout.splitlines()
+    assert len(lines) == events
+    failed, kept = 0, {'first': 0, 'last': 0, 'total': 0, 'through': 0, 'picked': 0}
+    for (at, rows), line in zip(asked, lines):
+        state = json.loads(line)
+        state['states'].pop('m.rows')
+        if at == len(rows):
+            assert state['fault'] != 'none' and state['states'] == kept, (at, rows, state)
+            failed += 1
+            continue
+        a, b = rows[at]
+        kept = {'first': rows[0][0], 'last': rows[-1][1], 'total': sum(r[0] * (k + 1) for k, r in enumerate(rows)),
+                'through': a + b, 'picked': a * 1000 + b}
+        assert state['fault'] == 'none' and state['states'] == kept, (at, rows, state)
+    assert failed > 0
     return events
 
 
@@ -2869,6 +2926,7 @@ def main():
         report['bare_lists'] = bare_lists(aup, pure_run, work)
         report['bytes_compared'] = bytes_compared(aup, pure_run, work)
         report['inner_lists'] = inner_lists(aup, pure_run, work)
+        report['rows_at'] = rows_at(aup, pure_run, work)
         report['bytes_state'] = bytes_state(aup, pure_run, work)
         report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
         report['documents'] = documents_model(aup, pure_run, work, range(4))

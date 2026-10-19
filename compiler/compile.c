@@ -3738,6 +3738,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         return field_value(r, field);
     }
     case E_INDEX: {
+        int given = e->count == 2 ? rows_list(c, e->args[0]) : -1;
+        if (given >= 0) { /* a message's rows' item at a position: read where they are, not from a copy of them */
+            item_of(c, e->args[1], handler, height, given);
+            return item_value(c, e, given);
+        }
         Kind base = value(c, e->args[0], handler, height);
         if (base.type == LIST && e->count == 2) { /* a list value's item at a position */
             int reg = bind_list(c, e, base);
