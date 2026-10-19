@@ -83,6 +83,11 @@ DIAGNOSTICS = [
     ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
      '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
     ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
+    # Bytes alone as a state (Pure 028): read and set whole, no cursor in it, no text set from it.
+    ('state data: bytes\nstate at: cursor in data\n', '2:7', "a cursor moves in a text state; 'data' is not one"),
+    ('state data: bytes\ninput k = key KeyK\non k.down {\n  data.insert(data.start, "x")\n}\n', '4:3',
+     "'data' is a bytes state: it is read and set whole, no cursor in it"),
+    ('state data: bytes\nstate t: text\ninput k = key KeyK\non k.down {\n  t = data\n}\n', '5:7', 'expected text, not bytes'),
     # Lets' lists in inner blocks and xs = [...] (after 140's inflate): a stored list is not given elements so.
     ('record R {\n  v = 0\n}\nstate rs: list of R\non frame {\n  rs = []\n}\n', '6:3',
      "a list changes by append, insert, remove, rs[index].field = value and (a let's) rs = [...]"),
@@ -664,6 +669,22 @@ view inner {
   }
   return t
 }
+'''
+
+BYTES_STATE = '''state data: bytes
+state n = 0
+input add = message { d: bytes }
+input cut = message { k: u32 }
+on add {
+  data = data + add.d
+  n = data.bytes
+}
+on cut {
+  require cut.k <= data.bytes
+  data = data[0 .. cut.k]
+  n = data.bytes
+}
+view whole = data
 '''
 
 ACCEPTED = [
@@ -1581,6 +1602,53 @@ def nested_values(aup, pure_run, work):
     return {'events': 3}
 
 
+
+
+def bytes_state(aup, pure_run, work, steps=300):
+    """Bytes alone as a state (Pure 028): random bytes (0x00 and 0xff among them) added and cut, the app started again
+    from its store every so often, each step's state and view against Python's; then the same name as a text: a start
+    from the store and a replace while running keep bytes that are UTF-8 and start anew from bytes that are not, and
+    going back to bytes finds what the text held."""
+    import random
+    import struct
+    path = work / 'bytes_state.pmod'
+    (work / 'bytes_state.aup').write_text(BYTES_STATE)
+    compile_module(aup, work / 'bytes_state.aup', path)
+    text_path = work / 'bytes_as_text.pmod'
+    (work / 'bytes_as_text.aup').write_text('state data: text\nstate n = 0\nview whole = data\n')
+    compile_module(aup, work / 'bytes_as_text.aup', text_path)
+    rng = random.Random(28)
+    store, model, starts = work / 'bytes-store', b'', 0
+    for segment in range(steps // 20):
+        commands, wanted = '', []
+        for _ in range(20):
+            if rng.random() < 0.7:
+                d = bytes(rng.choice(b'a\x00\xff\xc3\xa9') for _ in range(rng.randrange(0, 5)))
+                commands += f"message add {d.hex() or '-'}\n"
+                model += d
+                wanted.append((model, 'none'))
+            else:
+                k = rng.randrange(0, len(model) + 3)
+                commands += f"message cut {struct.pack('<I', k).hex()}\n"
+                if k <= len(model): model = model[:k]
+                wanted.append((model, 'none' if k <= len(model) or k == len(model) else 'limit'))
+        lines = run(pure_run, path, '--store', store, stdin=commands, check=False).stdout.splitlines()
+        starts += 1
+        assert len(lines) == len(wanted), (segment, len(lines))
+        for (data, _), line in zip(wanted, lines):
+            state = json.loads(line)
+            assert state['states']['data'] == data.hex() == state['views']['whole'] and state['states']['n'] == len(data), (data, state)
+    # The same name as a text, from the store: UTF-8 bytes kept, others anew (the values record says it was bytes).
+    for given in (b'ok \xc3\xa9', b'no \xff'):
+        store = work / f'bytes-store-{given[0]:02x}'
+        run(pure_run, path, '--store', store, stdin=f"message add {given.hex()}\n")
+        shown = json.loads(run(pure_run, text_path, '--store', store, stdin='show\n').stdout.splitlines()[-1])
+        assert shown['states']['data'] == (given.decode() if given[0] == 0x6f else ''), shown
+        back = json.loads(run(pure_run, path, '--store', store, stdin='show\n').stdout.splitlines()[-1])
+        assert back['states']['data'] == (given.hex() if given[0] == 0x6f else ''), back  # what the text held, stored
+        replaced = json.loads(run(pure_run, path, stdin=f"message add {given.hex()}\nreplace {text_path}\nshow\n").stdout.splitlines()[-1])
+        assert replaced['states']['data'] == (given.decode() if given[0] == 0x6f else ''), replaced
+    return {'steps': steps, 'starts': starts}
 
 
 def inner_lists(aup, pure_run, work, events=100):
@@ -2801,6 +2869,7 @@ def main():
         report['bare_lists'] = bare_lists(aup, pure_run, work)
         report['bytes_compared'] = bytes_compared(aup, pure_run, work)
         report['inner_lists'] = inner_lists(aup, pure_run, work)
+        report['bytes_state'] = bytes_state(aup, pure_run, work)
         report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
         report['documents'] = documents_model(aup, pure_run, work, range(4))
     print(json.dumps(report))

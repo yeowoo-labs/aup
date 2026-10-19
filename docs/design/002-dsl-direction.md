@@ -956,3 +956,25 @@ ys = [4, 5]                                    # let의 리스트를 비우고 �
 - 검증: `inner_lists`가 for의 블록, 키 있는 리스트, fn의 for, 보기의 본문에 둔 let 리스트와 `xs = [...]`, `xs = []`를 무작위 100
   사건으로 파이썬과 견준다. 진단 하나가 바뀌었다(블록 밖에서 그 리스트를 읽으면 `unknown state`). 그 전에 컴파일되던 소스 60개의
   모듈은 바이트까지 같다.
+
+### 바이트 하나인 상태 (Pure 028)
+
+```text
+state pending: bytes                           # 빈 바이트로 시작한다. state x: bytes = "..."는 그 문자열의 UTF-8로
+input packet = message { data: bytes }
+on packet {
+  pending = pending + packet.data              # 읽기는 바이트 값, 쓰기는 통째로
+  require pending.bytes < 65536
+}
+view left = pending                            # 바이트 보기
+```
+
+- **뜻.** text 상태처럼 담고 저장하지만 UTF-8을 묻지 않는다. 이름은 바이트 값으로 읽힌다(`.bytes`, `[i]`, `[a .. b]`, 비교,
+  잇기). `x = …`가 바이트를 쓴다. 문자열은 바이트를 만나므로 `x = "ok"`도 된다.
+- **커서가 없다.** `cursor in x`, `mark in x`, `x.insert(…)`, `x.start`는 진단이 나온다. text에 바이트를 넣지도 않는다(`text(b)`로
+  옮긴다).
+- **이름이 같은 text와 바이트.** 교체와 저장소의 시작에서 정확할 때만 옮긴다: text는 언제나 바이트가 되고, 바이트는 UTF-8일 때만
+  text가 된다(아니면 초기값). Pure의 `values` 기록이 바이트 상태를 적어 손상과 옮김을 가른다.
+- 검증: `bytes_state`가 0x00과 0xff가 든 무작위 바이트를 붙이고 자르며 300걸음을 저장소로 15번 다시 시작하며 파이썬과 견준다. 같은
+  이름의 text로 저장소에서 시작하고 실행 중에 교체해, UTF-8인 바이트는 남고 아닌 것은 새로 시작하며, 바이트로 돌아오면 text가 가졌던
+  것을 찾는다. 진단 셋(커서, insert, text에 바이트).

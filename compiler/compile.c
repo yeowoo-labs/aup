@@ -222,6 +222,7 @@ typedef struct {
     int state_types[STATES], state_line[STATES], state_column[STATES];
     bool state_stays[STATES]; /* a mark: a cursor that stays before text inserted at it */
     bool state_transient[STATES]; /* held while the app runs, never stored (Pure 018) */
+    bool state_bytes[STATES];     /* a text state of bytes: read and set whole, UTF-8 asked of none (Pure 028) */
     int state_rows[STATES];   /* a list of a message's rows: its input + 1, or 0 */
     bool state_event[STATES]; /* a let's list (let.NAME): its handlers' alone, found only by its let */
     /* Lists the code makes (Pure 027's 2b): a register (bound: Pure's LIST_BIND gives it a list in a record to read) or
@@ -1572,7 +1573,7 @@ static const char *declared_kind(const Compiler *c, const char *name) {
     if (used_library(c, c->module, name) >= 0) return "a library";
     if (c->module) return library_record(c, c->module, name) >= 0 ? "a record" : NULL; /* fns, records and uses */
     int state = state_index(c, name);
-    if (state >= 0) return states[c->state_types[state]];
+    if (state >= 0) return c->state_types[state] == STATE_TEXT && c->state_bytes[state] ? "a bytes state" : states[c->state_types[state]];
     if (record_index(c, name) >= 0) return "a record";
     int input = input_index(c, name);
     if (input >= 0) return c->inputs[input].kind == KIND_KEY ? "a key input" :
@@ -1877,8 +1878,15 @@ static void state_declaration(Compiler *c, bool transient) {
     c->state_column[index] = name.column;
     if (is(c, ":")) {
         take(c);
-        Token type = expect_name(c, "text, i64, cursor, mark, list or index");
-        if (!strcmp(type.text, "i64")) { /* state n: i64 = 0: exact, whole */
+        Token type = expect_name(c, "text, bytes, i64, cursor, mark, list or index");
+        if (!strcmp(type.text, "bytes")) { /* state data: bytes: held as a text is, read and set whole (Pure 028) */
+            c->state_types[index] = STATE_TEXT;
+            c->state_bytes[index] = true;
+            if (is(c, "=")) {
+                take(c);
+                c->state_text[index] = plain_string(c, "a bytes state");
+            }
+        } else if (!strcmp(type.text, "i64")) { /* state n: i64 = 0: exact, whole */
             c->state_types[index] = STATE_I64;
             if (is(c, "=")) {
                 take(c);
@@ -2309,6 +2317,8 @@ static uint32_t constant(Compiler *c, const Expr *e) {
 
 static int text_state(Compiler *c, const char *name, int line, int column) {
     int index = state_index(c, name);
+    if (index >= 0 && c->state_types[index] == STATE_TEXT && c->state_bytes[index])
+        fail_at(c, line, column, "'%s' is a bytes state: it is read and set whole, no cursor in it", name);
     if (index < 0 || c->state_types[index] != STATE_TEXT) {
         const char *kind = declared_kind(c, name);
         if (kind) fail_at(c, line, column, "'%s' is %s, not a text state", name, kind);
@@ -3445,6 +3455,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             static const uint8_t loads[] = {LOAD, TEXT_LOAD, CUR_LOAD, 0, INDEX_LOAD, LOAD, LOAD};
             static const Type types[] = {NUM, TEXT, CURSOR, 0, INDEX, BOOL, I64};
             emit(c, e->line, e->column, loads[type], (uint32_t)index, 0);
+            if (type == STATE_TEXT && c->state_bytes[index]) return (Kind){BYTES, -1}; /* a bytes state's value (Pure 028) */
             return (Kind){types[type], type == STATE_CURSOR || type == STATE_INDEX ? cursor_owner(c, index) : -1};
         }
         int input = input_index(c, e->name);
@@ -4744,7 +4755,8 @@ static void statements(Compiler *c, const Stmt *s) {
                 index_of(c, s->value, c->handling, 0, cursor_owner(c, index));
                 emit(c, s->line, s->column, INDEX_STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_TEXT) {
-                expect_kind(c, s->value, value(c, s->value, c->handling, 0), TEXT);
+                Type type = c->state_bytes[index] ? BYTES : TEXT;
+                expect_kind(c, s->value, meeting(c, s->value, c->handling, 0, type), type);
                 emit(c, s->line, s->column, TEXT_SET, (uint32_t)index, 0);
             } else {
                 int owner = cursor_owner(c, index);
@@ -5089,7 +5101,7 @@ static bool text_path(Compiler *c, const char *path) {
     int param = parameter(c, path), local = c->scope ? -1 : local_named(c, path), state = c->module ? -1 : state_index(c, path);
     if (param >= 0) return c->scope->kinds[param].type == TEXT;
     if (local >= 0) return c->locals[local].kind.type == TEXT;
-    return state >= 0 && c->state_types[state] == STATE_TEXT;
+    return state >= 0 && c->state_types[state] == STATE_TEXT && !c->state_bytes[state];
 }
 
 /* for ch in t: t held by a name of its own, then a count whose block begins if at >= end { break }, takes the character
@@ -5436,7 +5448,7 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         } else if (c->state_types[i] == STATE_CURSOR || c->state_types[i] == STATE_INDEX) {
             bool cursor = c->state_types[i] == STATE_CURSOR;
             int target = state_index(c, c->state_target[i]);
-            if (target < 0 || c->state_types[target] != (cursor ? STATE_TEXT : STATE_LIST))
+            if (target < 0 || c->state_types[target] != (cursor ? STATE_TEXT : STATE_LIST) || (cursor && c->state_bytes[target]))
                 fail_at(c, c->state_line[i], c->state_column[i], cursor ? "a cursor moves in a text state; '%s' is not one" :
                         "an index points into a list state; '%s' is not one", c->state_target[i]);
             state_ref[i] = (uint32_t)target;
@@ -5693,7 +5705,8 @@ static void generate(Compiler *c, unsigned char **module, size_t *size) {
         /* Pure's types in a module: a cursor and an index are its anchor (027's 4c), a bool and an i64 then 4 and 5. */
         static const uint32_t module_types[] = {[STATE_NUM] = 0, [STATE_TEXT] = 1, [STATE_CURSOR] = 2, [STATE_LIST] = 3,
                                                 [STATE_INDEX] = 2, [STATE_BOOL] = 4, [STATE_I64] = 5};
-        p = put32(p, module_types[c->state_types[i]] | (c->state_transient[i] ? STATE_TRANSIENT : 0));
+        uint32_t type = c->state_types[i] == STATE_TEXT && c->state_bytes[i] ? 6 : module_types[c->state_types[i]]; /* 6 bytes */
+        p = put32(p, type | (c->state_transient[i] ? STATE_TRANSIENT : 0));
         if (c->state_types[i] == STATE_NUM || c->state_types[i] == STATE_BOOL) p = put_double(p, c->initial[i]);
         else if (c->state_types[i] == STATE_I64) p = put64(p, (uint64_t)c->state_integer[i]);
         else { /* flags: a mark (1: the cursor stays), or a keyed list's key field + 1 */
