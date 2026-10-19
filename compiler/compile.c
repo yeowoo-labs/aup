@@ -108,7 +108,7 @@ typedef struct Expr {
 } Expr;
 
 typedef enum { S_ASSIGN, S_IF, S_REPLY, S_REQUIRE, S_INSERT, S_REMOVE, S_APPEND, S_ADD, S_SET, S_SEND, S_FOR,
-               S_LET, S_COUNT, S_BREAK, S_RETURN, S_ASSIGNS, S_LETS, S_MATCH, S_ARM, S_CALL } StmtKind;
+               S_LET, S_COUNT, S_BREAK, S_RETURN, S_ASSIGNS, S_LETS, S_MATCH, S_ARM, S_CALL, S_TOGETHER } StmtKind;
 typedef struct Stmt {
     StmtKind kind;
     int line, column;
@@ -122,7 +122,8 @@ typedef struct Stmt {
     int library, key_line, key_column;
     char key[NAME];
     /* S_ASSIGNS and S_LETS: a, b = x, y gives every name its value at once (the values first, in order): the names, and
-     * the values linked from value by next. */
+     * the values linked from value by next. S_TOGETHER: a, xs[i].x = x, y, its targets (S_ASSIGN, S_SET) from then, each
+     * with its value, or value the one call that gives them all. */
     char (*names)[NAME];
     unsigned name_count;
     int refills; /* S_LET of xs = value's copy: xs's list + 1 (its value must be a list of its record), else 0 */
@@ -1293,7 +1294,19 @@ static Stmt *together(Compiler *c, Stmt *first) {
     for (unsigned i = 0; names && i < n; ++i) memcpy(s->names[i], targets[i]->name, NAME);
     s->kind = S_ASSIGNS;
     several_values(c, s);
-    return names ? s : through_lets(c, s, targets);
+    if (names) return s;
+    s->kind = S_TOGETHER; /* compiled straight, or through lets when a value may read what a target changes */
+    unsigned count = 0;
+    for (const Expr *v = s->value; v; v = v->next) ++count;
+    for (unsigned i = 0; count == n && i < n; ++i) {
+        Expr *after = s->value->next;
+        s->value->next = NULL;
+        targets[i]->value = s->value;
+        s->value = after;
+    }
+    for (unsigned i = 0; i < n; ++i) targets[i]->next = i + 1 < n ? targets[i + 1] : NULL;
+    s->then = targets[0];
+    return s;
 }
 
 static Stmt *statement(Compiler *c, unsigned depth) {
@@ -4571,6 +4584,54 @@ static Stmt *emptied(Compiler *c, const char *name, int line, int column) {
     return loop;
 }
 
+static bool listed(const int *lists, unsigned n, int list) {
+    for (unsigned i = 0; i < n; ++i) if (lists[i] == list) return true;
+    return false;
+}
+
+/* Whether e may read what S_TOGETHER's targets change (names, of them; lists, those changed): a target's name, a fn's
+ * call (it may read anything), a parameter or a case's binding (their kinds are the instance's), or an index of a
+ * list changed (a let's, a for's item, a state's) through which a changed item is read. */
+static bool reads_changed(Compiler *c, const Expr *e, char (*names)[NAME], unsigned n, const int *lists, unsigned l) {
+    if (!e) return false;
+    if (e->kind == E_FN) return true;
+    for (unsigned i = 0; i < n; ++i)
+        if (((e->kind == E_NAME || e->kind == E_ITEM) && !strcmp(e->name, names[i])) ||
+            (e->kind == E_FOLD && !strcmp(e->member, names[i])))
+            return true;
+    if (e->kind == E_NAME || e->kind == E_ITEM) {
+        if (!c->module && (parameter(c, e->name) >= 0 || alias_named(c, e->name) >= 0)) return true;
+        if (c->module) return true;
+        int local = local_named(c, e->name), loop = local < 0 ? loop_named(c, e->name) : -1,
+            state = local < 0 && loop < 0 ? state_index(c, e->name) : -1;
+        if (local >= 0 && c->locals[local].kind.type == INDEX && listed(lists, l, c->locals[local].kind.owner)) return true;
+        if (loop >= 0 && listed(lists, l, c->loops[loop].list)) return true;
+        if (state >= 0 && c->state_types[state] == STATE_INDEX && listed(lists, l, cursor_owner(c, state))) return true;
+    }
+    for (unsigned i = 0; i < PARAMS; ++i)
+        for (const Expr *x = e->args[i]; x; x = x->next)
+            if (reads_changed(c, x, names, n, lists, l)) return true;
+    return false;
+}
+
+/* S_TOGETHER's targets each given its value straight, in order: when no value reads what a target before it changes
+ * (then the values first, as written, is the same). */
+static bool straight(Compiler *c, const Stmt *s) {
+    if (s->value) return false; /* one call gives them all */
+    char (*names)[NAME] = allocate(c, STACK * sizeof(*names));
+    int lists[STACK];
+    unsigned n = 0, l = 0;
+    for (const Stmt *t = s->then; t; t = t->next) {
+        if (!t->name[0]) return false; /* at.x: the list of its index is not named */
+        memcpy(names[n++], t->name, NAME);
+        int list = local_named(c, t->name) < 0 ? state_index(c, t->name) : -1;
+        if (list >= 0 && c->state_types[list] == STATE_LIST) lists[l++] = list;
+    }
+    for (const Stmt *t = s->then; t; t = t->next)
+        if (reads_changed(c, t->value, names, n, lists, l)) return false;
+    return true;
+}
+
 /* xs = a list value (a fn's, a let's, another list's): a copy of it first (xs may be in it), then xs emptied, then
  * given the copy's items in order (added by key when xs is keyed). */
 static Stmt *refilled(Compiler *c, const Stmt *s, int list) {
@@ -4840,6 +4901,37 @@ static void statements(Compiler *c, const Stmt *s) {
             }
             (void)first;
             for (unsigned i = s->name_count; i-- > 0;) pop_named(c, local_named(c, s->names[i]), s->line, s->column);
+            break;
+        }
+        case S_TOGETHER: {
+            if (straight(c, s)) {
+                statements(c, s->then);
+                break;
+            }
+            Stmt *spread = allocate(c, sizeof(*spread)), *targets[STACK]; /* copies: a fn's body compiles for each instance */
+            *spread = *s;
+            spread->kind = S_LETS, spread->then = spread->next = NULL;
+            spread->names = allocate(c, STACK * sizeof(*spread->names));
+            Expr **link = &spread->value;
+            if (s->value) { /* one call gives them all */
+                *link = node(c, s->value->kind, s->value->line, s->value->column);
+                **link = *s->value;
+                link = &(*link)->next;
+            }
+            unsigned n = 0;
+            for (const Stmt *t = s->then; t; t = t->next) {
+                targets[n] = allocate(c, sizeof(*targets[n]));
+                *targets[n] = *t;
+                targets[n++]->next = NULL;
+                if (t->value) {
+                    *link = node(c, t->value->kind, t->value->line, t->value->column);
+                    **link = *t->value;
+                    link = &(*link)->next;
+                }
+            }
+            *link = NULL;
+            spread->name_count = n;
+            statements(c, through_lets(c, spread, targets));
             break;
         }
         case S_ASSIGNS: {

@@ -675,6 +675,8 @@ state wide: i64
 state per = 0
 state hexed = 0
 state bits: i64
+state n2 = 0
+state n3 = 0
 input tick = every 250 ms
 input go = message { k: u32 }
 input edge = message { x: i64 }
@@ -714,6 +716,11 @@ on go {
   ns.append(0)
   ns[0], ns[1] = 3, go.k
   b = b + ns[0] * 100 + ns[1]
+  let q = bs.first
+  bs[0].y, n2 = 5, q.y
+  for p in bs {
+    if p.y == 5 { bs[0].y, n3 = 6, p.y }
+  }
   let xs, ys, zs, us: list of number
   let ps, qs: list of P
   zs.append(1)
@@ -1827,7 +1834,8 @@ def rows_at(aup, pure_run, work, events=200):
 def frictions(aup, pure_run, work, events=100):
     """140's frictions written away in aup alone, no core change: lets' lists declared together (let a, b: list of R),
     each its own and empty as it begins, in inner blocks too; targets together with fields and items among them
-    (xs[i].x, xs[i].y = a, b; a, xs[i] = ...), the values first, then each target left to right as Python's; a list
+    (xs[i].x, xs[i].y = a, b; a, xs[i] = ...), the values first, then each target left to right as Python's (straight
+    when no value may read what a target changes; an index or a for's item of a changed list is read first); a list
     given a list value whole (xs = f(x), xs = ys, xs = xs, xs = [] for a list state too, xs, j = f(x)), added by key
     when keyed; abs(x) of a number and an i64 (x once); a timer's period (tick.period); 0x... a number where a number
     goes (compared with one, in its arithmetic, given to one), an i64 elsewhere. Each event against Python's."""
@@ -1856,9 +1864,12 @@ def frictions(aup, pure_run, work, events=100):
         ns = [0, 0]
         ns[0], ns[1] = 3, k
         b = b + ns[0] * 100 + ns[1]
+        n2, bs[0]['y'] = bs[0]['y'], 5  # q is bs's first: its y read before the item changes
+        for p in bs:
+            if p['y'] == 5: n3, bs[0]['y'] = p['y'], 6
         want = {'total': sum(range(k)) * (1 + 200 + 10000), 'n': n, 'bs': bs, 'a': a, 'b': b, 'i': i, 'kept': kept,
                 'keyed': keyed, 'j': k + 100, 'far': abs(k - 4.5), 'wide': abs(k - 4), 'per': 250,
-                'hexed': (k == 2) + 10 * (k == 3) + min(k, 5) * 100 + 16, 'bits': (k | 0xf0) & 0xff}
+                'hexed': (k == 2) + 10 * (k == 3) + min(k, 5) * 100 + 16, 'bits': (k | 0xf0) & 0xff, 'n2': n2, 'n3': n3}
         assert state['fault'] == 'none' and {key: state['states'][key] for key in want} == want, (k, state['states'])
     edges = ''.join(f"message edge {struct.pack('<q', x).hex()}\n" for x in (-2 ** 63 + 1, -2 ** 63))
     first, second = (json.loads(line) for line in run(pure_run, path, stdin=edges, check=False).stdout.splitlines())
