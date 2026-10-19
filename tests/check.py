@@ -83,6 +83,11 @@ DIAGNOSTICS = [
     ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
      '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
     ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
+    # Lists bare as values (after 140's inflate and HTTP): a list value (a parameter's, or what a fn gave back) is read,
+    # not changed; a stored list is not passed as one.
+    ('fn grow(xs) {\n  xs.append(1)\n  return 0\n}\nstate n = 0\non frame {\n  let ys: list of number = [1]\n  n = grow(ys)\n}\n',
+     '2:3', "'xs' is a list value (a copy, given or made): it is read"),
+    ('record R {\n  v = 0\n}\nstate rs: list of R\nfn f(xs) = xs.count\nview v = f(rs)\n', '6:12', "'rs' is a list; read rs.count"),
     # Fns that call themselves, blocks, several values, records' values and characters (Pure 027's stage 2c).
     ('fn f(n) = if n == 0 { 0 } else { f(n - 1) + 1 }\nstate x = 0\non frame {\n  x = f(3)\n}\n', '1:34',
      "fn 'f' calls itself before a return gives its value: write its type"),
@@ -363,7 +368,7 @@ DIAGNOSTICS = [
      "an output sends no rows: 'i' has rows (rows)"),
     (ROWS + 'view v = o.rows.count\n', '10:10', "the rows of 'o' are only available in its handler"),
     (ROWS + 'on o {\n  n = o.rows\n}\n', '11:7',
-     "'o.rows' holds a message's rows: walk them (for r in o.rows) or read .count, .first or .last"),
+     'expected a number, not a list: walk it (for x in ...) or read .count, .first or .last'),
     (ROWS + 'on o {\n  for a in n {\n  }\n}\n', '11:12', "'n' is a state, not a list"),
     (ROWS + 'on o {\n  for n in xs {\n  }\n}\n', '11:7', "'n' is already declared as a state"),
     ('input o = message {\n  rows: list of Nope\n}\n', '2:17', "a list holds a record; 'Nope' is not one"),
@@ -533,6 +538,54 @@ on chars {
 on forever.down {
   ran = ran + 1
   ran = without_end(0)
+}
+'''
+
+BARE_LISTS = '''record Item {
+  v = 0
+  w = 0
+}
+state total = 0
+state odd = 0
+state even = 0
+state far = -1
+state second = -1
+state twice = 0
+state last_odd = -1
+input give = message { items: list of Item }
+
+fn sum_v(xs) = sum(x.v for x in xs)
+fn split(xs) {
+  let odds: list of Item
+  let evens: list of Item
+  for x in xs {
+    if x.v % 2 == 0 { evens.append(Item { v: x.v, w: x.w }) } else { odds.append(Item { v: x.v, w: x.w }) }
+  }
+  return odds, evens
+}
+fn farthest(xs) = max(x.v * x.v + x.w * x.w for x in xs)
+fn second_w(xs) = xs[1].w
+fn doubled(xs) {
+  let out: list of number
+  for x in xs { out.append(2 * x.v + x.w) }
+  return out
+}
+fn added(ns) {
+  let t = 0
+  for n in ns { t = t + n }
+  return t
+}
+
+on give {
+  total = sum_v(give.items)
+  let o, e = split(give.items)
+  odd = sum_v(o) * 1000 + o.count
+  even = sum_v(e) * 1000 + e.count
+  if give.items.count > 0 { far = farthest(give.items) }
+  if give.items.count > 1 { second = second_w(give.items) }
+  let d = doubled(give.items)
+  twice = added(d)
+  if o.count > 0 { last_odd = o.last.v }
 }
 '''
 
@@ -1451,6 +1504,35 @@ def nested_values(aup, pure_run, work):
     return {'events': 3}
 
 
+
+
+def bare_lists(aup, pure_run, work, events=200):
+    """Lists passed to fns and given back bare (Pure 027 after 140's inflate and HTTP): a message's rows and a let's
+    list given to fns as values (copies), fns that fold, walk and read them by position, a fn giving back two lists
+    and one giving back a list of numbers, read again by fns; each event's states against Python's."""
+    import random
+    import struct
+    path = work / 'bare_lists.pmod'
+    (work / 'bare_lists.aup').write_text(BARE_LISTS)
+    compile_module(aup, work / 'bare_lists.aup', path)
+    rng = random.Random(140)
+    asked = [[(rng.randint(-50, 50), rng.randint(-50, 50)) for _ in range(rng.randrange(0, 12))] for _ in range(events)]
+    commands = ''.join(f"message give {b''.join(struct.pack('<dd', v, w) for v, w in items).hex() or '-'}\n" for items in asked)
+    lines = run(pure_run, path, stdin=commands).stdout.splitlines()
+    model = {'far': -1, 'second': -1, 'last_odd': -1}
+    for items, line in zip(asked, lines):
+        state = json.loads(line)
+        odd, even = [i for i in items if i[0] % 2], [i for i in items if not i[0] % 2]
+        model['total'] = sum(v for v, _ in items)
+        model['odd'] = sum(v for v, _ in odd) * 1000 + len(odd)
+        model['even'] = sum(v for v, _ in even) * 1000 + len(even)
+        if items: model['far'] = max(v * v + w * w for v, w in items)
+        if len(items) > 1: model['second'] = items[1][1]
+        model['twice'] = sum(2 * v + w for v, w in items)
+        if odd: model['last_odd'] = odd[-1][0]
+        assert state['fault'] == 'none' and {k: state['states'][k] for k in model} == model, (items, state['states'])
+    assert len(lines) == events
+    return events
 
 
 def functions(aup, pure_run, work, trees=40, texts=60):
@@ -2592,6 +2674,7 @@ def main():
         report['formats_and_texts'] = formats_and_texts(aup, pure_run, work)
         report['nested_values'] = nested_values(aup, pure_run, work)
         report['functions'] = functions(aup, pure_run, work)
+        report['bare_lists'] = bare_lists(aup, pure_run, work)
         report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
         report['documents'] = documents_model(aup, pure_run, work, range(4))
     print(json.dumps(report))

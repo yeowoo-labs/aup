@@ -2320,6 +2320,9 @@ static int text_state(Compiler *c, const char *name, int line, int column) {
 static int cursor_owner(const Compiler *c, int cursor) { return state_index(c, c->state_target[cursor]); }
 
 /* The list state name[...] indexes (where: the index, or NULL). */
+static int local_named(const Compiler *c, const char *name);
+static int parameter(const Compiler *c, const char *name);
+
 static int list_state(Compiler *c, const char *name, int line, int column, const Expr *where) {
     int index = state_index(c, name);
     if (index >= 0 && c->state_types[index] == STATE_LIST) {
@@ -2328,6 +2331,10 @@ static int list_state(Compiler *c, const char *name, int line, int column, const
         return index;
     }
     (void)where;
+    int local = local_named(c, name);
+    if (parameter(c, name) >= 0 || (local >= 0 && c->locals[local].kind.type == LIST))
+        fail_at(c, line, column, "'%s' is a list value (a copy, given or made): it is read by for, a fold, [i], .count, .first "
+                "and .last, not changed; changes go to a let's list", name);
     const char *kind = declared_kind(c, name);
     if (kind) fail_at(c, line, column, "'%s' is %s, not a list", name, kind);
     fail_at(c, line, column, "unknown list '%s'", name);
@@ -2377,6 +2384,9 @@ static void expect_kind(Compiler *c, const Expr *e, Kind actual, Type type) {
     const char *name = e->kind == E_MEMBER ? e->member : e->name;
     if (actual.type != type && actual.type == RECORD && c->records[actual.owner].variant && *name)
         fail_at(c, e->line, e->column, "'%s' holds a variant: match it, as in match %s { ... }", name, name);
+    if (actual.type == LIST && type != LIST)
+        fail_at(c, e->line, e->column, "expected %s, not a list: walk it (for x in ...) or read .count, .first or .last",
+                type_name(type));
     if (actual.type != type) fail_at(c, e->line, e->column, "expected %s, not %s", type_name(type), type_name(actual.type));
 }
 
@@ -2736,6 +2746,7 @@ static int hidden_list(Compiler *c, int record, bool bound, int line, int column
 
 static Kind value(Compiler *c, const Expr *e, bool handler, int height);
 static int walked_list(Compiler *c, const char *path, int line, int column);
+static int walked_list_at(Compiler *c, const char *path, int line, int column, int height);
 static void item_of(Compiler *c, const Expr *e, bool handler, int height, int list);
 static Kind item_value(Compiler *c, const Expr *e, int list);
 static int local_named(const Compiler *c, const char *name);
@@ -3407,6 +3418,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         int index = state_index(c, e->name);
         if (index >= 0) {
             int type = c->state_types[index];
+            if (type == STATE_LIST && c->state_event[index] && !c->state_hidden[index]) {
+                /* a let's list as a value (a copy of its items): to a fn, a return, a let or a field */
+                emit(c, e->line, e->column, LIST_VALUE, (uint32_t)index, 0);
+                return (Kind){LIST, module_record(c, c->state_library[index], c->state_target[index])};
+            }
             if (type == STATE_LIST)
                 fail_at(c, e->line, e->column, "'%s' is a list; read %s.count or a field, as in %s[index].field",
                         e->name, e->name, e->name);
@@ -3500,9 +3516,11 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (library >= 0) return inline_fn(c, e, library, e->member, handler, height); /* library.constant */
         int message;
         char path[NAME];
-        if (rows_list(c, e) >= 0)
-            fail_at(c, e->line, e->column, "'%s' holds a message's rows: walk them (for r in %s) or read .count, .first or .last",
-                    c->state_names[rows_list(c, e)], c->state_names[rows_list(c, e)]);
+        int given = rows_list(c, e);
+        if (given >= 0) { /* a message's rows as a value (a copy of them): to a fn, a return, a let or a field */
+            emit(c, e->line, e->column, LIST_VALUE, (uint32_t)given, 0);
+            return (Kind){LIST, module_record(c, c->state_library[given], c->state_target[given])};
+        }
         if (message_path(c, e, &message, path)) {
             const Input *in = &c->inputs[message];
             if (message != c->message)
@@ -3662,8 +3680,13 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             return value(c, &at, handler, height);
         }
         if (e->count == 2) fail_at(c, e->line, e->column, "a list's slice goes in a for or a fold, as in for x in %s[a .. b]", e->name);
-        app_name(c, e, e->name);
-        int list = list_state(c, e->name, e->line, e->column, e->args[0]);
+        int local = c->module ? -1 : local_named(c, e->name), list;
+        if (!c->module && (parameter(c, e->name) >= 0 || (local >= 0 && c->locals[local].kind.type == LIST)))
+            list = walked_list_at(c, e->name, e->line, e->column, height); /* a list value, bound to be read */
+        else {
+            app_name(c, e, e->name);
+            list = list_state(c, e->name, e->line, e->column, e->args[0]);
+        }
         const Record *r = record_of(c, list);
         if (!*e->member && r->scalar) { /* xs[i]: the value at a position (or a key) */
             item_of(c, e->args[0], handler, height, list);
@@ -3755,7 +3778,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     case E_FOLD: {
         /* The block after FOLD runs once per item, as a column of the list: it
          * starts with an empty stack and reads only its item and states. */
-        int list = walked_list(c, e->member, e->line, e->column); /* a message's rows in its handler, a list value bound */
+        int list = walked_list_at(c, e->member, e->line, e->column, height); /* rows in its handler, a list value bound */
         if (c->folding) fail_at(c, e->line, e->column, "a count, sum, max or min cannot hold another");
         if (c->filtering) fail_at(c, e->line, e->column, "a table's where cannot hold a count, sum, max or min");
         bool sliced = e->args[2] != NULL;
@@ -4287,15 +4310,20 @@ static void view_changes(Compiler *c, const Stmt *s, int list, const char *name)
 
 /* The list a for or a fold walks, written as its name (a list, a message's rows, a let's) or as a path to a list
  * value (item.items, a match's binding): a value is bound to a register first. */
-static int walked_list(Compiler *c, const char *path, int line, int column) {
+static int walked_list_at(Compiler *c, const char *path, int line, int column, int height) {
     int named = state_index(c, path), local = strchr(path, '.') ? -1 : local_named(c, path);
     if (named >= 0 || (c->module == 0 && strchr(path, '.') == NULL && alias_named(c, path) < 0 && loop_named(c, path) < 0 &&
-                       (local < 0 || c->locals[local].kind.type != LIST)))
+                       parameter(c, path) < 0 && (local < 0 || c->locals[local].kind.type != LIST)))
         return list_state(c, path, line, column, NULL);
     Expr *e = path_expr(c, path, line, column);
-    Kind kind = value(c, e, c->handling, 0);
+    Kind kind = value(c, e, c->handling, height);
     if (kind.type != LIST) fail_at(c, line, column, "'%s' is not a list", path);
     return bind_list(c, e, kind);
+}
+
+/* The list a for walks or a fold folds, its path read with an empty stack below it. */
+static int walked_list(Compiler *c, const char *path, int line, int column) {
+    return walked_list_at(c, path, line, column, 0);
 }
 
 /* A slot for a let of bytes or text (Pure's: 0-15 bytes, 16-31 texts), the handler's next. */

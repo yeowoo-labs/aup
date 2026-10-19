@@ -889,3 +889,31 @@ on edit {
 언어는 그대로다(`cursor in note`, `mark in note`, `index of tasks`). Pure의 모듈에서는 커서와 인덱스가 앵커 하나다: 상태 종류 2가
 text나 리스트 안의 자리이고, 명령 일곱(LOAD, STORE, START, END, MOVE, COUNT, AT)이 그 둘의 열셋을 대신한다. aup는 MOVE와
 COUNT에 커서가 든 text나 인덱스가 든 리스트를 적어 낸다. Pure의 줄 수가 0부터이므로 `at.line`은 1을 더해 내보낸다.
+
+### 맨 리스트를 값으로 (Pure 140의 inflate와 HTTP 뒤)
+
+```text
+fn total(xs) = sum(x.v for x in xs)            # 리스트를 받는 fn: 걷기, 접기, xs[i], .count, .first, .last로 읽는다
+fn split(xs) {
+  let odds: list of Item
+  let evens: list of Item
+  for x in xs { if x.v % 2 == 0 { evens.append(x) } else { odds.append(x) } }
+  return odds, evens                           # 리스트를 돌려주는 fn: 그 값(항목의 복사)이 결과다
+}
+on give {
+  let o, e = split(give.items)                 # 메시지의 행도, let의 리스트도 값으로 넘어간다
+  n = total(o) + total(e)
+}
+```
+
+- **값.** let의 리스트나 메시지의 행을 그 이름으로 쓰면 리스트 값이 된다(Pure의 LIST_VALUE: 항목의 복사). fn의 인자, `return`, let,
+  레코드의 리스트 필드에 그렇게 준다. 이미 값인 리스트(매개변수, fn이 돌려준 것을 담은 let, 레코드의 리스트 필드)는 복사하지 않고
+  번호로 옮겨진다.
+- **읽기만.** 리스트 값은 레지스터에 묶여 읽힌다(LIST_BIND). 바꾸려 하면 진단이 나온다: "a list value ... is read ..., not changed;
+  changes go to a let's list".
+- **저장되는 리스트는 값이 아니다.** 상태의 리스트를 fn에 넘기면 지금처럼 거절한다(Pure의 LIST_VALUE는 이벤트의 리스트만 받는다).
+- **비용.** let의 리스트를 넘길 때마다 그 항목을 복사한다. 자주 부르는 fn에는 한 번 값으로 만든 것(`let t = table(xs)`)을 넘긴다.
+  복사 없이 나누는 길은 Pure의 일로 남는다.
+- 검증: `bare_lists`가 무작위 리스트 200개를 행으로 받아 리스트를 받는 fn, 두 리스트를 돌려주는 fn, 수의 리스트를 돌려주는 fn을
+  지나게 하고 파이썬과 견준다. 진단 둘(리스트 값을 바꾸기, 저장되는 리스트를 넘기기). 그 전에 컴파일되던 aup 소스 60개의 모듈은
+  바이트까지 같다.
