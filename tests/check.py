@@ -2515,6 +2515,42 @@ def main():
         final = json.loads(lines[-1])
         assert final['states'] == {'bonus': 7, 'count': 9} and final['views'] == {'doubled': 18}, final
         report['replace_keeps_states_by_name'] = True
+        # A number, a bool and an i64 carry over each other when exact (Pure 027's 5d), else take the new default: on a
+        # replace and on a start from a store the old module wrote, its states and a stored list's fields alike.
+        kinds = ('record Row {\n  a@A\n}\nstate x@X\nstate y@Y\nstate w@W\nstate v@V\nstate rows: list of Row\n'
+                 'input set = message {\n  x: number\n  y: number\n  w: i64\n  v: i64\n}\ninput add = message { a: number }\n'
+                 'on set {\n  x = set.x\n  y = set.y\n  w = set.w\n  v = set.v\n}\non add { rows.append(Row { a: add.a }) }\n'
+                 'view cells = each r in rows {\n  a = r.a\n}\n')
+        before = {'A': ' = 0', 'X': ' = 0', 'Y': ' = 0', 'W': ': i64', 'V': ': i64'}
+        after = {'A': ': i64 = 9', 'X': ': i64 = -1', 'Y': ': i64 = -2', 'W': ' = 3', 'V': ' = false'}
+        for name, types in (('kinds-before', before), ('kinds-after', after)):
+            source = kinds
+            for mark, written in types.items():
+                source = source.replace('@' + mark, written)
+            if name == 'kinds-after':  # its handlers would not type: the states alone, and the view
+                source = source.split('input set')[0] + 'view cells = each r in rows {\n  a = r.a\n}\n'
+            (work / f'{name}.aup').write_text(source)
+            compile_module(aup, work / f'{name}.aup', work / f'{name}.pmod')
+        given = f"message set {struct.pack('<ddqq', 5, 2.5, 7, 2 ** 53 + 1).hex()}\n"
+        given += ''.join(f"message add {struct.pack('<d', a).hex()}\n" for a in (3, 2.5, -0.0, 1e300))
+        wanted = ({'x': 5, 'y': -2, 'w': 7, 'v': False}, [3, 9, 0, 9])
+
+        def seen(line):
+            shown = json.loads(line)
+            return ({k: shown['states'][k] for k in 'xywv'}, [row['a'] for row in shown['views']['cells']])
+
+        replaced = run(pure_run, work / 'kinds-before.pmod', stdin=given + f"replace {work / 'kinds-after.pmod'}\nshow\n")
+        assert seen(replaced.stdout.splitlines()[-1]) == wanted, replaced.stdout.splitlines()[-1]
+        store = work / 'kinds-store'
+        run(pure_run, work / 'kinds-before.pmod', '--store', store, stdin=given)
+        for _ in range(2):  # moved at the start, then stored as moved
+            started = run(pure_run, work / 'kinds-after.pmod', '--store', store, stdin='show\n')
+            assert seen(started.stdout.splitlines()[-1]) == wanted, started.stdout.splitlines()[-1]
+        back = run(pure_run, work / 'kinds-before.pmod', '--store', store, stdin='show\n')
+        assert seen(back.stdout.splitlines()[-1]) == ({'x': 5, 'y': -2, 'w': 7, 'v': 0}, [3, 9, 0, 9]), back.stdout
+        assert json.loads(started.stdout.splitlines()[-1])['states']['v'] is False
+        assert json.loads(back.stdout.splitlines()[-1])['states']['v'] is not False  # the bool's false, an i64's 0
+        report['number_kinds_carried'] = 3
         accepted_damaged, over_limit = properties(aup, pure_run, work, args.generated)
         report['generated_programs_verified'] = args.generated - over_limit
         report['generated_programs_over_instruction_limit'] = over_limit
