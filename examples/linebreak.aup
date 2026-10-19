@@ -59,7 +59,7 @@ fn next_unit(t, i) {
   return j
 }
 
-fn aksara(t, u) = t.eff[u] == AK || t.eff[u] == AS || t.codes[u] == 9676   # U+25CC
+fn aksara(t, u) = t.eff[u] == AK || t.eff[u] == AS || t.codes[u] == 0x25CC
 fn pi(t, k) = ranges[t.at[k]].pi
 fn pf(t, k) = ranges[t.at[k]].pf
 fn east(t, k) = ranges[t.at[k]].east
@@ -111,7 +111,7 @@ fn decide(t, i) {
   }
   if A == QU && (!east(t, i) || unit == 0 || !east(t, t.start[unit - 1])) { return NONE }
   if B == CB || A == CB { return ALLOWED }                                            # LB20
-  if (A == HY || base == 8208) && B == AL {                                           # LB20a (U+2010)
+  if (A == HY || base == 0x2010) && B == AL {                                         # LB20a
     let w = if unit > 0 { t.eff[unit - 1] } else { SP }
     if end(w) || w == SP || w == ZW || w == CB || w == GL { return NONE }
   }
@@ -139,7 +139,7 @@ fn decide(t, i) {
   if (A == AL || A == HL) && (B == AL || B == HL) { return NONE }                     # LB28
   if A == AP && aksara(t, i) { return NONE }                                          # LB28a
   if aksara(t, unit) && (B == VF || B == VI) { return NONE }
-  if A == VI && unit > 0 && aksara(t, t.start[unit - 1]) && (B == AK || t.codes[i] == 9676) { return NONE }
+  if A == VI && unit > 0 && aksara(t, t.start[unit - 1]) && (B == AK || t.codes[i] == 0x25CC) { return NONE }
   if aksara(t, unit) && aksara(t, i) {
     let j = next_unit(t, i)
     if j < n && t.eff[j] == VF { return NONE }
@@ -153,15 +153,8 @@ fn decide(t, i) {
 }
 
 on line {
-  let codes: list of number
-  let cls: list of number
-  let eff: list of number
-  let start: list of number
-  let nonspace: list of number
-  let ri: list of number
-  let at: list of number
-  let joined: list of bool
-  let numeric: list of bool
+  let codes, cls, eff, start, nonspace, ri, at: list of number
+  let joined, numeric: list of bool
   for p in line.points {
     let i = codes.count
     let r = range(p.code)

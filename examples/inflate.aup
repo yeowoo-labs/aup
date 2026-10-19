@@ -67,8 +67,7 @@ on inflate {
       at = (b + 4 + size) * 8
     } else {
       require kind != 3
-      let lengths: list of number
-      let distances: list of number
+      let lengths, distances: list of number
       if kind == 1 {
         for s in 0 .. 288 { lengths.append(if s < 144 { 8 } else if s < 256 { 9 } else if s < 280 { 7 } else { 8 }) }
         for s in 0 .. 30 { distances.append(5) }

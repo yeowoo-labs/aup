@@ -124,10 +124,8 @@ fn request(d) -> Request, number {
       for k in semi .. c { require d[k] != 10 }
       require n <= 2147483648                    # 2^31 at most: ours, not h11's
       if n == 0 {
-        let t, after = fields(d, c + 2)
-        if after < 0 { return Request {}, -1 }
-        for f in t { trailers.append(f) }
-        j = after
+        trailers, j = fields(d, c + 2)
+        if j < 0 { return Request {}, -1 }
         more = false
       } else {
         if d.bytes < c + 4 + n { return Request {}, -1 }

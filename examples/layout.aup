@@ -33,10 +33,9 @@ fn START = 0; fn END = 1; fn CENTER = 2; fn BETWEEN = 3; fn AROUND = 4; fn EVENL
 fn factor(e, growing, base, pad) = if growing { e.grow } else { (base - pad) * e.shrink }
 
 on tree {
-  while boxes.count > 0 { boxes.remove(boxes.last) }
+  boxes = []
   for d in tree.nodes { boxes.append(Box {}) }
-  boxes[0].w = tree.nodes[0].w
-  boxes[0].h = tree.nodes[0].h
+  boxes[0].w, boxes[0].h = tree.nodes[0].w, tree.nodes[0].h
   for i in 0 .. tree.nodes.count {
     let d = tree.nodes[i]
     let kids: list of number
@@ -47,10 +46,7 @@ on tree {
     if n > 0 {
       let inner = (if d.column { boxes[i].h } else { boxes[i].w }) - (if d.column { d.top + d.bottom } else { d.left + d.right })
       let line = max((if d.column { boxes[i].w } else { boxes[i].h }) - (if d.column { d.left + d.right } else { d.top + d.bottom }), 0)
-      let pads: list of number                   # each item's padding on the main axis, and on the cross
-      let crosses: list of number
-      let bases: list of number
-      let sizes: list of number
+      let pads, crosses, bases, sizes: list of number   # each item's padding on the main axis and on the cross, ...
       let frozen: list of bool
       let total = 0
       for k in kids {
@@ -113,10 +109,8 @@ on tree {
         require own >= 0 || d.align == STRETCH  # an auto cross size not stretched would be sized by its content
         let across = max(if own < 0 { line } else { own }, crosses[x])
         let offset = if d.align == END { line - across } else if d.align == CENTER { (line - across) / 2 } else { 0 }
-        boxes[k].x = if d.column { d.left + offset } else { at }
-        boxes[k].y = if d.column { at } else { d.top + offset }
-        boxes[k].w = if d.column { across } else { sizes[x] }
-        boxes[k].h = if d.column { sizes[x] } else { across }
+        if d.column { boxes[k].x, boxes[k].y, boxes[k].w, boxes[k].h = d.left + offset, at, across, sizes[x] }
+        else { boxes[k].x, boxes[k].y, boxes[k].w, boxes[k].h = at, d.top + offset, sizes[x], across }
         at = at + sizes[x]
       }
     }

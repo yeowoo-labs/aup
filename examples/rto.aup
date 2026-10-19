@@ -23,7 +23,7 @@ input transmit = message { seq: u32 }
 input ack = message { seq: u32 }
 input tick = every 10 ms
 
-fn LOWEST = 1000; fn HIGHEST = 60000; fn PERIOD = 10   # milliseconds; the clock's granularity G is the tick's period
+fn LOWEST = 1000; fn HIGHEST = 60000                    # milliseconds
 
 on transmit {
   outstanding.append(Segment { seq: transmit.seq, sent: now })
@@ -46,10 +46,10 @@ on ack {
       if !measured {                                                                  # 2.2
         srtt, rttvar, measured = r, r / 2, true
       } else {                                                                        # 2.3
-        rttvar = 0.75 * rttvar + 0.25 * max(srtt - r, r - srtt)
+        rttvar = 0.75 * rttvar + 0.25 * abs(srtt - r)
         srtt = 0.875 * srtt + 0.125 * r
       }
-      rto = min(max(srtt + max(PERIOD, 4 * rttvar), LOWEST), HIGHEST)                 # 2.4, 2.5
+      rto = min(max(srtt + max(tick.period, 4 * rttvar), LOWEST), HIGHEST)            # 2.4, 2.5 (G: the tick's period)
     }
     deadline = if outstanding.count > 0 { now + rto } else { -1 }                     # 5.3, 5.2
   }

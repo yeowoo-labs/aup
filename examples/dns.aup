@@ -67,7 +67,7 @@ fn data(d, i, size, type) {
 on read {
   let d = read.data
   require d.bytes >= 12
-  while records.count > 0 { records.remove(records.first) }
+  records = []
   let at = 12
   for section in 0 .. 4 {
     for k in 0 .. word(d, 4 + 2 * section) {
@@ -101,7 +101,7 @@ view wire {
     while !done && r.name[k] != 0 {
       for s in seen {
         if !done && s.name == r.name[k .. r.name.bytes] {
-          out = out + two(49152 + s.at)            # 0xc000: a pointer
+          out = out + two(0xc000 + s.at)           # a pointer
           done = true
         }
       }
