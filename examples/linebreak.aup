@@ -3,8 +3,16 @@
 # loaded once: each its class after LB1, whether an initial or a final quotation mark (Pi, Pf), East Asian (width F, W
 # or H), and pictographic and unassigned (Extended_Pictographic and Cn). A line's boundaries, the ends included, are 0
 # (none), 1 (allowed) or 2 (mandatory).
-record Range {
+record Row {                                     # a range as the load message gives it: by its first code point
   start = 0
+  class = 0
+  pi = false
+  pf = false
+  east = false
+  pictographic = false
+}
+record Range {                                   # a range as the state keeps it: by its last code point
+  last = 0
   class = 0
   pi = false
   pf = false
@@ -14,21 +22,24 @@ record Range {
 record Point {
   code = 0
 }
-record Text {                                    # each position's: its code, class, range, and what the rules look back at
-  codes: list of number
-  cls: list of number
-  eff: list of number                            # its unit's class: a mark takes its base's (LB9), a lone mark is AL (LB10)
-  joined: list of bool                           # a mark LB9 joins to the character before
-  start: list of number                          # where its unit starts
-  nonspace: list of number                       # where the last unit up to it that is not a space starts, or -1
-  numeric: list of bool                          # its unit ends NU (NU | SY | IS)*
-  ri: list of number                             # how many regional indicators end at its unit
-  at: list of number                             # its range
+record Unit {                                    # a position's: its code, class, range, and what the rules look back at
+  code = 0
+  cls = 0
+  eff = 0                                        # its unit's class: a mark takes its base's (LB9), a lone mark is AL (LB10)
+  joined = false                                 # a mark LB9 joins to the character before
+  start = 0                                      # where its unit starts
+  nonspace = 0                                   # where the last unit up to it that is not a space starts, or -1
+  numeric = false                                # its unit ends NU (NU | SY | IS)*
+  ri = 0                                         # how many regional indicators end at its unit
+  at = 0                                         # its range, by key
 }
-state ranges: list of Range                      # by start, from 0
+record Text {
+  units: list of Unit
+}
+state ranges: list of Range by last              # by its last code point, every one up to 0x10FFFF in one
 state breaks: bytes                              # the last line's boundaries
 view boundaries = breaks
-input load = message { rows: list of Range }
+input load = message { rows: list of Row }
 input line = message { points: list of Point }
 
 fn BK = 0; fn CR = 1; fn LF = 2; fn NL = 3; fn SP = 4; fn ZW = 5; fn ZWJ = 6; fn CM = 7; fn WJ = 8; fn GL = 9
@@ -40,68 +51,68 @@ fn NONE = 0; fn ALLOWED = 1; fn MANDATORY = 2
 fn end(c) = c == BK || c == CR || c == LF || c == NL
 
 on load {
-  for r in load.rows { ranges.append(Range { ..r }) }
+  let n = load.rows.count
+  for i in 0 .. n {
+    let last = if i + 1 < n { load.rows[i + 1].start - 1 } else { 0x10FFFF }
+    ranges.add(Range { last: last, class: load.rows[i].class, pi: load.rows[i].pi, pf: load.rows[i].pf,
+                       east: load.rows[i].east, pictographic: load.rows[i].pictographic })
+  }
 }
 
 # The range holding code point c (ranges by start: the last whose start is c or before).
-fn range(c) {
-  let low, high = 0, ranges.count
-  while high - low > 1 {
-    let middle = (low + high) // 2
-    if ranges[middle].start <= c { low = middle } else { high = middle }
-  }
-  return low
-}
+
+# The range holding code point c: the first whose last is c or after (a seek: ranges are kept by last).
+fn range(c) = first(x in ranges where x.last >= c)
 
 fn next_unit(t, i) {
   let j = i + 1
-  while j < t.codes.count && t.joined[j] { j = j + 1 }
+  while j < t.units.count && t.units[j].joined { j = j + 1 }
   return j
 }
 
-fn aksara(t, u) = t.eff[u] == AK || t.eff[u] == AS || t.codes[u] == 0x25CC
-fn pi(t, k) = ranges[t.at[k]].pi
-fn pf(t, k) = ranges[t.at[k]].pf
-fn east(t, k) = ranges[t.at[k]].east
+fn aksara(t, u) = t.units[u].eff == AK || t.units[u].eff == AS || t.units[u].code == 0x25CC
+fn pi(t, k) = ranges[t.units[k].at].pi
+fn pf(t, k) = ranges[t.units[k].at].pf
+fn east(t, k) = ranges[t.units[k].at].east
 
 fn decide(t, i) {
-  let n = t.codes.count
-  let a, b, A, B = t.cls[i - 1], t.cls[i], t.eff[i - 1], t.eff[i]
-  let unit, before = t.start[i - 1], t.nonspace[i - 1]
-  let base = t.codes[unit]
+  let n = t.units.count
+  let a, b, A, B = t.units[i - 1].cls, t.units[i].cls, t.units[i - 1].eff, t.units[i].eff
+  let unit, before = t.units[i - 1].start, t.units[i - 1].nonspace
+  let base = t.units[unit].code
   if a == BK { return MANDATORY }                                                     # LB4
   if a == CR && b == LF { return NONE }                                               # LB5
   if a == CR || a == LF || a == NL { return MANDATORY }
   if end(b) { return NONE }                                                           # LB6
   if b == SP || b == ZW { return NONE }                                               # LB7
-  if before >= 0 && t.eff[before] == ZW { return ALLOWED }                            # LB8
+  if before >= 0 && t.units[before].eff == ZW { return ALLOWED }                            # LB8
   if a == ZWJ { return NONE }                                                         # LB8a
-  if t.joined[i] { return NONE }                                                      # LB9
+  if t.units[i].joined { return NONE }                                                      # LB9
   if A == WJ || B == WJ { return NONE }                                               # LB11
   if A == GL { return NONE }                                                          # LB12
   if B == GL && A != SP && A != BA && A != HY { return NONE }                         # LB12a
   if B == CL || B == CP || B == EX || B == SY { return NONE }                         # LB13
-  if before >= 0 && t.eff[before] == OP { return NONE }                               # LB14
-  if before >= 0 && t.eff[before] == QU && pi(t, before) {                            # LB15a
+  if before >= 0 && t.units[before].eff == OP { return NONE }                               # LB14
+  if before >= 0 && t.units[before].eff == QU && pi(t, before) {                            # LB15a
     if before == 0 { return NONE }
-    let q = t.eff[before - 1]
+    let q = t.units[before - 1].eff
     if end(q) || q == OP || q == QU || q == GL || q == SP || q == ZW { return NONE }
   }
   if B == QU && pf(t, i) {                                                            # LB15b
     let j = next_unit(t, i)
     if j == n { return NONE }
-    let e = t.eff[j]
+    let e = t.units[j].eff
     if e == SP || e == GL || e == WJ || e == CL || e == QU || e == CP || e == EX || e == IS || e == SY || end(e) || e == ZW {
       return NONE
     }
   }
   if A == SP && B == IS {                                                             # LB15c
     let j = next_unit(t, i)
-    if j < n && t.eff[j] == NU { return ALLOWED }
+    if j < n && t.units[j].eff == NU { return ALLOWED }
   }
   if B == IS { return NONE }                                                          # LB15d
-  if B == NS && before >= 0 && (t.eff[before] == CL || t.eff[before] == CP) { return NONE } # LB16
-  if B == B2 && before >= 0 && t.eff[before] == B2 { return NONE }                    # LB17
+  if B == NS && before >= 0 && (t.units[before].eff == CL || t.units[before].eff == CP) { return NONE } # LB16
+  if B == B2 && before >= 0 && t.units[before].eff == B2 { return NONE }                    # LB17
   if A == SP { return ALLOWED }                                                       # LB18
   if B == QU && !pi(t, i) { return NONE }                                             # LB19
   if A == QU && !pf(t, unit) { return NONE }
@@ -109,29 +120,29 @@ fn decide(t, i) {
     let j = next_unit(t, i)
     if !east(t, unit) || j == n || !east(t, j) { return NONE }
   }
-  if A == QU && (!east(t, i) || unit == 0 || !east(t, t.start[unit - 1])) { return NONE }
+  if A == QU && (!east(t, i) || unit == 0 || !east(t, t.units[unit - 1].start)) { return NONE }
   if B == CB || A == CB { return ALLOWED }                                            # LB20
   if (A == HY || base == 0x2010) && B == AL {                                         # LB20a
-    let w = if unit > 0 { t.eff[unit - 1] } else { SP }
+    let w = if unit > 0 { t.units[unit - 1].eff } else { SP }
     if end(w) || w == SP || w == ZW || w == CB || w == GL { return NONE }
   }
   if B == BA || B == HY || B == NS || A == BB { return NONE }                         # LB21
-  if (A == HY || (A == BA && !east(t, unit))) && unit > 0 && t.eff[unit - 1] == HL && B != HL { return NONE } # LB21a
+  if (A == HY || (A == BA && !east(t, unit))) && unit > 0 && t.units[unit - 1].eff == HL && B != HL { return NONE } # LB21a
   if A == SY && B == HL { return NONE }                                               # LB21b
   if B == IN { return NONE }                                                          # LB22
   if ((A == AL || A == HL) && B == NU) || (A == NU && (B == AL || B == HL)) { return NONE } # LB23
   if (A == PR && (B == ID || B == EB || B == EM)) || ((A == ID || A == EB || A == EM) && B == PO) { return NONE } # LB23a
   if ((A == PR || A == PO) && (B == AL || B == HL)) || ((A == AL || A == HL) && (B == PR || B == PO)) { return NONE } # LB24
-  if (B == PO || B == PR) && (t.numeric[i - 1] || ((A == CL || A == CP) && unit > 0 && t.numeric[unit - 1])) { return NONE } # LB25
+  if (B == PO || B == PR) && (t.units[i - 1].numeric || ((A == CL || A == CP) && unit > 0 && t.units[unit - 1].numeric)) { return NONE } # LB25
   if A == PO || A == PR {
     if B == NU { return NONE }
     if B == OP {
       let j = next_unit(t, i)
-      if j < n && t.eff[j] == IS { j = next_unit(t, j) }
-      if j < n && t.eff[j] == NU { return NONE }
+      if j < n && t.units[j].eff == IS { j = next_unit(t, j) }
+      if j < n && t.units[j].eff == NU { return NONE }
     }
   }
-  if (A == HY || A == IS || t.numeric[i - 1]) && B == NU { return NONE }
+  if (A == HY || A == IS || t.units[i - 1].numeric) && B == NU { return NONE }
   if A == JL && (B == JL || B == JV || B == H2 || B == H3) { return NONE }            # LB26
   if ((A == JV || A == H2) && (B == JV || B == JT)) || ((A == JT || A == H3) && B == JT) { return NONE }
   let jamo = A == JL || A == JV || A == JT || A == H2 || A == H3                       # LB27
@@ -139,44 +150,40 @@ fn decide(t, i) {
   if (A == AL || A == HL) && (B == AL || B == HL) { return NONE }                     # LB28
   if A == AP && aksara(t, i) { return NONE }                                          # LB28a
   if aksara(t, unit) && (B == VF || B == VI) { return NONE }
-  if A == VI && unit > 0 && aksara(t, t.start[unit - 1]) && (B == AK || t.codes[i] == 0x25CC) { return NONE }
+  if A == VI && unit > 0 && aksara(t, t.units[unit - 1].start) && (B == AK || t.units[i].code == 0x25CC) { return NONE }
   if aksara(t, unit) && aksara(t, i) {
     let j = next_unit(t, i)
-    if j < n && t.eff[j] == VF { return NONE }
+    if j < n && t.units[j].eff == VF { return NONE }
   }
   if A == IS && (B == AL || B == HL) { return NONE }                                  # LB29
   if (A == AL || A == HL || A == NU) && B == OP && !east(t, i) { return NONE }        # LB30
   if A == CP && !east(t, unit) && (B == AL || B == HL || B == NU) { return NONE }
-  if A == RI && B == RI && t.ri[i - 1] % 2 == 1 { return NONE }                       # LB30a
-  if B == EM && (A == EB || ranges[t.at[unit]].pictographic) { return NONE }          # LB30b
+  if A == RI && B == RI && t.units[i - 1].ri % 2 == 1 { return NONE }                       # LB30a
+  if B == EM && (A == EB || ranges[t.units[unit].at].pictographic) { return NONE }          # LB30b
   return ALLOWED                                                                      # LB31
 }
 
 on line {
-  let codes, cls, eff, start, nonspace, ri, at: list of number
-  let joined, numeric: list of bool
+  let units: list of Unit
   for p in line.points {
-    let i = codes.count
-    let r = range(p.code)
-    let c = ranges[r].class
+    let i = units.count
+    let code = p.code
+    let found = range(code)
+    let c = found.class
     let mark = c == CM || c == ZWJ
-    let previous = if i > 0 { eff[i - 1] } else { SP }
+    let previous = if i > 0 { units[i - 1].eff } else { SP }
     let joins = mark && i > 0 && !end(previous) && previous != SP && previous != ZW   # LB9, LB10
     let e = if joins { previous } else if mark { AL } else { c }
-    codes.append(p.code)
-    cls.append(c)
-    at.append(r)
-    joined.append(joins)
-    eff.append(e)
-    start.append(if joins { start[i - 1] } else { i })
-    nonspace.append(if e != SP { start[i] } else if i > 0 { nonspace[i - 1] } else { -1 })
-    numeric.append(if joins { numeric[i - 1] } else { e == NU || ((e == SY || e == IS) && i > 0 && numeric[i - 1]) })
-    ri.append(if joins { ri[i - 1] } else if e == RI { (if i > 0 { ri[i - 1] } else { 0 }) + 1 } else { 0 })
+    let start = if joins { units[i - 1].start } else { i }
+    units.append(Unit { code: code, cls: c, eff: e, joined: joins, start: start,
+                        nonspace: if e != SP { start } else if i > 0 { units[i - 1].nonspace } else { -1 },
+                        numeric: if joins { units[i - 1].numeric } else { e == NU || ((e == SY || e == IS) && i > 0 && units[i - 1].numeric) },
+                        ri: if joins { units[i - 1].ri } else if e == RI { (if i > 0 { units[i - 1].ri } else { 0 }) + 1 } else { 0 },
+                        at: found.last })
   }
-  let t = Text { codes: codes, cls: cls, eff: eff, joined: joined, start: start, nonspace: nonspace, numeric: numeric, ri: ri,
-                 at: at }
+  let t = Text { units: units }
   let out: list of i64 = [0]                                                          # LB2
-  for i in 1 .. codes.count { out.append(i64(decide(t, i))) }
-  if codes.count > 0 { out.append(2) }                                                # LB3
+  for i in 1 .. units.count { out.append(i64(decide(t, i))) }
+  if units.count > 0 { out.append(2) }                                                # LB3
   breaks = bytes(out)
 }
