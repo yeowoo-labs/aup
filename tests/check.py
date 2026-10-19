@@ -1352,10 +1352,18 @@ def formats_and_texts(aup, pure_run, work, apps=6, per_app=24):
     """Pure 027's stage 2a. Random formats ({v:08x}, {x:.3f}, ...) of i64s
     and numbers a message gives, against Python's format(): an integer's
     form of a number that is not whole fails as limit, -0 is written as 0.
-    Then an app that cuts a message's bytes at commas into a text joined by
-    '|', counting with while and reading by position only where && decides
-    (an empty message reads nothing), against Python."""
-    import struct
+    .Nd (Pure 027's stage 5) writes an integer in minor units, its last N
+    digits after a point: the Decimal of v / 10^N in .Nf. Then an app that
+    cuts a message's bytes at commas into a text joined by '|', counting
+    with while and reading by position only where && decides (an empty
+    message reads nothing), against Python."""
+    import decimal
+
+    def shown(v, spec):
+        if '.' in spec and spec.endswith('d'):
+            return format(decimal.Decimal(v).scaleb(-int(spec.split('.')[1][:-1])), spec[:-1] + 'f')
+        return format(v, spec)
+
     rng = random.Random(272)
     checked = faults = 0
     for app in range(apps):
@@ -1365,7 +1373,7 @@ def formats_and_texts(aup, pure_run, work, apps=6, per_app=24):
             form = rng.choice('dxXbo' if integer else 'dxXbof')
             width = rng.choice([0, 0, 1, 5, 8, 20])
             zeros = width > 0 and rng.random() < 0.5
-            digits = rng.randrange(0, 11) if form == 'f' else None
+            digits = rng.randrange(0, 11) if form == 'f' or (form == 'd' and rng.random() < 0.4) else None
             spec = ('0' if zeros else '') + (str(width) if width else '') + (f'.{digits}' if digits is not None else '') + form
             specs.append((integer, spec))
         source = 'state t: text\n' + ''.join(f'input e{i} = message {{\n  v: i64\n  x: number\n}}\n' for i in range(per_app))
@@ -1380,11 +1388,11 @@ def formats_and_texts(aup, pure_run, work, apps=6, per_app=24):
                 x = rng.choice([rng.uniform(-1e6, 1e6), float(rng.randrange(-5000, 5000)), rng.uniform(-1, 1), -0.0, 2.5, 1e20])
                 given += f'message e{i} {struct.pack("<qd", v, x).hex()}\n'
                 if integer:
-                    wanted.append((format(v, spec), 'none'))
+                    wanted.append((shown(v, spec), 'none'))
                 elif spec.endswith('f'):
                     wanted.append((format(x + 0.0 if x else 0.0, spec), 'none'))
                 elif x == int(x) and abs(x) <= 2 ** 53:
-                    wanted.append((format(int(x), spec), 'none'))
+                    wanted.append((shown(int(x), spec), 'none'))
                 else:
                     wanted.append((None, 'limit'))
         lines = run(pure_run, work / f'formats{app}.pmod', stdin=given, check=False).stdout.splitlines()

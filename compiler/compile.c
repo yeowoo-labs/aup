@@ -657,7 +657,8 @@ static Expr *postfix(Compiler *c, Expr *e) {
     return e;
 }
 
-/* A format after ':' in a string's braces, as Python's: [0][width][.digits][d x X b o f]; how NUM_TEXT writes it. */
+/* A format after ':' in a string's braces, as Python's: [0][width][.digits][d x X b o f]; how NUM_TEXT writes it.
+ * .2d is not Python's: an integer in minor units, its last two digits after a point (money's cents, Pure 027). */
 static uint32_t format_of(Compiler *c, const char *text, size_t length, int line, int column) {
     size_t at = 0;
     uint32_t format = 0, width = 0, digits = 0, form = 0;
@@ -678,7 +679,8 @@ static uint32_t format_of(Compiler *c, const char *text, size_t length, int line
         ++at;
     }
     if (at != length) fail_at(c, line, column, "a format is [0][width][.digits][d x X b o f], as in 08x or .2f");
-    if (digits && form != FORM_FIXED) fail_at(c, line, column, "digits after the point go with f, as in .2f");
+    if (digits && form != FORM_FIXED && form != FORM_DECIMAL)
+        fail_at(c, line, column, "digits after the point go with f or d, as in .2f or .2d (cents: 1234 is 12.34)");
     return format | width << FORMAT_WIDTH | form << FORMAT_FORM | digits << FORMAT_DIGITS | 0x80000000u; /* written */
 }
 
@@ -3321,7 +3323,7 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
                 fail_at(c, part->line, part->column, "a format writes a number, a bool or an i64, not %s", type_name(kind.type));
             if (kind.type == BOOL && form) fail_at(c, part->line, part->column, "a bool's format is a width alone");
             if (kind.type == I64 && form == FORM_FIXED)
-                fail_at(c, part->line, part->column, "f writes a number; an i64 is written as one by number(i)");
+                fail_at(c, part->line, part->column, "f writes a number; an i64 in cents is written by .2d (1234 is 12.34)");
             if (kind.type == NUM || kind.type == BOOL || kind.type == I64)
                 emit(c, part->line, part->column, NUM_TEXT, (kind.type == BOOL ? 1u : kind.type == I64 ? 2u : 0u) | format, 0);
             else if (kind.type != TEXT)
