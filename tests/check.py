@@ -80,6 +80,10 @@ DIAGNOSTICS = [
     ('state a = 0\non frame {\n  let xs, ys: list of number = [1]\n}\n', '3:30',
      'lists declared together begin empty: give each its elements apart'),
     ('state a = 0\non frame {\n  let xs, xs: list of number\n}\n', '3:11', "'xs' is named twice"),
+    ('record F {\n  v = 0\n}\nstate kept: list of F\nstate n = 0\non frame {\n  kept = n\n}\n', '7:10',
+     "'kept' takes a list of F, not a number"),
+    ('record F {\n  v = 0\n}\nrecord G {\n  w = 0\n}\nstate kept: list of F\nstate other: list of G\non frame {\n  kept = other\n}\n',
+     '10:10', "'kept' takes a list of F, not G"),
     ('state s: text\nstate a = 0\non frame {\n  s, a = "x", 1\n}\n', '4:3', "'s' takes its value apart"),
     ('state t: text\nstate c: cursor in t\non frame {\n  let a, b = 1, c\n}\n', '4:17',
      'a let holds a number, a bool, an i64, an index, bytes, text, a list or a record, not a cursor'),
@@ -91,9 +95,8 @@ DIAGNOSTICS = [
     ('state data: bytes\ninput k = key KeyK\non k.down {\n  data.insert(data.start, "x")\n}\n', '4:3',
      "'data' is a bytes state: it is read and set whole, no cursor in it"),
     ('state data: bytes\nstate t: text\ninput k = key KeyK\non k.down {\n  t = data\n}\n', '5:7', 'expected text, not bytes'),
-    # Lets' lists in inner blocks and xs = [...] (after 140's inflate): a stored list is not given elements so.
-    ('record R {\n  v = 0\n}\nstate rs: list of R\non frame {\n  rs = []\n}\n', '6:3',
-     "a list changes by append, insert, remove, rs[index].field = value and (a let's) rs = [...]"),
+    # A list given a value whole (after 140's frictions): xs = [...] and xs = a list of its record, a stored list's too.
+    ('record R {\n  v = 0\n}\nstate rs: list of R\non frame {\n  rs = [1]\n}\n', '6:9', "'rs' holds R records, as in rs.append(R { v: ... })"),
     # Bytes compared (after 140's DNS and HTTP): bytes compare with bytes (a string where bytes go is its bytes), and
     # neither compares nor joins with a text's value.
     ('state t: text\ninput m = message { name: bytes }\non m {\n  require m.name == t\n}\n', '4:21',
@@ -275,7 +278,7 @@ DIAGNOSTICS = [
     (RECORD + 'state xs: list of T\nview v = xs.size\n', '5:10', "a list has count, first and last, not 'size'"),
     (RECORD + 'state xs: list of T\nstate at: index of xs\nview v = at\n', '6:10', 'a view is a number, a bool, an i64, text, bytes or a list, not an index'),
     (RECORD + 'state xs: list of T\nstate at: index of xs\n' + ON_K + '  at = 3\n}\n', '8:8', 'expected an index, not a number'),
-    (RECORD + 'state xs: list of T\n' + ON_K + '  xs = 1\n}\n', '7:3', 'a list changes by append, insert, remove'),
+    (RECORD + 'state xs: list of T\n' + ON_K + '  xs = 1\n}\n', '7:8', "'xs' takes a list of T, not a number"),
     (RECORD + 'record U {\n  a = 0\n}\nstate xs: list of T\n' + ON_K + '  xs.append(U { a: 1 })\n}\n', '10:13',
      "'xs' holds T, not U"),
     (RECORD + 'state xs: list of T\n' + ON_K + '  xs.append(1)\n}\n', '7:13', "'xs' holds T records"),
@@ -661,8 +664,29 @@ state bs: list of B
 state a = 0
 state b = 0
 state i = 0
+state kept: list of P
+state keyed: list of P by x
+state j = 0
 input go = message { k: u32 }
+fn made(n) -> list of P, number {
+  let out: list of P
+  for m in 0 .. n { out.append(P { x: m * 10 }) }
+  return out, n + 100
+}
+fn only(n) -> list of P {
+  let out: list of P
+  for m in 0 .. n { out.append(P { x: n - m }) }
+  return out
+}
 on go {
+  let ts: list of P
+  ts.append(P { x: 1 })
+  ts, j = made(go.k)
+  kept = ts
+  kept = kept
+  keyed = only(go.k + 1)
+  if go.k == 3 { kept = [] }
+  if go.k == 4 { keyed = kept }
   if bs.count == 0 { bs.append(B {}) }
   bs.append(B {})
   bs[0].x, bs[0].y = go.k, go.k * 2
@@ -676,10 +700,10 @@ on go {
   b = b + ns[0] * 100 + ns[1]
   let xs, ys: list of number
   let ps, qs: list of P
-  for j in 0 .. go.k {
-    xs.append(j)
-    ys.append(j * 2)
-    ps.append(P { x: j })
+  for w in 0 .. go.k {
+    xs.append(w)
+    ys.append(w * 2)
+    ps.append(P { x: w })
   }
   if go.k > 1 {
     let inner, outer: list of number
@@ -1785,8 +1809,9 @@ def rows_at(aup, pure_run, work, events=200):
 def frictions(aup, pure_run, work, events=100):
     """140's frictions written away in aup alone, no core change: lets' lists declared together (let a, b: list of R),
     each its own and empty as it begins, in inner blocks too; targets together with fields and items among them
-    (xs[i].x, xs[i].y = a, b; a, xs[i] = ...), the values first, then each target left to right as Python's. Each event
-    against Python's."""
+    (xs[i].x, xs[i].y = a, b; a, xs[i] = ...), the values first, then each target left to right as Python's; a list
+    given a list value whole (xs = f(x), xs = ys, xs = xs, xs = [] for a list state too, xs, j = f(x)), added by key
+    when keyed. Each event against Python's."""
     import random
     import struct
     path = work / 'frictions.pmod'
@@ -1799,6 +1824,9 @@ def frictions(aup, pure_run, work, events=100):
     n, bs, a, b, i = 0, [], 0, 0, 0
     for k, line in zip(asked, lines):
         state = json.loads(line)
+        kept = [] if k == 3 else [{'x': m * 10} for m in range(k)]
+        keyed = sorted(({'x': k + 1 - m} for m in range(k + 1)), key=lambda p: p['x'])
+        if k == 4: keyed = sorted(kept, key=lambda p: p['x'])
         if k > 1: n = 10 + 1 + k
         bs += [{'x': 0, 'y': 0}] * (2 if not bs else 1)
         bs = [dict(x) for x in bs]
@@ -1809,7 +1837,8 @@ def frictions(aup, pure_run, work, events=100):
         ns = [0, 0]
         ns[0], ns[1] = 3, k
         b = b + ns[0] * 100 + ns[1]
-        want = {'total': sum(range(k)) * (1 + 200 + 10000), 'n': n, 'bs': bs, 'a': a, 'b': b, 'i': i}
+        want = {'total': sum(range(k)) * (1 + 200 + 10000), 'n': n, 'bs': bs, 'a': a, 'b': b, 'i': i, 'kept': kept,
+                'keyed': keyed, 'j': k + 100}
         assert state['fault'] == 'none' and {key: state['states'][key] for key in want} == want, (k, state['states'])
     return events
 

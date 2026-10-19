@@ -124,6 +124,7 @@ typedef struct Stmt {
      * the values linked from value by next. */
     char (*names)[NAME];
     unsigned name_count;
+    int refills; /* S_LET of xs = value's copy: xs's list + 1 (its value must be a list of its record), else 0 */
     struct Stmt *then, *otherwise, *next;
 } Stmt;
 
@@ -1227,6 +1228,43 @@ static Stmt *target(Compiler *c, Token name) {
     return t;
 }
 
+/* s (its names' count and its values, a, xs[i].x = x, y's) as lets and a statement for each target: the values
+ * first, each into a let of its own (a literal, which reads nothing, straight), then each target, left to right. */
+static Stmt *through_lets(Compiler *c, Stmt *s, Stmt **targets) {
+    unsigned n = s->name_count;
+    for (unsigned i = 0; i < n; ++i) snprintf(s->names[i], NAME, "$%d$%d$%u", s->line, s->column, i); /* none of the source's (nor a path) */
+    s->kind = S_LETS;
+    Expr *values[STACK];
+    unsigned count = 0;
+    for (Expr *v = s->value; v; v = v->next) values[count++] = v;
+    Stmt *last = s;
+    Expr **link = &s->value;
+    unsigned kept = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        Expr *v = count == n ? values[i] : NULL; /* NULL: one call gives them all */
+        if (v && (v->kind == E_NUMBER || v->kind == E_BOOL || v->kind == E_TEXT)) {
+            v->next = NULL;      /* a literal reads nothing: straight to its target */
+            targets[i]->value = v;
+        } else {
+            memcpy(s->names[kept++], s->names[i], NAME);
+            Expr *given = node(c, E_NAME, s->line, s->column);
+            memcpy(given->name, s->names[i], NAME);
+            targets[i]->value = given;
+            if (v) *link = v, link = &v->next;
+        }
+        last = last->next = targets[i];
+    }
+    last->next = NULL;
+    if (count == n) *link = NULL;
+    s->name_count = kept;
+    if (kept == 1) { /* one let: as let x = value */
+        s->kind = S_LET;
+        memcpy(s->name, s->names[0], NAME);
+        s->names = NULL, s->name_count = 0;
+    }
+    return kept ? s : s->next; /* every value a literal: no lets */
+}
+
 /* a, xs[i].x = x, y after its first target: every target its value at once, the values first, in order. Names alone
  * are S_ASSIGNS; with a field or an item among them, the values go to lets of their own first (a literal, which
  * reads nothing, goes straight), then each target takes its own: a let each and a statement each, linked. */
@@ -1250,40 +1288,10 @@ static Stmt *together(Compiler *c, Stmt *first) {
     s->line = first->line, s->column = first->column;
     s->names = allocate(c, STACK * sizeof(*s->names));
     s->name_count = n;
-    for (unsigned i = 0; i < n; ++i)
-        if (names) memcpy(s->names[i], targets[i]->name, NAME);
-        else snprintf(s->names[i], NAME, ".%d.%d.%u", s->line, s->column, i); /* no name of the source's */
-    s->kind = names ? S_ASSIGNS : S_LETS;
+    for (unsigned i = 0; names && i < n; ++i) memcpy(s->names[i], targets[i]->name, NAME);
+    s->kind = S_ASSIGNS;
     several_values(c, s);
-    if (names) return s;
-    Expr *values[STACK];
-    unsigned count = 0;
-    for (Expr *v = s->value; v; v = v->next) values[count++] = v;
-    Stmt *last = s;
-    Expr **link = &s->value;
-    unsigned kept = 0;
-    for (unsigned i = 0; i < n; ++i) {
-        Expr *v = count == n ? values[i] : NULL; /* NULL: one call gives them all */
-        if (v && (v->kind == E_NUMBER || v->kind == E_BOOL || v->kind == E_TEXT)) {
-            v->next = NULL;      /* a literal reads nothing: straight to its target */
-            targets[i]->value = v;
-        } else {
-            memcpy(s->names[kept++], s->names[i], NAME);
-            Expr *given = node(c, E_NAME, s->line, s->column);
-            memcpy(given->name, s->names[i], NAME);
-            targets[i]->value = given;
-            if (v) *link = v, link = &v->next;
-        }
-        last = last->next = targets[i];
-    }
-    if (count == n) *link = NULL;
-    s->name_count = kept;
-    if (kept == 1) { /* one let: as let x = value */
-        s->kind = S_LET;
-        memcpy(s->name, s->names[0], NAME);
-        s->names = NULL, s->name_count = 0;
-    }
-    return kept ? s : s->next; /* every value a literal: no lets */
+    return names ? s : through_lets(c, s, targets);
 }
 
 static Stmt *statement(Compiler *c, unsigned depth) {
@@ -4538,6 +4546,41 @@ static Stmt *emptied(Compiler *c, const char *name, int line, int column) {
     return loop;
 }
 
+/* xs = a list value (a fn's, a let's, another list's): a copy of it first (xs may be in it), then xs emptied, then
+ * given the copy's items in order (added by key when xs is keyed). */
+static Stmt *refilled(Compiler *c, const Stmt *s, int list) {
+    Stmt *copy = allocate(c, sizeof(*copy)), *each = allocate(c, sizeof(*each)), *give = allocate(c, sizeof(*give));
+    Expr *item = node(c, E_NAME, s->line, s->column);
+    copy->kind = S_LET, copy->line = s->line, copy->column = s->column, copy->value = s->value, copy->refills = list + 1;
+    snprintf(copy->name, NAME, "$%d$%d$copy", s->line, s->column);
+    each->kind = S_FOR, each->line = s->line, each->column = s->column, each->then = give;
+    snprintf(each->name, NAME, "$%d$%d$item", s->line, s->column);
+    memcpy(each->member, copy->name, NAME);
+    each->first = node(c, E_NAME, s->line, s->column), each->last = node(c, E_NAME, s->line, s->column); /* where they stand */
+    memcpy(each->first->name, copy->name, NAME);
+    memcpy(each->last->name, each->name, NAME);
+    memcpy(item->name, each->name, NAME);
+    give->kind = keyed_by(c, list) ? S_ADD : S_APPEND, give->line = s->line, give->column = s->column, give->value = item;
+    memcpy(give->name, s->name, NAME);
+    Stmt *empty = emptied(c, s->name, s->line, s->column);
+    empty->next = each;
+    int other = s->value->kind == E_NAME && !c->module && parameter(c, s->value->name) < 0 && local_named(c, s->value->name) < 0 ?
+                state_index(c, s->value->name) : -1;
+    if (other >= 0 && c->state_types[other] == STATE_LIST) { /* xs = ys: another list, walked where it is */
+        if (other == list) return NULL;                     /* xs = xs: as it is */
+        int record = module_record(c, c->state_library[list], c->state_target[list]),
+            given = module_record(c, c->state_library[other], c->state_target[other]);
+        if (record != given)
+            fail_at(c, s->value->line, s->value->column, "'%s' takes a list of %s, not %s", s->name, c->records[record].name,
+                    c->records[given].name);
+        memcpy(each->member, s->value->name, NAME);
+        memcpy(each->first->name, s->value->name, NAME);
+        return empty;
+    }
+    copy->next = empty;
+    return copy;
+}
+
 static void statements(Compiler *c, const Stmt *s) {
     unsigned scope = c->local_count; /* a block's lets end with it */
     for (const Stmt *before = NULL; s; before = s, s = s->next) {
@@ -4707,6 +4750,14 @@ static void statements(Compiler *c, const Stmt *s) {
             Kind held = value(c, s->value, c->handling, 0);
             if (held.type == TUPLE)
                 fail_at(c, s->value->line, s->value->column, "this gives several values: name each, as in let a, b = ...");
+            if (s->refills) { /* xs = value: a list of xs's record */
+                int list = s->refills - 1, record = module_record(c, c->state_library[list], c->state_target[list]);
+                const char *name = c->state_names[list];
+                if (c->state_event[list] && !strncmp(name, "let.", 4)) name += 4; /* a let's list, as written */
+                if (held.type != LIST || held.owner != record)
+                    fail_at(c, s->value->line, s->value->column, "'%s' takes a list of %s, not %s", name,
+                            c->records[record].name, held.type == LIST ? c->records[held.owner].name : type_name(held.type));
+            }
             if (held.type == RECORD || held.type == LIST) { /* a record's value, a list's (027's 2c) */
                 name_value(c, s->name, held, s->line, s->column);
                 pop_named(c, local_named(c, s->name), s->line, s->column);
@@ -4769,6 +4820,31 @@ static void statements(Compiler *c, const Stmt *s) {
         case S_ASSIGNS: {
             const Expr *v = s->value;
             int locals[STACK], states[STACK];
+            bool lists = false;
+            for (unsigned i = 0; i < s->name_count; ++i) {
+                int list = local_named(c, s->names[i]) < 0 ? state_index(c, s->names[i]) : -1;
+                lists = lists || (list >= 0 && c->state_types[list] == STATE_LIST);
+            }
+            if (lists) { /* xs, j = f(x): a list among the names takes its value as xs = value does, after the values */
+                Stmt *spread = allocate(c, sizeof(*spread)), *targets[STACK];
+                *spread = *s;
+                spread->next = NULL;
+                spread->names = allocate(c, STACK * sizeof(*spread->names));
+                Expr **link = &spread->value;
+                for (const Expr *x = s->value; x; x = x->next) { /* copies: a fn's body is compiled for each instance */
+                    *link = node(c, x->kind, x->line, x->column);
+                    **link = *x;
+                    link = &(*link)->next;
+                }
+                *link = NULL;
+                for (unsigned i = 0; i < s->name_count; ++i) {
+                    targets[i] = allocate(c, sizeof(*targets[i]));
+                    targets[i]->kind = S_ASSIGN, targets[i]->line = s->line, targets[i]->column = s->column;
+                    memcpy(targets[i]->name, s->names[i], NAME);
+                }
+                statements(c, through_lets(c, spread, targets));
+                break;
+            }
             if (!v->next) { /* a fn's call that gives them all (027's 2c): each into a let of its kind */
                 Kind given = value(c, v, c->handling, 0);
                 const Instance *in = given.type == TUPLE ? &c->instances[given.owner] : NULL;
@@ -4869,8 +4945,8 @@ static void statements(Compiler *c, const Stmt *s) {
             } else if (c->state_types[index] == STATE_NUM || c->state_types[index] == STATE_BOOL) {
                 expect_kind(c, s->value, value(c, s->value, c->handling, 0), c->state_types[index] == STATE_BOOL ? BOOL : NUM);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
-            } else if (c->state_types[index] == STATE_LIST && c->state_event[index] && s->value->kind == E_LIST) {
-                statements(c, emptied(c, s->name, s->line, s->column)); /* xs = [...]: a let's list emptied, then its elements */
+            } else if (c->state_types[index] == STATE_LIST && s->value->kind == E_LIST) {
+                statements(c, emptied(c, s->name, s->line, s->column)); /* xs = [...]: the list emptied, then its elements */
                 if (keyed_by(c, index) && s->value->args[0])
                     fail_at(c, s->value->line, s->value->column, "a keyed list adds its elements by key; add them one by one");
                 for (const Expr *element = s->value->args[0]; element; element = element->next) {
@@ -4878,8 +4954,7 @@ static void statements(Compiler *c, const Stmt *s) {
                     emit(c, element->line, element->column, LIST_APPEND, (uint32_t)index, 0);
                 }
             } else if (c->state_types[index] == STATE_LIST) {
-                fail_at(c, s->line, s->column, "a list changes by append, insert, remove, %s[index].field = value and (a let's) "
-                        "%s = [...]", s->name, s->name);
+                statements(c, refilled(c, s, index)); /* xs = a list value */
             } else if (c->state_types[index] == STATE_INDEX) {
                 index_of(c, s->value, c->handling, 0, cursor_owner(c, index));
                 emit(c, s->line, s->column, INDEX_STORE, (uint32_t)index, 0);
