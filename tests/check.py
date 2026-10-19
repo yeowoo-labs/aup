@@ -221,6 +221,7 @@ DIAGNOSTICS = [
      '6:12', "a cursor of 'a' cannot point into 'b'"),
     ('state a: text\nstate at: cursor in a\ninput k = key KeyK\non k.down {\n  at = 3\n}\n', '5:8',
      'expected a cursor, not a number'),
+    ('state n: i64 = 7\nview v = n / 2\n', '2:12', 'an i64 divides by // (its quotient, floored)'),
     ('state a: text\nstate at: cursor in a\nview v = at\n', '3:10', 'a view is a number, a bool, an i64, text, bytes or a list, not a cursor'),
     ('state a: text\nstate at: cursor in a\nview v = "{at}"\n', '3:12', 'a string shows numbers, bools, i64s and text, not a cursor'),
     ('state x = 1\nstate t: text = "{x}"\n', '2:17', 'a text state starts from a plain string'),
@@ -574,7 +575,7 @@ ACCEPTED = [
     'output told = message {\n  id: i64\n  big: bool\n}\ninput go = key KeyG\n'
     'on put {\n  orders.add(Order { id: put.id, total: put.total * 2 + 1, note: "{put.id}" })\n'
     '  send told { id: put.id, big: put.total > 1000 }\n}\n'
-    'on go.down {\n  let step: = 0\n}\n'.replace('  let step: = 0\n', '  let step = next / 3 % 7 - 1\n  next = next + step\n'
+    'on go.down {\n  let step: = 0\n}\n'.replace('  let step: = 0\n', '  let step = next // 3 % 7 - 1\n  next = next + step\n'
     '  sum = sum + max(-step, 0) + min(1, next)\n  seen = number(step) + seen\n'
     '  for o in orders[0 .. next] where o.total != 0 {\n    o.total = -o.total\n  }\n  if orders.has(5) { orders[5].total = 9 }\n')
     + 'view count = count(o in orders[-5 .. 5])\nview most = max(o.total for o in orders)\nview kinds = distinct(o.total for o in orders)\n'
@@ -785,7 +786,7 @@ def random_program(rng):
             return f'number({integer(depth - 1, handler)})'
         if choice < 0.6:
             return f'(if {truth(depth - 1, handler)} {{ {number(depth - 1, handler)} }} else {{ {number(depth - 1, handler)} }})'
-        op = rng.choice(['+', '-', '*', '/'])
+        op = rng.choice(['+', '-', '*', '/', '//'])
         return f'({number(depth - 1, handler)} {op} {number(depth - 1, handler)})'
 
     def integer(depth, handler):
@@ -801,7 +802,7 @@ def random_program(rng):
             return f'(if {truth(depth - 1, handler)} {{ {integer(depth - 1, handler)} }} else {{ {rng.choice(["0", "-1"])} }})'
         if choice < 0.6:
             return '-' + integer(depth - 1, handler)
-        op = rng.choice(['+', '-', '*', '/', '%'])
+        op = rng.choice(['+', '-', '*', '//', '%'])
         right = str(rng.choice([1, 2, 10, -3])) if rng.random() < 0.3 else integer(depth - 1, handler)
         return f'({integer(depth - 1, handler)} {op} {right})'
 
@@ -2305,10 +2306,10 @@ on add.down {
   n = n + 1
 }
 on grow.down { next = next * 1024 }
-on half.down { next = -next / 2 }
+on half.down { next = -next // 2 }
 on far.down { n = number(next) }
 view total = sum(r.id for r in rows)
-view line = "{next} {i64(-7) / 2} {i64(-7) % 2} {i64(7) % -2} {-7 / 2}"
+view line = "{next} {i64(-7) // 2} {i64(-7) % 2} {i64(7) % -2} {-7 / 2}"
 view least = min(r.id for r in rows)
 """
 
@@ -2429,6 +2430,22 @@ def main():
         shown = json.loads(run(pure_run, work / 'wide.pmod', stdin='message m39 05000000\nmessage m39 02000000\n').stdout.splitlines()[-1])
         assert shown['error'] is None and shown['states']['s299'] == 7 and shown['views']['v69'] == 2, shown['states']['s299']
         report['wide_program'] = {'states': 301, 'inputs': 40, 'views': 70, 'records': 20, 'source_bytes': len(wide)}
+
+        # Floor division of numbers (Pure 027's stage 5): a // b and a % b as Python's, bit for bit (-0 too), on random pairs.
+        import math
+        frng = random.Random(55)
+        pairs = [(7.0, 2.0), (-7.0, 2.0), (7.0, -2.0), (1.0, 0.1), (0.0, -3.0), (-0.0, 3.0), (1e300, 7.0), (5.5, 1.5)]
+        pairs += [(frng.uniform(-1e6, 1e6), frng.choice([frng.uniform(-100, 100), float(frng.randint(-9, 9) or 3)]))
+                  for _ in range(192)]
+        source = ''.join(f'view q{i} = {a!r} // {b!r}\nview r{i} = {a!r} % {b!r}\n' for i, (a, b) in enumerate(pairs))
+        (work / 'floors.aup').write_text(source)
+        compile_module(aup, work / 'floors.aup', work / 'floors.pmod')
+        shown = json.loads(run(pure_run, work / 'floors.pmod', stdin='show\n').stdout, parse_int=float)['views'] # -0 a float
+        for i, (a, b) in enumerate(pairs):
+            q, r = shown[f'q{i}'], shown[f'r{i}']
+            assert math.copysign(1, q) == math.copysign(1, a // b) and q == a // b, (a, b, q, a // b)
+            assert r == a % b and math.copysign(1, r) == math.copysign(1, a % b), (a, b, r, a % b)
+        report['floor_divisions'] = len(pairs)
 
         # message like X is X's fields, written once: the same module, byte for byte.
         fields = '  title: text\n  lane: u32\n  to: {\n    city: text\n  }\n'

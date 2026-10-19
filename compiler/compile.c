@@ -24,7 +24,7 @@ enum { CONST, LOAD, ADD, SUB, MUL, DIV, NEG, LT, LE, GT, GE, EQ, NE, AND, OR, NO
        PICK, SLIDE, FOLD, TEXT_COMPARE, LIST_FIND, LIST_HAS, NOW, FLOOR, MOD, SEND, OUTER_ROW, EACH,
        LOCAL_LOAD, LOCAL_STORE, I64_ADD, I64_SUB, I64_MUL, I64_DIV, I64_MOD, I64_NEG, I64_COMPARE, I64_MIN, I64_MAX,
        I64_FROM, NUM_FROM, LOOP, BREAK, I64_BITS, BYTE_AT, BYTES_OF, ANCHOR_AT, BYTES_SLICE, BYTE, BYTES_LOAD, BYTES_STORE,
-       LIST_VALUE, LIST_BIND, APPEND_IN, NUM_PARSE, CALL, RETURN, CHAR_AT, CHAR };
+       LIST_VALUE, LIST_BIND, APPEND_IN, NUM_PARSE, CALL, RETURN, CHAR_AT, CHAR, FLOORDIV };
 /* A cursor's and an index's instructions are Pure's anchor's (027's 4c), MOVE and COUNT naming the text or list in
  * bits 0-15 and the unit above (IN). */
 enum { CUR_LOAD = ANCHOR_LOAD, CUR_START = ANCHOR_START, CUR_END = ANCHOR_END, CUR_MOVE = ANCHOR_MOVE, CUR_STORE = ANCHOR_STORE,
@@ -452,7 +452,7 @@ static Token scan(Compiler *c) {
         token.kind = T_NAME;
         return token;
     }
-    static const char *const pairs[] = {"<=", ">=", "==", "!=", "&&", "||", "..", "<<", ">>", "->"};
+    static const char *const pairs[] = {"<=", ">=", "==", "!=", "&&", "||", "..", "<<", ">>", "->", "//"};
     for (size_t i = 0; i < sizeof(pairs) / sizeof(*pairs); ++i)
         if (ch == pairs[i][0] && peek_char(c, 1) == pairs[i][1]) {
             memcpy(token.text, pairs[i], 3);
@@ -557,7 +557,7 @@ static bool utf8_valid(const unsigned char *bytes, size_t size) {
 static const struct { const char *text; int precedence, op; } binary[] = {
     {"||", 1, OR}, {"&&", 2, AND}, {"==", 3, EQ}, {"!=", 3, NE}, {"<", 4, LT}, {"<=", 4, LE},
     {">", 4, GT}, {">=", 4, GE}, {"|", 5, BIT_OR}, {"^", 6, BIT_XOR}, {"&", 7, BIT_AND}, {"<<", 8, BIT_LEFT},
-    {">>", 8, BIT_RIGHT}, {"+", 9, ADD}, {"-", 9, SUB}, {"*", 10, MUL}, {"/", 10, DIV}, {"%", 10, MOD},
+    {">>", 8, BIT_RIGHT}, {"+", 9, ADD}, {"-", 9, SUB}, {"*", 10, MUL}, {"/", 10, DIV}, {"//", 10, FLOORDIV}, {"%", 10, MOD},
 };
 enum { UNARY = 11 }; /* a unary operator's operand binds tighter than any binary one */
 
@@ -2431,7 +2431,8 @@ static void integer(Compiler *c, const Expr *e, bool handler, int height) {
 static bool literal_only(const Expr *e) {
     if (loose(e)) return true;
     if (e->kind == E_IF) return literal_only(e->args[1]) && literal_only(e->args[2]); /* whatever its condition */
-    bool arithmetic = (e->kind == E_BINARY && (e->op == ADD || e->op == SUB || e->op == MUL || e->op == DIV || e->op == MOD) &&
+    bool arithmetic = (e->kind == E_BINARY && (e->op == ADD || e->op == SUB || e->op == MUL || e->op == DIV || e->op == FLOORDIV ||
+                                               e->op == MOD) &&
                        e->args[1]->kind != E_UNIT) ||
                       (e->kind == E_CALL && (e->op == MIN || e->op == MAX)) || (e->kind == E_UNARY && e->op == NEG);
     for (unsigned i = 0; arithmetic && i < e->count; ++i) arithmetic = literal_only(e->args[i]);
@@ -2481,7 +2482,7 @@ static uint8_t i64_op(int op) {
     case ADD: return I64_ADD;
     case SUB: return I64_SUB;
     case MUL: return I64_MUL;
-    case DIV: return I64_DIV;
+    case DIV: case FLOORDIV: return I64_DIV; /* (an i64's / refused: its quotient is //'s) */
     case MOD: return I64_MOD;
     case MIN: return I64_MIN;
     default: return I64_MAX;
@@ -3938,9 +3939,12 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             emit(c, e->line, e->column, NEG, 0, 0);
             return (Kind){NUM, -1};
         }
-        if (e->count == 2 && (e->op == MUL || e->op == DIV || e->op == MOD || e->op == MIN || e->op == MAX)) {
+        if (e->count == 2 && (e->op == MUL || e->op == DIV || e->op == FLOORDIV || e->op == MOD || e->op == MIN || e->op == MAX)) {
             Kind left = wanted(c, e->args[0], handler, height, left_hint(c, e, handler, height, want));
             Type type = second(c, e, left, handler, height);
+            if (type == I64 && e->op == DIV) /* Pure 027's stage 5: / divides numbers, // gives an i64's floored quotient */
+                fail_at(c, e->line, e->column, "an i64 divides by // (its quotient, floored); / divides numbers, as in "
+                        "number(a) / number(b)");
             emit(c, e->line, e->column, type == I64 ? i64_op(e->op) : (uint8_t)e->op, 0, 0);
             return (Kind){type, -1};
         }
