@@ -70,7 +70,7 @@ typedef struct {
     int line, column;
     double number;
     int64_t integer; /* a literal of digits alone (whole): its exact value, when not past an i64's range (wide) */
-    bool whole, wide, hex; /* hex: written 0x..., an i64 wherever it stands */
+    bool whole, wide, hex; /* hex: written 0x..., an i64 unless a number is wanted where it stands */
     char text[NAME + 1]; /* name, or punctuation of one or two characters */
     size_t start, end;   /* string contents in the source */
 } Token;
@@ -2534,8 +2534,10 @@ static void expect_kind(Compiler *c, const Expr *e, Kind actual, Type type) {
     if (actual.type != type) fail_at(c, e->line, e->column, "expected %s, not %s", type_name(type), type_name(actual.type));
 }
 
+static Kind wanted(Compiler *c, const Expr *e, bool handler, int height, Type want);
+
 static Kind number(Compiler *c, const Expr *e, bool handler, int height) {
-    Kind kind = value(c, e, handler, height);
+    Kind kind = wanted(c, e, handler, height, NUM); /* 0x... is a number here */
     expect_kind(c, e, kind, NUM);
     return kind;
 }
@@ -3464,6 +3466,12 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
     if (height + 1 > STACK) fail_at(c, e->line, e->column, "expression needs more than 64 stack values");
     switch (e->kind) {
     case E_NUMBER:
+        if (e->hex && want == NUM) { /* 0x... where a number goes (140's UAX #14 friction): that number, exactly */
+            if (e->wide || e->integer > INT64_C(9007199254740992))
+                fail_at(c, e->line, e->column, "the number is past 2^53, where numbers stop being exact: write it as an i64");
+            emit(c, e->line, e->column, CONST, 0, (double)e->integer);
+            return (Kind){NUM, -1};
+        }
         if (e->hex) { /* 0x...: an i64 */
             emit(c, e->line, e->column, CONST, 2, 0);
             made_i64(c, e, c->code_count - 1);
@@ -4960,7 +4968,8 @@ static void statements(Compiler *c, const Stmt *s) {
                 integer(c, s->value, c->handling, 0);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_NUM || c->state_types[index] == STATE_BOOL) {
-                expect_kind(c, s->value, value(c, s->value, c->handling, 0), c->state_types[index] == STATE_BOOL ? BOOL : NUM);
+                Type type = c->state_types[index] == STATE_BOOL ? BOOL : NUM;
+                expect_kind(c, s->value, wanted(c, s->value, c->handling, 0, type), type);
                 emit(c, s->line, s->column, STORE, (uint32_t)index, 0);
             } else if (c->state_types[index] == STATE_LIST && s->value->kind == E_LIST) {
                 statements(c, emptied(c, s->name, s->line, s->column)); /* xs = [...]: the list emptied, then its elements */

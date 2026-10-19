@@ -81,6 +81,8 @@ DIAGNOSTICS = [
      'lists declared together begin empty: give each its elements apart'),
     ('state a = 0\non frame {\n  let xs, xs: list of number\n}\n', '3:11', "'xs' is named twice"),
     ('state t: text\nview v = abs(t)\n', '2:14', 'expected a number, not text'),
+    ('state n = 0\nview v = n + 0x20000000000001\n', '2:14', 'the number is past 2^53, where numbers stop being exact: write it as an i64'),
+    ('state n = 0\nview v = n & 0xff\n', '2:10', 'bit operations take i64s, not numbers'),
     ('record F {\n  v = 0\n}\nstate kept: list of F\nstate n = 0\non frame {\n  kept = n\n}\n', '7:10',
      "'kept' takes a list of F, not a number"),
     ('record F {\n  v = 0\n}\nrecord G {\n  w = 0\n}\nstate kept: list of F\nstate other: list of G\non frame {\n  kept = other\n}\n',
@@ -671,6 +673,8 @@ state j = 0
 state far = 0
 state wide: i64
 state per = 0
+state hexed = 0
+state bits: i64
 input tick = every 250 ms
 input go = message { k: u32 }
 input edge = message { x: i64 }
@@ -689,6 +693,8 @@ on go {
   far = abs(go.k - 4.5) + abs(-0.0)
   wide = abs(i64(go.k) - 4)
   per = tick.period
+  hexed = (if go.k == 0x2 { 1 } else { 0 }) + (if 0x3 == go.k { 10 } else { 0 }) + min(go.k, 0x5) * 100 + 0x10
+  bits = (i64(go.k) | 0xf0) & 0xff
   let ts: list of P
   ts.append(P { x: 1 })
   ts, j = made(go.k)
@@ -1821,7 +1827,8 @@ def frictions(aup, pure_run, work, events=100):
     each its own and empty as it begins, in inner blocks too; targets together with fields and items among them
     (xs[i].x, xs[i].y = a, b; a, xs[i] = ...), the values first, then each target left to right as Python's; a list
     given a list value whole (xs = f(x), xs = ys, xs = xs, xs = [] for a list state too, xs, j = f(x)), added by key
-    when keyed; abs(x) of a number and an i64 (x once); a timer's period (tick.period). Each event against Python's."""
+    when keyed; abs(x) of a number and an i64 (x once); a timer's period (tick.period); 0x... a number where a number
+    goes (compared with one, in its arithmetic, given to one), an i64 elsewhere. Each event against Python's."""
     import random
     import struct
     path = work / 'frictions.pmod'
@@ -1848,7 +1855,8 @@ def frictions(aup, pure_run, work, events=100):
         ns[0], ns[1] = 3, k
         b = b + ns[0] * 100 + ns[1]
         want = {'total': sum(range(k)) * (1 + 200 + 10000), 'n': n, 'bs': bs, 'a': a, 'b': b, 'i': i, 'kept': kept,
-                'keyed': keyed, 'j': k + 100, 'far': abs(k - 4.5), 'wide': abs(k - 4), 'per': 250}
+                'keyed': keyed, 'j': k + 100, 'far': abs(k - 4.5), 'wide': abs(k - 4), 'per': 250,
+                'hexed': (k == 2) + 10 * (k == 3) + min(k, 5) * 100 + 16, 'bits': (k | 0xf0) & 0xff}
         assert state['fault'] == 'none' and {key: state['states'][key] for key in want} == want, (k, state['states'])
     edges = ''.join(f"message edge {struct.pack('<q', x).hex()}\n" for x in (-2 ** 63 + 1, -2 ** 63))
     first, second = (json.loads(line) for line in run(pure_run, path, stdin=edges, check=False).stdout.splitlines())
