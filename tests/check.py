@@ -36,6 +36,7 @@ builds its apps with this compiler.)
 import argparse
 import json
 import random
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2446,6 +2447,15 @@ def main():
             assert math.copysign(1, q) == math.copysign(1, a // b) and q == a // b, (a, b, q, a // b)
             assert r == a % b and math.copysign(1, r) == math.copysign(1, a % b), (a, b, r, a % b)
         report['floor_divisions'] = len(pairs)
+
+        # An i64 sum is exact (Pure 027's 5b): past the range midway, back in it at the end, it is the answer.
+        (work / 'isum.aup').write_text('record Big {\n  v: i64\n}\nstate xs: list of Big\ninput add = message { v: i64 }\n'
+                                       'on add { xs.append(Big { v: add.v }) }\nview total = sum(x.v for x in xs)\n')
+        compile_module(aup, work / 'isum.aup', work / 'isum.pmod')
+        steps = ''.join(f"message add {struct.pack('<q', v).hex()}\n" for v in (2 ** 63 - 1, 1, -2, 2))
+        totals = [json.loads(line)['views']['total'] for line in run(pure_run, work / 'isum.pmod', stdin=steps).stdout.splitlines()]
+        assert totals == [2 ** 63 - 1, None, 2 ** 63 - 2, None], totals
+        report['exact_i64_sums'] = len(totals)
 
         # message like X is X's fields, written once: the same module, byte for byte.
         fields = '  title: text\n  lane: u32\n  to: {\n    city: text\n  }\n'
