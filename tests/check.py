@@ -83,6 +83,12 @@ DIAGNOSTICS = [
     ('record R {\n  v = 0\n}\ninput m = message { d: bytes }\nstate t: text\non m {\n  let xs: list of R\n'
      '  t = text(bytes(xs))\n}\n', '8:18', 'bytes(...) makes bytes of a list of i64, not of R'),
     ('state x = 0\nview v = [1, 2]\n', '2:10', "a list's elements begin a let's list"),
+    # Bytes compared (after 140's DNS and HTTP): bytes compare with bytes (a string where bytes go is its bytes), and
+    # neither compares nor joins with a text's value.
+    ('state t: text\ninput m = message { name: bytes }\non m {\n  require m.name == t\n}\n', '4:21',
+     'bytes compares with bytes, not text: convert one, as in bytes(t) or text(b)'),
+    ('state t: text\ninput m = message { name: bytes }\non m {\n  require t < m.name\n}\n', '4:15',
+     'text compares with text, not bytes: convert one, as in bytes(t) or text(b)'),
     # Lists bare as values (after 140's inflate and HTTP): a list value (a parameter's, or what a fn gave back) is read,
     # not changed; a stored list is not passed as one.
     ('fn grow(xs) {\n  xs.append(1)\n  return 0\n}\nstate n = 0\non frame {\n  let ys: list of number = [1]\n  n = grow(ys)\n}\n',
@@ -586,6 +592,26 @@ on give {
   let d = doubled(give.items)
   twice = added(d)
   if o.count > 0 { last_odd = o.last.v }
+}
+'''
+
+BYTES_COMPARED = '''state rel = 0
+state lit = 0
+state joined = false
+input m = message { a: bytes, b: bytes }
+on m {
+  rel = 0
+  if m.a < m.b { rel = rel + 1 }
+  if m.a <= m.b { rel = rel + 2 }
+  if m.a > m.b { rel = rel + 4 }
+  if m.a >= m.b { rel = rel + 8 }
+  if m.a == m.b { rel = rel + 16 }
+  if m.a != m.b { rel = rel + 32 }
+  lit = 0
+  if m.a == "ab" { lit = lit + 1 }
+  if "ab" < m.a { lit = lit + 2 }
+  if m.b != "{rel}" { lit = lit + 4 }
+  joined = "<" + m.a + "|" + m.b + ">" == bytes("<") + m.a + bytes("|") + m.b + bytes(">")
 }
 '''
 
@@ -1504,6 +1530,29 @@ def nested_values(aup, pure_run, work):
     return {'events': 3}
 
 
+
+
+def bytes_compared(aup, pure_run, work, events=400):
+    """Bytes compared (Pure's TEXT_COMPARE with PURE_COMPARE_BYTES, after 140's DNS and HTTP): random bytes, 0x00 and
+    0xff among them, in the six relations, against literals on either side and a string with a format (a string where
+    bytes are what it meets is its UTF-8 bytes), and joined with literals; each event against Python's."""
+    import random
+    import struct
+    path = work / 'bytes_compared.pmod'
+    (work / 'bytes_compared.aup').write_text(BYTES_COMPARED)
+    compile_module(aup, work / 'bytes_compared.aup', path)
+    rng = random.Random(140)
+    pick = lambda: bytes(rng.choice(b'ab\x00\xff') for _ in range(rng.randrange(0, 4)))
+    asked = [(pick(), pick()) for _ in range(events)]
+    commands = ''.join(f"message m {(struct.pack('<I', len(a)) + a + b).hex()}\n" for a, b in asked)
+    lines = run(pure_run, path, stdin=commands).stdout.splitlines()
+    assert len(lines) == events
+    for (a, b), line in zip(asked, lines):
+        state = json.loads(line)
+        rel = sum(bit for bit, holds in zip((1, 2, 4, 8, 16, 32), (a < b, a <= b, a > b, a >= b, a == b, a != b)) if holds)
+        lit = (a == b'ab') + 2 * (b'ab' < a) + 4 * (b != str(rel).encode())
+        assert state['fault'] == 'none' and state['states'] == {'rel': rel, 'lit': lit, 'joined': True}, (a, b, state)
+    return events
 
 
 def bare_lists(aup, pure_run, work, events=200):
@@ -2675,6 +2724,7 @@ def main():
         report['nested_values'] = nested_values(aup, pure_run, work)
         report['functions'] = functions(aup, pure_run, work)
         report['bare_lists'] = bare_lists(aup, pure_run, work)
+        report['bytes_compared'] = bytes_compared(aup, pure_run, work)
         report['stored_nested'] = stored_nested(aup, pure_run, work, range(6))
         report['documents'] = documents_model(aup, pure_run, work, range(4))
     print(json.dumps(report))

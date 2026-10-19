@@ -2452,6 +2452,15 @@ static bool literal_only(const Expr *e) {
 }
 
 /* The type e has, compiled and taken back: what literals beside it take. */
+static Kind meeting(Compiler *c, const Expr *x, bool handler, int height, Type other) {
+    Kind kind = value(c, x, handler, height);
+    if (x->kind == E_STRING && kind.type == TEXT && other == BYTES) {
+        emit(c, x->line, x->column, BYTES_FROM, 0, 0);
+        return (Kind){BYTES, -1};
+    }
+    return kind;
+}
+
 static Type probe(Compiler *c, const Expr *e, bool handler, int height) {
     unsigned code = c->code_count, constants = c->constants, joins = c->joins, instances = c->instance_count;
     size_t used = c->constant_used;
@@ -2723,6 +2732,13 @@ static uint32_t local_arg(const Compiler *c, int local) {
  * may pass its range, any conversion or call may). && and || compute their right side only where it decides, and
  * where it cannot fail they compute it anyway (one AND or OR). */
 static Type probe(Compiler *c, const Expr *e, bool handler, int height);
+
+/* A side of a comparison or a join: a string (a literal, or one with formats) where bytes are what it meets is its
+ * UTF-8 bytes, as 1 is an i64 where i64s go; other values do not mix (bytes(t) and text(b) convert them). */
+static Kind meeting(Compiler *c, const Expr *x, bool handler, int height, Type other);
+static bool meets_bytes(Compiler *c, const Expr *string, const Expr *other, bool handler, int height) {
+    return string->kind == E_STRING && probe(c, other, handler, height) == BYTES;
+}
 
 /* A list the code makes (027's 2b), an event's: a register a list in a record is bound to, to be read (bound; a new one
  * each time: each place reads its own), or the one empty list of a record (a LIST field's default). */
@@ -3831,10 +3847,12 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
         if (e->op == ADD || e->op == SUB) {
             /* at + 1 char moves a cursor, at + 1 an index; both stop at the ends. */
             bool distance = e->args[1]->kind == E_UNIT;
-            Kind left = wanted(c, e->args[0], handler, height, distance ? 0 : left_hint(c, e, handler, height, want));
+            Kind left = !distance && meets_bytes(c, e->args[0], e->args[1], handler, height + 1)
+                            ? meeting(c, e->args[0], handler, height, BYTES)
+                            : wanted(c, e->args[0], handler, height, distance ? 0 : left_hint(c, e, handler, height, want));
             if (!distance && (left.type == BYTES || left.type == TEXT)) { /* joined */
                 if (e->op == SUB) fail_at(c, e->line, e->column, "texts and bytes are joined with +; - takes nothing apart");
-                Kind right = value(c, e->args[1], handler, height + 1);
+                Kind right = meeting(c, e->args[1], handler, height + 1, left.type);
                 if (right.type != left.type)
                     fail_at(c, e->args[1]->line, e->args[1]->column, "%s joins %s, not %s", type_name(left.type), type_name(left.type),
                             type_name(right.type));
@@ -3855,11 +3873,17 @@ static Kind value(Compiler *c, const Expr *e, bool handler, int height) {
             return (Kind){type, -1};
         }
         if (e->op >= LT && e->op <= NE) {
-            /* Texts compare by their bytes, numbers and i64s as numbers; bools are equal or not. */
-            Kind left = wanted(c, e->args[0], handler, height, left_hint(c, e, handler, height, 0));
-            if (left.type == TEXT) {
-                expect_kind(c, e->args[1], value(c, e->args[1], handler, height + 1), TEXT);
-                emit(c, e->line, e->column, TEXT_COMPARE, (uint32_t)(e->op - LT), 0);
+            /* Texts and bytes compare by their bytes, numbers and i64s as numbers; bools are equal or not. */
+            Kind left = meets_bytes(c, e->args[0], e->args[1], handler, height + 1) ? meeting(c, e->args[0], handler, height, BYTES)
+                                                                                    : wanted(c, e->args[0], handler, height, left_hint(c, e, handler, height, 0));
+            if (left.type == TEXT || left.type == BYTES) {
+                Kind right = meeting(c, e->args[1], handler, height + 1, left.type);
+                if (right.type == TEXT || right.type == BYTES) {
+                    if (right.type != left.type)
+                        fail_at(c, e->args[1]->line, e->args[1]->column, "%s compares with %s, not %s: convert one, as in bytes(t) or "
+                                "text(b)", type_name(left.type), type_name(left.type), type_name(right.type));
+                } else expect_kind(c, e->args[1], right, left.type);
+                emit(c, e->line, e->column, TEXT_COMPARE, (uint32_t)(e->op - LT) | (left.type == BYTES ? 0x100u : 0), 0);
                 return (Kind){BOOL, -1};
             }
             if (left.type == BOOL) {
