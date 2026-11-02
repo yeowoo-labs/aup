@@ -103,6 +103,7 @@ typedef struct Expr {
     char name[NAME], member[NAME];
     struct Expr *args[PARAMS], *next;
     unsigned count;
+    unsigned height; /* its tree's levels, itself the first, once the parser has measured it (0 before) */
     unsigned char *bytes;
     size_t size;
 } Expr;
@@ -575,6 +576,21 @@ static Expr *node(Compiler *c, ExprKind kind, int line, int column) {
     return e;
 }
 
+/* e, its tree measured: every pass after the parser walks an expression's tree by recursion, so an expression's
+ * nesting is its tree's height, DEPTH at most, whatever made it. A chain of operators, fields or positions is as tall
+ * as it is long though the parser makes it in a loop, so each link is measured as it is made; a node keeps its
+ * height, and what was measured is not walked again. */
+static Expr *measured(Compiler *c, Expr *e) {
+    if (!e->height) {
+        unsigned below = 0;
+        for (unsigned i = 0; i < PARAMS; ++i)
+            for (Expr *x = e->args[i]; x; x = x->next)
+                if (measured(c, x)->height > below) below = x->height;
+        if ((e->height = below + 1) > DEPTH) fail_at(c, e->line, e->column, "expression nesting exceeds 64");
+    }
+    return e;
+}
+
 static Expr *expression(Compiler *c, int minimum, bool multiline);
 static Token held_record(Compiler *c, char name[NAME], int *library);
 static int used_library(const Compiler *c, int module, const char *name);
@@ -639,7 +655,7 @@ static Expr *postfix(Compiler *c, Expr *e) {
                 newlines(c);
             }
             expect(c, "]", "']'");
-            e = at;
+            e = measured(c, at);
             continue;
         }
         take(c);
@@ -658,7 +674,7 @@ static Expr *postfix(Compiler *c, Expr *e) {
         access->args[0] = e;
         access->count = 1;
         memcpy(access->member, member.text, NAME);
-        e = access;
+        e = measured(c, access);
     }
     return e;
 }
@@ -1018,10 +1034,10 @@ parsed:
         e->args[0] = left;
         e->args[1] = expression(c, binary[found].precedence + 1, multiline);
         e->count = 2;
-        left = e;
+        left = measured(c, e);
     }
     --c->depth;
-    return left;
+    return measured(c, left);
 }
 
 /* Record { field: value, ... }: fields end at a comma, semicolon or line end. */
@@ -1047,6 +1063,7 @@ static Expr *inserted_value(Compiler *c, bool multiline);
 
 static Expr *record_value(Compiler *c, const Token *library) {
     Token name = take(c);
+    if (++c->depth > DEPTH) fail_at(c, name.line, name.column, "expression nesting exceeds 64");
     take(c); /* { */
     Expr *r = node(c, E_RECORD, name.line, name.column), **tail = &r->args[0];
     memcpy(r->name, name.text, NAME);
@@ -1074,13 +1091,15 @@ static Expr *record_value(Compiler *c, const Token *library) {
         while (is(c, ",") || is(c, ";") || c->token.kind == T_NL) take(c);
     }
     take(c);
-    return r;
+    --c->depth;
+    return measured(c, r);
 }
 
 /* send's fields { field: value, group: { ... } }: E_FIELD nodes linked from
  * args[0] of an E_RECORD without a name; a group's value is such a record. */
 static Expr *send_fields(Compiler *c) {
     Token open = take(c); /* { */
+    if (++c->depth > DEPTH) fail_at(c, open.line, open.column, "expression nesting exceeds 64");
     Expr *r = node(c, E_RECORD, open.line, open.column), **tail = &r->args[0];
     separators(c);
     while (!is(c, "}")) {
@@ -1098,7 +1117,8 @@ static Expr *send_fields(Compiler *c) {
         while (is(c, ",") || is(c, ";") || c->token.kind == T_NL) take(c);
     }
     take(c);
-    return r;
+    --c->depth;
+    return measured(c, r);
 }
 
 /* A value inserted into a text or a list: an expression or a record

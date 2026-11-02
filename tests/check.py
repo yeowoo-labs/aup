@@ -214,6 +214,24 @@ DIAGNOSTICS = [
     ('\n'.join(['fn f0(x) = x + 1'] + [f'fn f{i}(x) = f{i - 1}(f{i - 1}(x))' for i in range(1, 15)] + ['view v = f14(1)']) + '\n',
      '1:14', "program exceeds 65535 instructions (in fn 'f0' called at 2:15)"),
     ('view v = ' + '(' * 70 + '1' + ')' * 70 + '\n', '1:', 'expression nesting exceeds 64'),
+    # An expression nests as deep as its tree, however it is written: a chain of operators, fields or positions is as
+    # deep as it is long though no parenthesis says so, and is refused at the link past 64 (a chain of 16,000 terms
+    # once ran the compiler out of stack); a record's value and a send's group nest as an expression does.
+    ('state a = 0\nview v = ' + ' + '.join(['a'] * 65) + '\n', '2:264', 'expression nesting exceeds 64'),
+    ('state a = 0\nview v = ' + ' + '.join(['a'] * 100000) + '\n', '2:264', 'expression nesting exceeds 64'),
+    ('state a = 0\nview v = ' + ' == '.join(['a'] * 16000) + '\n', '2:327', 'expression nesting exceeds 64'),
+    ('state a = 0\ninput go = key KeyA\non go.down { a = ' + ' + '.join(['a'] * 16000) + ' }\n', '3:272',
+     'expression nesting exceeds 64'),
+    ('state a = 0\ninput go = key KeyA\non go.down {\n  let b = ' + ' + '.join(['a'] * 16000) + '\n  a = b\n}\n', '4:265',
+     'expression nesting exceeds 64'),
+    ('state a = 0\nfn f(a) = ' + ' + '.join(['a'] * 16000) + '\nview v = f(1)\n', '2:265', 'expression nesting exceeds 64'),
+    ('state a = 0\nview v = a' + '.x' * 100000 + '\n', '2:10', 'expression nesting exceeds 64'),
+    ('state a = 0\ninput m = message {\n  data: bytes\n}\non m { a = m.data' + '[0]' * 100000 + ' }\n', '5:204',
+     'expression nesting exceeds 64'),
+    ('record R {\n  a = 0\n}\nstate xs: list of R\ninput go = key KeyA\non go.down { xs.append(' + 'R { a: ' * 100000 + '1' +
+     ' }' * 100000 + ') }\n', '6:472', 'expression nesting exceeds 64'),
+    (SENDS + 'on buy {\n  send ordered { item: buy.item, count: 1, to: ' + '{ city: ' * 100000 + '"x"' + ' }' * 100000 +
+     ' }\n}\n', '14:552', 'expression nesting exceeds 64'),
     ('state s = 0\n' * 1 + ''.join(f'state s{i} = 0\n' for i in range(4096)), '4097:7', 'at most 4096 states are allowed'),
     # v0b: messages and types
     ('input m = message { a: u32 }\non m {\n  reply m.a\n}\n', '3:9', 'reply takes bytes or text, not a number'),
@@ -2620,6 +2638,38 @@ def timing(aup, pure_run, work, seeds, steps=300):
     return compared
 
 
+def nesting(aup, pure_run, work):
+    """An expression's chain past 64 (100,000 terms) is refused alike by check, build, query and watch, at the operator
+    past 64 and with no module written; the longest it takes (64 terms) builds, and runs on Pure."""
+    chain = lambda n: ' + '.join(['a'] * n)
+    long, out = work / 'nest-long.aup', work / 'nest-long.pmod'
+    long.write_text(f'state a = 1\ninput go = key KeyA\non go.down {{ a = {chain(100000)} }}\n')
+    for result in run(aup, 'check', long, check=False), run(aup, 'build', long, '-o', out, check=False):
+        assert result.returncode == 1 and f'{long}:3:272: expression nesting exceeds 64' in result.stderr, result.stderr
+    app, query = work / 'nest-app.aup', work / 'nest-query.aup'
+    app.write_text('state a = 1\ninput go = key KeyA\non go.down { a = a + 1 }\n')
+    query.write_text(f'view q = {chain(100000)}\n')
+    result = run(aup, 'query', app, query, '-o', out, check=False)
+    assert result.returncode == 1 and f'{query}:1:264: expression nesting exceeds 64' in result.stderr, result.stderr
+    assert not out.exists()
+    most = f'state a = 1\ninput go = key KeyA\non go.down {{ a = {chain(64)} }}\nview v = {chain(64)}\n'
+    watcher = subprocess.Popen([str(aup), 'watch', str(long), '-o', str(out)], stderr=subprocess.PIPE, text=True)
+    try:
+        line = watcher.stderr.readline()
+        assert f'{long}:3:272: expression nesting exceeds 64' in line, line
+        long.write_text(most)
+        line = watcher.stderr.readline()
+        assert f'built {out}' in line, line
+    finally:
+        watcher.terminate()
+        assert watcher.wait(timeout=5) == 0
+    shown = json.loads(run(pure_run, out, stdin='down go\nshow\n').stdout.splitlines()[-1])
+    assert shown['error'] is None and shown['states']['a'] == 64 and shown['views']['v'] == 64 * 64, shown
+    query.write_text(f'view q = {chain(64)}\n')
+    run(aup, 'query', app, query, '-o', out)
+    return {'modes': 4, 'refused_terms': 100000, 'most_terms': 64}
+
+
 def watching(aup, pure_run, work):
     """aup watch: whatever the last build read, read differently, builds
     again; errors keep the last module; the module is only ever replaced whole."""
@@ -3058,6 +3108,7 @@ def main():
         report['i64_snapshots'] = integers(aup, pure_run, work)
         report['time_snapshots'] = timing(aup, pure_run, work, range(args.seeds))
         report['watched_builds'] = watching(aup, pure_run, work)
+        report['nesting'] = nesting(aup, pure_run, work)
         report['fold_snapshots'] = folds(aup, pure_run, work, range(args.seeds if hasattr(args, 'seeds') else 8))
         report['keyed_snapshots'], report['keyed_failed_events'] = keyed(aup, pure_run, work, range(args.seeds))
         report['stored_snapshots'], report['stored_restarts'] = stored_runs(aup, pure_run, work, range(args.text_seeds))
