@@ -8,10 +8,12 @@
 #include <time.h>
 #include <unistd.h>
 
-static int usage(void) {
+/* How aup is called: on standard error with status 2 when it was called another way, on standard output when asked. */
+static int usage(FILE *to) {
     fputs("aup check FILE\naup build FILE -o OUT.pmod\naup watch FILE -o OUT.pmod\naup query APP QUERY|- -o OUT.pmod\n"
-          "A library `use name` is name.aup beside FILE or in a directory of AUP_PATH (':' separated).\n", stderr);
-    return 2;
+          "aup --version | --help\n"
+          "A library `use name` is name.aup beside FILE or in a directory of AUP_PATH (':' separated).\n", to);
+    return to == stdout ? 0 : 2;
 }
 
 /* All of a file's bytes, of any size (Pure 027's 4f-4); NULL if they cannot be read. */
@@ -220,9 +222,14 @@ static int watch(const char *path, const char *out) {
 
 int main(int argc, char **argv) {
     Inputs inputs;
+    if (argc == 2 && !strcmp(argv[1], "--version")) { /* the version (the VERSION file's), and the module format it writes */
+        puts("aup " AUP_VERSION "\nmodule format 7");
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--help")) return usage(stdout);
     if (argc == 5 && !strcmp(argv[3], "-o") && !strcmp(argv[1], "build")) return compile(argv[2], argv[4], &inputs);
     if (argc == 5 && !strcmp(argv[3], "-o") && !strcmp(argv[1], "watch")) return watch(argv[2], argv[4]);
     if (argc == 3 && !strcmp(argv[1], "check")) return compile(argv[2], NULL, &inputs);
     if (argc == 6 && !strcmp(argv[4], "-o") && !strcmp(argv[1], "query")) return query(argv[2], argv[3], argv[5]);
-    return usage();
+    return usage(stderr);
 }

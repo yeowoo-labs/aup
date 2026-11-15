@@ -2916,6 +2916,17 @@ def text_parity(aup, pure_run, work, seeds, steps=400):
     return compared
 
 
+def versions(aup, module):
+    """aup --version says its name with the VERSION file's line, then the module format: the eighth byte of a module
+    it built. aup --help says how it is called, on standard output; called another way it says so with status 2."""
+    said = run(aup, '--version').stdout.splitlines()
+    assert said == [f'aup {(ROOT / "VERSION").read_text().strip()}', f'module format {chr(module.read_bytes()[7])}'], said
+    helped = run(aup, '--help')
+    assert helped.stdout.startswith('aup check FILE') and not helped.stderr, helped
+    assert run(aup, check=False).returncode == 2 and run(aup, '--version', 'x', check=False).returncode == 2
+    return len(said)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--aup', type=Path, required=True)
@@ -2938,6 +2949,7 @@ def main():
             shown = json.loads(run(pure_run, work / 'first.pmod', stdin='show\n').stdout)
             assert shown['error'] is None, path
         report['verified_deterministic_modules'] = len(sources)
+        report['version_lines'] = versions(aup, work / 'first.pmod')
 
         for number, (source, where, message) in enumerate(DIAGNOSTICS):
             path = work / f'bad{number}.aup'
