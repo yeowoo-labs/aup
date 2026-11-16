@@ -36,6 +36,7 @@ builds its apps with this compiler.)
 import argparse
 import json
 import random
+import shutil
 import struct
 import subprocess
 import sys
@@ -3108,10 +3109,13 @@ def main():
             ('tests/oracle/faults.aup', HERE / 'oracle/faults.pure', ['divide', 'grow', 'bound'],
              {'shown': ('shown', 'value')}),
         ]
-        results = [parity(aup, pure_run, workbench, pair, work, range(args.seeds)) for pair in pairs]
-        report['parity_snapshots'] = sum(compared for compared, _ in results)
-        report['parity_failed_events_matched'] = sum(failures for _, failures in results)
-        report['parity_programs'] = len(pairs)
+        if shutil.which('node'):
+            results = [parity(aup, pure_run, workbench, pair, work, range(args.seeds)) for pair in pairs]
+            report['parity_snapshots'] = sum(compared for compared, _ in results)
+            report['parity_failed_events_matched'] = sum(failures for _, failures in results)
+            report['parity_programs'] = len(pairs)
+        else:  # the workbench's engine runs under Node: without it this one comparison is left out, and said
+            report['parity_skipped'] = 'node is not installed'
         report['text_model_snapshots'] = text_parity(aup, pure_run, work, range(args.text_seeds))
         report['list_model_snapshots'], report['list_model_failed_events'] = \
             tasks_parity(aup, pure_run, work, range(args.text_seeds))
