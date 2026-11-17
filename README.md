@@ -5,7 +5,7 @@ are to the JVM, aup is to Pure: you declare an app, aup checks it and emits a mo
 verifies again before it runs.
 
 **Status: v0, pre-1.0.** The language covers states, events, views, records, lists, functions and
-library imports; it is usable for real apps and unstable. No release, no package, no
+library imports; it is usable for real apps and unstable. Preview release 0.9: no package, no
 compatibility promise. There has been no external security audit.
 
 ## What a program looks like
