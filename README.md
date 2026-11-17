@@ -43,7 +43,7 @@ breaking and a TCP retransmission timer written in the language itself. See the
 ## Build and run
 
 A C17 toolchain and `make` are enough; there are no external dependencies. `make check` needs a
-Pure checkout beside this one.
+Pure checkout beside this one and Python 3.
 
 ```sh
 git clone https://github.com/yeowoo-labs/pure.git ../pure && make -C ../pure
@@ -75,7 +75,7 @@ document models with reference implementations, and repeats the persistence chec
 | Path | What lives there |
 |---|---|
 | `compiler/` | Lexer, parser, checker, module emitter |
-| `examples/` | Counter, notes, tasks, documents, kanban board |
+| `examples/` | Counter, notes, tasks, documents, and specs written in aup (SHA-256, JSON, inflate, DNS, HTTP/1.1, UAX #14, RFC 6298, box layout) |
 | `docs/design/` | Language design |
 | `tests/` | Verification, diagnostics and reference-model tests |
 
