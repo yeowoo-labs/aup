@@ -2699,7 +2699,12 @@ def watching(aup, pure_run, work):
         return json.loads(run(pure_run, out, stdin='show\n').stdout)['views']['doubled']
 
     def write(path, text):
-        path.write_text(text)
+        """The file with text, all of it at once (renamed into place): the watcher reads the file before or after,
+        never cut short. (Written in place, a writer held up between the truncation and the write for two of the
+        watcher's looks has the empty file built: a build more than the lines here count.)"""
+        part = path.with_name(path.name + '.part')
+        part.write_text(text)
+        os.replace(part, path)
 
     try:
         heard(f'built {out}')
@@ -2731,7 +2736,9 @@ def watching(aup, pure_run, work):
         heard(f'built {out}')
         assert shown() == 18
         # Written in two parts at random moments; the first part alone (and the
-        # empty file before it) compiles too, into a module without the view.
+        # empty file before it) compiles too, into a module without the view: the
+        # watcher may build one of those when the writer is held up between the
+        # parts, and then builds the whole file.
         rng = random.Random(10)
         for count in range(7, 17):
             time.sleep(rng.uniform(0, 0.05))
@@ -2742,8 +2749,13 @@ def watching(aup, pure_run, work):
                 file.flush()
                 time.sleep(0.02)
                 file.write(text[cut:])
-            heard(f'built {out}')
-            assert shown() == 3 * count
+            for builds in range(3):  # the whole file's, after at most the empty file's and the first part's
+                heard(f'built {out}')
+                views = json.loads(run(pure_run, out, stdin='show\n').stdout)['views']
+                if views.get('doubled') == 3 * count:
+                    break
+            else:
+                raise AssertionError((count, views, lines[-3:]))
     finally:
         watcher.terminate()
         assert watcher.wait(timeout=5) == 0
